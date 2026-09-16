@@ -1,0 +1,29 @@
+{
+  "name": "@ballast/service-margin-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "echo 'no lint configured'"
+  },
+  "dependencies": {
+    "@ballast/contract-clients": "workspace:*",
+    "@ballast/db": "workspace:*",
+    "@ballast/domain-types": "workspace:*",
+    "@ballast/network-config": "workspace:*",
+    "@ballast/observability": "workspace:*",
+    "drizzle-orm": "^0.36.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

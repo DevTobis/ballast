@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/db" },
+    { "path": "../../packages/domain-types" },
+    { "path": "../../packages/network-config" },
+    { "path": "../../packages/observability" },
+    { "path": "../../packages/contract-clients" }
+  ]
+}

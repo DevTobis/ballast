@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ballast
+      POSTGRES_PASSWORD: ballast
+      POSTGRES_DB: ballast
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./.pgdata:/var/lib/postgresql/data
+
+  # Local Stellar network (Core + Horizon + Soroban RPC) for integration testing.
+  # Not needed to run unit tests; only for end-to-end contract deploy/invoke drills.
+  stellar:
+    image: stellar/quickstart:testing
+    restart: unless-stopped
+    command: --local --enable-soroban-rpc
+    ports:
+      - "8000:8000"

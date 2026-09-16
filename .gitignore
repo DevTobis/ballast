@@ -1,0 +1,26 @@
+node_modules/
+dist/
+build/
+.turbo/
+*.log
+*.bak
+*.tsbuildinfo
+.env
+.env.local
+
+# Rust
+/target/
+contracts/**/target/
+contracts/**/test_snapshots/
+
+# Wasm build output
+*.wasm
+!vendor/**/*.wasm
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local data
+.pgdata/

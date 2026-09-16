@@ -1,0 +1,70 @@
+import type { FastifyInstance } from "fastify";
+import { eq } from "drizzle-orm";
+import { schema, type Database } from "@ballast/db";
+import type { ExitQuote } from "@ballast/domain-types";
+import type { ContractClients } from "../contract-clients.js";
+import { exitExecuteSchema, exitQuoteRequestSchema } from "../schemas.js";
+import { requireAsset, requireStellarAccount } from "./helpers.js";
+
+export function registerExitRoutes(app: FastifyInstance, db: Database, contracts: ContractClients): void {
+  app.post("/v1/exit/quotes", async (request, reply) => {
+    const body = exitQuoteRequestSchema.parse(request.body);
+    const asset = await requireAsset(db, body.assetId);
+
+    const onChainQuote: ExitQuote = await contracts.exitDesk.quote(asset.contractC, body.units);
+
+    const [row] = await db
+      .insert(schema.exitQuote)
+      .values({
+        holderId: request.partyId,
+        assetId: asset.id,
+        units: body.units.toString(),
+        price: onChainQuote.price.toString(),
+        spreadBps: onChainQuote.spreadBps,
+        usdcOut: onChainQuote.usdcOut.toString(),
+        expiresAt: new Date(onChainQuote.expiresAt),
+        status: "open",
+      })
+      .returning();
+
+    return reply.code(201).send({
+      id: row.id,
+      assetId: asset.id,
+      units: row.units,
+      price: row.price,
+      spreadBps: row.spreadBps,
+      usdcOut: row.usdcOut,
+      expiresAt: row.expiresAt,
+    });
+  });
+
+  app.post<{ Params: { id: string } }>("/v1/exit/quotes/:id/execute", async (request, reply) => {
+    const body = exitExecuteSchema.parse(request.body);
+    const [quote] = await db.select().from(schema.exitQuote).where(eq(schema.exitQuote.id, request.params.id)).limit(1);
+    if (!quote) return reply.code(404).send({ error: "quote not found" });
+    if (quote.status !== "open") return reply.code(409).send({ error: `quote is ${quote.status}` });
+    if (quote.expiresAt.getTime() < Date.now()) {
+      await db.update(schema.exitQuote).set({ status: "expired" }).where(eq(schema.exitQuote.id, quote.id));
+      return reply.code(409).send({ error: "quote expired" });
+    }
+
+    const asset = await requireAsset(db, quote.assetId);
+    const holderAccount = await requireStellarAccount(db, quote.holderId);
+
+    await db.insert(schema.auditLog).values({
+      actor: holderAccount,
+      action: "exit.execute.requested",
+      payload: { quoteId: quote.id, minUsdcOut: body.minUsdcOut.toString(), to: body.to },
+    });
+
+    const xdr = await contracts.exitDesk.exit(
+      holderAccount,
+      asset.contractC,
+      BigInt(Math.round(Number(quote.units))),
+      body.minUsdcOut,
+      body.to,
+    );
+
+    return reply.code(201).send({ xdr, quoteId: quote.id });
+  });
+}
