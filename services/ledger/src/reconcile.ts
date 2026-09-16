@@ -24,27 +24,19 @@
  *   `PledgeVault`/`CreditLine` contract storage directly and treat *that* as ground truth.
  * - Only RWA pledge units are reconciled. Credit-line USDC draw/repay balances, repo trades and
  *   exit fills are not yet folded into the chain-event-implied comparison.
- * - Event decoding assumes a convention (`data.value` holds the unit amount as a string) that
- *   matches how `services/indexer`'s `poller.ts` stores events, not a verified on-chain contract
- *   event schema (that's contract-team territory).
+ * - Event decoding matches how `services/indexer`'s `poller.ts` actually stores events: the
+ *   `pledged`/`released`/`liquidated` events from `contracts/pledge-vault` publish a `(asset,
+ *   units, ...)` tuple as their event body, which `scValToNative` decodes as a plain array — so
+ *   `data.value` is `[assetAddress, unitsAsString, ...]`, not a bare unit amount. Index 1 is the
+ *   units field for all three topics. (An earlier version of this file assumed `data.value` was
+ *   itself the unit amount and called `BigInt(data.value)` directly, which throws on an array —
+ *   fixed here.)
  */
 import { schema, type Database } from "@ballast/db";
 import { createConsoleAlerter } from "@ballast/observability";
+import { decimalStringToScaled } from "@ballast/domain-types";
 
 const alerter = createConsoleAlerter("ledger");
-
-/** Same fixed-point convention as `PRICE_SCALE` in `@ballast/domain-types` (7 decimals). */
-const SCALE = 10_000_000n;
-
-/** Postgres `numeric` money columns round-trip as decimal strings, not numbers — parse by hand. */
-function decimalToScaled(decimal: string): bigint {
-  const negative = decimal.startsWith("-");
-  const unsigned = negative ? decimal.slice(1) : decimal;
-  const [wholePart, fracPart = ""] = unsigned.split(".");
-  const fracPadded = (fracPart + "0000000").slice(0, 7);
-  const combined = BigInt(wholePart || "0") * SCALE + BigInt(fracPadded || "0");
-  return negative ? -combined : combined;
-}
 
 /** Tolerance in raw scaled units (1n = 1e-7 of an asset unit) below which a diff isn't a break. */
 const TOLERANCE_UNITS = 100n;
@@ -92,8 +84,8 @@ export async function runReconciliation(db: Database): Promise<ReconciliationOut
   const journalAccountBalances: Record<string, { debit: bigint; credit: bigint; net: bigint }> = {};
   for (const row of journalRows) {
     const acct = (journalAccountBalances[row.account] ??= { debit: 0n, credit: 0n, net: 0n });
-    const debit = decimalToScaled(row.debit);
-    const credit = decimalToScaled(row.credit);
+    const debit = decimalStringToScaled(row.debit);
+    const credit = decimalStringToScaled(row.credit);
     acct.debit += debit;
     acct.credit += credit;
     acct.net += debit - credit;
@@ -105,14 +97,18 @@ export async function runReconciliation(db: Database): Promise<ReconciliationOut
   for (const asset of assets) {
     const pgUnits = pledgeRows
       .filter((p) => p.assetId === asset.id && p.status === "active")
-      .reduce((sum, p) => sum + decimalToScaled(p.units), 0n);
+      .reduce((sum, p) => sum + decimalStringToScaled(p.units), 0n);
 
     const relevantEvents = chainEventRows.filter(
       (e) => e.contract === asset.contractC && PLEDGE_TOPICS.has(e.topic),
     );
     const chainUnits = relevantEvents.reduce((sum, e) => {
-      const data = e.data as { value?: string } | null;
-      const units = data?.value !== undefined ? BigInt(data.value) : 0n;
+      // `data.value` is the decoded `(asset, units, ...)` event-body tuple — a plain array, with
+      // units always at index 1 for `pledged`/`released`/`liquidated` (see the module doc above).
+      const data = e.data as { value?: unknown } | null;
+      const tuple = Array.isArray(data?.value) ? data.value : undefined;
+      const unitsField = tuple?.[1];
+      const units = typeof unitsField === "string" ? BigInt(unitsField) : 0n;
       return sum + topicDelta(e.topic, units);
     }, 0n);
 
@@ -143,8 +139,8 @@ export async function runReconciliation(db: Database): Promise<ReconciliationOut
     scope: {
       compared:
         "postgres pledge.units (status='active') per asset vs. chain_event rows tagged with that " +
-        "asset's contract_c and a pledge/release/liquidate topic, using each event's decoded " +
-        "data.value as the unit delta",
+        "asset's contract_c and a pledge/release/liquidate topic, reading units from index 1 of " +
+        "each event's decoded (asset, units, ...) data.value tuple",
       deferred: [
         "no direct on-chain contract-balance introspection (this compares against our own indexed " +
           "chain_event log, not a fresh read of contract storage)",

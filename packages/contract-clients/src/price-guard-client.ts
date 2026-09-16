@@ -24,7 +24,11 @@ export class PriceGuardClient extends BaseContractClient {
     ]);
   }
 
-  /** Pushes an independent-feed or last-redemption-price reading (contracts/price-guard). */
+  /**
+   * Pushes an independent-feed or last-redemption-price reading. The on-chain function is named
+   * `publish_source` (contracts/price-guard/src/lib.rs) — kept as `publishFeed` here for the
+   * TS-side name already used by callers.
+   */
   publishFeed(
     source: string,
     assetAddress: string,
@@ -32,7 +36,7 @@ export class PriceGuardClient extends BaseContractClient {
     value: bigint,
     ts: number,
   ): Promise<string> {
-    return this.invoke(source, "publish_feed", [
+    return this.invoke(source, "publish_source", [
       scAddress(source),
       scAddress(assetAddress),
       scSymbol(sourceName),

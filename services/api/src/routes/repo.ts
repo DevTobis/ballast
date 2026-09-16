@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
+import { scaledToDecimalString } from "@ballast/domain-types";
 import type { ContractClients } from "../contract-clients.js";
 import { repoProposalSchema, repoTradeActionSchema } from "../schemas.js";
 import { requireAsset, requireStellarAccount } from "./helpers.js";
@@ -20,8 +21,8 @@ export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts
         cashLenderId: body.cashLenderId,
         cashBorrowerId: body.cashBorrowerId,
         assetId: asset.id,
-        units: body.units.toString(),
-        cashAmount: body.cashAmount.toString(),
+        units: scaledToDecimalString(body.units),
+        cashAmount: scaledToDecimalString(body.cashAmount),
         rateBps: body.rateBps,
         kind: body.kind,
         startLedger: 0,

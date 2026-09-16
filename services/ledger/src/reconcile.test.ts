@@ -47,7 +47,7 @@ describe("runReconciliation", () => {
       asset: [baseAsset],
       pledge: [{ assetId: ASSET_ID, status: "active", units: "1000.0000000" }],
       chainEvent: [
-        { contract: CONTRACT_C, topic: "pledge", data: { value: "10000000000" } }, // 1000.0000000 scaled
+        { contract: CONTRACT_C, topic: "pledge", data: { value: ["GASSET000000000000000000000000000000000000000000000000", "10000000000"] } }, // 1000.0000000 scaled
       ],
     });
 
@@ -66,8 +66,8 @@ describe("runReconciliation", () => {
       pledge: [{ assetId: ASSET_ID, status: "active", units: "1000.0000000" }],
       // ...but the chain only shows 400 units pledged, net of a release. That's a real break.
       chainEvent: [
-        { contract: CONTRACT_C, topic: "pledge", data: { value: "10000000000" } },
-        { contract: CONTRACT_C, topic: "release", data: { value: "6000000000" } },
+        { contract: CONTRACT_C, topic: "pledge", data: { value: ["GASSET000000000000000000000000000000000000000000000000", "10000000000"] } },
+        { contract: CONTRACT_C, topic: "release", data: { value: ["GASSET000000000000000000000000000000000000000000000000", "6000000000"] } },
       ],
     });
 
@@ -89,7 +89,7 @@ describe("runReconciliation", () => {
       asset: [baseAsset],
       pledge: [{ assetId: ASSET_ID, status: "active", units: "1000.0000000" }],
       // off by 0.0000050 units, well inside TOLERANCE_UNITS
-      chainEvent: [{ contract: CONTRACT_C, topic: "pledge", data: { value: "9999999950" } }],
+      chainEvent: [{ contract: CONTRACT_C, topic: "pledge", data: { value: ["GASSET000000000000000000000000000000000000000000000000", "9999999950"] } }],
     });
 
     const { breaks } = await runReconciliation(db);

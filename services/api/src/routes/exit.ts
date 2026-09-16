@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
-import type { ExitQuote } from "@ballast/domain-types";
+import type { OnChainExitQuote } from "@ballast/contract-clients";
+import { decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-types";
 import type { ContractClients } from "../contract-clients.js";
 import { exitExecuteSchema, exitQuoteRequestSchema } from "../schemas.js";
 import { requireAsset, requireStellarAccount } from "./helpers.js";
@@ -11,18 +12,19 @@ export function registerExitRoutes(app: FastifyInstance, db: Database, contracts
     const body = exitQuoteRequestSchema.parse(request.body);
     const asset = await requireAsset(db, body.assetId);
 
-    const onChainQuote: ExitQuote = await contracts.exitDesk.quote(asset.contractC, body.units);
+    const onChainQuote: OnChainExitQuote = await contracts.exitDesk.quote(asset.contractC, body.units);
 
     const [row] = await db
       .insert(schema.exitQuote)
       .values({
         holderId: request.partyId,
         assetId: asset.id,
-        units: body.units.toString(),
-        price: onChainQuote.price.toString(),
+        units: scaledToDecimalString(body.units),
+        price: scaledToDecimalString(onChainQuote.price),
         spreadBps: onChainQuote.spreadBps,
-        usdcOut: onChainQuote.usdcOut.toString(),
-        expiresAt: new Date(onChainQuote.expiresAt),
+        usdcOut: scaledToDecimalString(onChainQuote.usdcOut),
+        // `expiresAt` on-chain is Unix *seconds* (ledger timestamp); `Date` wants milliseconds.
+        expiresAt: new Date(onChainQuote.expiresAt * 1000),
         status: "open",
       })
       .returning();
@@ -30,10 +32,12 @@ export function registerExitRoutes(app: FastifyInstance, db: Database, contracts
     return reply.code(201).send({
       id: row.id,
       assetId: asset.id,
-      units: row.units,
-      price: row.price,
+      // Returned as raw 7-decimal-scaled-bigint strings (the on-chain/request-body convention),
+      // not the Postgres decimal-string form these columns are stored as.
+      units: decimalStringToScaled(row.units).toString(),
+      price: decimalStringToScaled(row.price).toString(),
       spreadBps: row.spreadBps,
-      usdcOut: row.usdcOut,
+      usdcOut: decimalStringToScaled(row.usdcOut).toString(),
       expiresAt: row.expiresAt,
     });
   });
@@ -60,7 +64,7 @@ export function registerExitRoutes(app: FastifyInstance, db: Database, contracts
     const xdr = await contracts.exitDesk.exit(
       holderAccount,
       asset.contractC,
-      BigInt(Math.round(Number(quote.units))),
+      decimalStringToScaled(quote.units),
       body.minUsdcOut,
       body.to,
     );

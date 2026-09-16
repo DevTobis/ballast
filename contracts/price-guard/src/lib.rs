@@ -140,8 +140,15 @@ mod alloc_free_sort {
 
     impl SortBuf {
         pub fn from(values: &soroban_sdk::Vec<i128>) -> Self {
+            // Fail loudly rather than silently dropping sources past capacity — a median
+            // computed from an arbitrary subset of sources (instead of all of them) is exactly
+            // the kind of quiet data loss the Price Guard exists to prevent.
+            assert!(
+                values.len() as usize <= 8,
+                "price-guard: more than 8 fresh sources for one asset, raise SortBuf capacity"
+            );
             let mut items = [0i128; 8];
-            let len = values.len().min(8) as usize;
+            let len = values.len() as usize;
             for i in 0..len {
                 items[i] = values.get(i as u32).unwrap();
             }

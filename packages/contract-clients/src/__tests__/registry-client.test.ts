@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { RegistryClient } from "../registry-client.js";
+import { RegistryClient, type OnChainAssetConfig } from "../registry-client.js";
 import { randomAccountId, randomContractId, stubRpcServer, testNetwork } from "./support.js";
-import type { AssetConfig } from "@ballast/domain-types";
 
 describe("RegistryClient", () => {
   let stub: ReturnType<typeof stubRpcServer>;
@@ -26,18 +25,14 @@ describe("RegistryClient", () => {
   });
 
   it("registerAsset() returns non-empty unsigned XDR", async () => {
-    const config: AssetConfig = {
-      id: "id",
-      code: "RWA1",
-      issuerG: randomAccountId(),
-      contractC: randomContractId(),
+    const config: OnChainAssetConfig = {
+      issuer: randomAccountId(),
+      contract: randomContractId(),
       standard: "classic_sac",
       yieldType: "accumulating",
       custodyMode: "escrow",
       ccy: "USD",
       redemptionLagDays: 2,
-      redemptionDailyCap: 1_000_000n,
-      navSchedule: "daily",
       priceBandBps: 100,
       dailyMoveBandBps: 200,
       haircutBaseBps: 500,
@@ -64,8 +59,14 @@ describe("RegistryClient", () => {
     expect(xdr.length).toBeGreaterThan(0);
   });
 
-  it("pause() and unpause() return non-empty unsigned XDR", async () => {
+  it("pause() and queueUnpause()/executeUnpause() return non-empty unsigned XDR", async () => {
     expect((await client.pause(source, "Draws")).length).toBeGreaterThan(0);
-    expect((await client.unpause(source, "All")).length).toBeGreaterThan(0);
+    expect((await client.queueUnpause(source, "All")).length).toBeGreaterThan(0);
+    expect((await client.executeUnpause(source, 1n)).length).toBeGreaterThan(0);
+  });
+
+  it("isPaused() simulates a read and does not throw", async () => {
+    const result = await client.isPaused("Draws");
+    expect(result).toBeDefined();
   });
 });

@@ -27,6 +27,54 @@ export function enumToScVal(variantName: string, ...fields: xdr.ScVal[]): xdr.Sc
 /** @deprecated use {@link enumToScVal} */
 export const scEnumVariant = enumToScVal;
 
+const snakeToCamel = (key: string): string => key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
+
+const PASCAL_VARIANT = /^[A-Z][A-Za-z0-9]*$/;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !(value instanceof Map) &&
+    !(value instanceof Uint8Array) &&
+    (value as object).constructor === Object
+  );
+}
+
+/**
+ * Recursively normalizes a `scValToNative`-decoded contract value into the shape Ballast's TS
+ * types expect:
+ *  - struct map keys converted from the contract's snake_case field names (e.g. `ltv_bps`) to
+ *    camelCase (`ltvBps`);
+ *  - a fieldless `#[contracttype] enum` variant, which soroban-sdk encodes as `Vec([Symbol(name)])`
+ *    and therefore decodes as a one-element array (e.g. `["Ok"]`), unwrapped to the bare variant
+ *    string (`"Ok"`) — matching how `enumToScVal` above encodes it.
+ *
+ * This is a convention-based normalizer, not a full XDR-spec-aware decoder — it assumes Ballast
+ * never has a *genuine* array field whose sole element is a bare PascalCase string, which holds
+ * for every current on-chain read. A tuple-variant enum (fields after the tag) is left as an
+ * array (`["HaircutBaseBps", 700]`) since no current read result needs one. A future pass should
+ * replace this with codegen'd bindings (`stellar contract bindings typescript`) once available,
+ * rather than hand-extending this further.
+ */
+export function normalizeContractValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    if (value.length === 1 && typeof value[0] === "string" && PASCAL_VARIANT.test(value[0])) {
+      return value[0];
+    }
+    return value.map(normalizeContractValue);
+  }
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[snakeToCamel(key)] = normalizeContractValue(val);
+    }
+    return out;
+  }
+  return value;
+}
+
 /**
  * Encodes a `#[contracttype] struct` the way soroban-sdk represents it on the wire: an `ScMap`
  * with `Symbol` keys sorted lexicographically by field name.

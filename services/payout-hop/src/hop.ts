@@ -8,18 +8,9 @@
  */
 import { Asset, Memo, Operation, TransactionBuilder, BASE_FEE, type Transaction } from "@stellar/stellar-sdk";
 import { randomUUID } from "node:crypto";
-import { schema, type Database } from "@ballast/db";
+import { schema, recordJournalEntry, type Database } from "@ballast/db";
+import { scaledToDecimalString } from "@ballast/domain-types";
 import type { PayoutSigner } from "./signer.js";
-
-/** Same fixed-point convention as `PRICE_SCALE` in `@ballast/domain-types` (7 decimals). */
-const SCALE = 10_000_000n;
-
-function scaledToDecimalString(raw: bigint): string {
-  if (raw <= 0n) throw new Error("payout-hop: amount must be positive");
-  const whole = raw / SCALE;
-  const frac = (raw % SCALE).toString().padStart(7, "0");
-  return `${whole}.${frac}`;
-}
 
 /** SEP conventions: anchors ask for either a text memo or a numeric (MEMO_ID) memo — support both. */
 function buildMemo(memo: string): Memo {
@@ -107,12 +98,25 @@ export async function forwardPayout(
       });
     }
 
-    await trx.insert(schema.journalEntry).values({
+    // A balanced pair, not a lone credit row: cash leaving Ballast's operator account (debit)
+    // funds the payout booked against the payout-hop account (credit). Both legs go through
+    // `recordJournalEntry` directly (not `recordDoubleEntry`, which opens its own transaction)
+    // since this is already inside one.
+    const refId = args.quoteId ?? randomUUID();
+    await recordJournalEntry(trx, {
       refType: "payout_hop",
-      refId: args.quoteId ?? randomUUID(),
+      refId,
+      account: "usdc_cash",
+      debit: args.amount,
+      credit: 0n,
+      ccy: "USDC",
+    });
+    await recordJournalEntry(trx, {
+      refType: "payout_hop",
+      refId,
       account: "operator:payout_hop",
-      debit: "0",
-      credit: scaledToDecimalString(args.amount),
+      debit: 0n,
+      credit: args.amount,
       ccy: "USDC",
     });
   });

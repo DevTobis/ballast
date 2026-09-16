@@ -18,7 +18,7 @@ describe("PledgeVaultClient", () => {
   });
 
   it("pledge() returns non-empty unsigned XDR", async () => {
-    const xdr = await client.pledge(source, 1n, asset, 1_000n, "escrow");
+    const xdr = await client.pledge(source, 1n, asset, 1_000n);
     expect(typeof xdr).toBe("string");
     expect(xdr.length).toBeGreaterThan(0);
   });

@@ -1,6 +1,6 @@
 import type { RepoKind } from "@ballast/domain-types";
 import { BaseContractClient } from "./base-client.js";
-import { scAddress, scBytes, scI128, scStruct, scSymbol, scU32, scU64 } from "./scval.js";
+import { enumToScVal, scAddress, scBytes, scI128, scU32, scU64 } from "./scval.js";
 
 const REPO_KIND_VARIANT: Record<RepoKind, string> = {
   intraday: "Intraday",
@@ -10,8 +10,10 @@ const REPO_KIND_VARIANT: Record<RepoKind, string> = {
 };
 
 /**
- * Terms for `RepoDvp::propose` (PRD §8 `RepoTerms`). `cashLender` is implied by the `source`
- * argument to `propose` (it signs and is the `cash_lender` param on-chain), so it's omitted here.
+ * Terms for `RepoDvp::propose`. `cashLender` is implied by the `source` argument to `propose`
+ * (it signs and is the `cash_lender` param on-chain), so it's omitted here. Unlike PRD §8's
+ * pseudocode (a single `RepoTerms` struct param), the real contract flattens these into individual
+ * arguments — see `contracts/repo-dvp/src/lib.rs::propose`.
  */
 export interface RepoProposeTerms {
   cashBorrower: string;
@@ -24,22 +26,19 @@ export interface RepoProposeTerms {
   agreementHash: Buffer;
 }
 
-function encodeRepoTerms(terms: RepoProposeTerms) {
-  return scStruct({
-    cash_borrower: scAddress(terms.cashBorrower),
-    asset: scAddress(terms.asset),
-    units: scI128(terms.units),
-    cash_amount: scI128(terms.cashAmount),
-    rate_bps: scU32(terms.rateBps),
-    kind: scSymbol(REPO_KIND_VARIANT[terms.kind]),
-    maturity_at: scU64(terms.maturityAt),
-    agreement_hash: scBytes(terms.agreementHash),
-  });
-}
-
 export class RepoDvpClient extends BaseContractClient {
   propose(source: string, terms: RepoProposeTerms): Promise<string> {
-    return this.invoke(source, "propose", [scAddress(source), encodeRepoTerms(terms)]);
+    return this.invoke(source, "propose", [
+      scAddress(source),
+      scAddress(terms.cashBorrower),
+      scAddress(terms.asset),
+      scI128(terms.units),
+      scI128(terms.cashAmount),
+      scU32(terms.rateBps),
+      enumToScVal(REPO_KIND_VARIANT[terms.kind]),
+      scU64(terms.maturityAt),
+      scBytes(terms.agreementHash),
+    ]);
   }
 
   acceptAndSettle(source: string, id: bigint): Promise<string> {

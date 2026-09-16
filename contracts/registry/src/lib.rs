@@ -124,11 +124,26 @@ impl Registry {
         );
 
         let mut config = read_asset(&env, &pending.asset);
+        // `raise_haircut_now` enforces `<= 10_000` bps on its own write path; this path must
+        // enforce the same bound (and a sane bound on the other bps-denominated fields) so a
+        // queued change can't silently push a field past 100% after the timelock elapses.
         match pending.change {
-            ParamChange::HaircutBaseBps(v) => config.haircut_base_bps = v,
-            ParamChange::HaircutFxBps(v) => config.haircut_fx_bps = v,
-            ParamChange::PriceBandBps(v) => config.price_band_bps = v,
-            ParamChange::DailyMoveBandBps(v) => config.daily_move_band_bps = v,
+            ParamChange::HaircutBaseBps(v) => {
+                assert!(v <= 10_000, "registry: haircut cannot exceed 100%");
+                config.haircut_base_bps = v;
+            }
+            ParamChange::HaircutFxBps(v) => {
+                assert!(v <= 10_000, "registry: haircut cannot exceed 100%");
+                config.haircut_fx_bps = v;
+            }
+            ParamChange::PriceBandBps(v) => {
+                assert!(v <= 10_000, "registry: band cannot exceed 100%");
+                config.price_band_bps = v;
+            }
+            ParamChange::DailyMoveBandBps(v) => {
+                assert!(v <= 10_000, "registry: band cannot exceed 100%");
+                config.daily_move_band_bps = v;
+            }
             ParamChange::RedemptionLagDays(v) => config.redemption_lag_days = v,
             ParamChange::Status(v) => config.status = v,
         }

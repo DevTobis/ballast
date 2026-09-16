@@ -39,6 +39,9 @@ importers:
 
   packages/db:
     dependencies:
+      '@ballast/domain-types':
+        specifier: workspace:*
+        version: link:../domain-types
       drizzle-orm:
         specifier: ^0.36.0
         version: 0.36.4(postgres@3.4.9)

@@ -459,6 +459,13 @@ impl CreditLine {
     pub fn line(env: Env, line: u64) -> Line {
         read_line(&env, line)
     }
+
+    /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
+    /// the line they're claiming to release collateral from, without decoding this contract's
+    /// full `Line` struct on the other side.
+    pub fn borrower_of(env: Env, line: u64) -> Address {
+        read_line(&env, line).borrower
+    }
 }
 
 #[cfg(test)]

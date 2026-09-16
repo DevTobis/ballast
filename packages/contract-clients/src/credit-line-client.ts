@@ -62,6 +62,19 @@ export class CreditLineClient extends BaseContractClient {
     return this.invoke(source, "repay", [scAddress(source), scU64(line), scI128(amount)]);
   }
 
+  /**
+   * Syncs `PledgeVault`'s actual on-chain pledged units into this line's LTV view
+   * (`contracts/credit-line/src/lib.rs::sync_collateral`, admin- or keeper-gated). Without this
+   * being called after every pledge/release, a line's `pledged_units` stays at its last synced
+   * value (0 for a brand-new line) and every `draw` would be rejected as unhealthy — this is the
+   * off-chain `margin-monitor`/`indexer` service's job, driven by observed `pledged`/`released`
+   * chain events, not something `services/api`'s pledge route calls directly (it only returns
+   * unsigned XDR for the borrower to sign; the pledge hasn't landed on-chain yet at that point).
+   */
+  syncCollateral(source: string, line: bigint, units: bigint): Promise<string> {
+    return this.invoke(source, "sync_collateral", [scAddress(source), scU64(line), scI128(units)]);
+  }
+
   /** Read-only; simulated rather than returned as unsigned XDR since it changes no state. */
   ltv(line: bigint): Promise<LtvView> {
     return this.read<LtvView>("ltv", [scU64(line)]);

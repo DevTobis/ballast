@@ -61,12 +61,16 @@ describe("forwardPayout", () => {
     expect(signer.submittedTx?.memo.type).toBe(MemoText);
     expect(signer.submittedTx?.memo.value?.toString()).toBe("customer-ref-123");
 
-    expect(inserted).toHaveLength(2);
+    // exit_fill + a balanced pair of journal_entry legs (debit usdc_cash, credit operator:payout_hop)
+    expect(inserted).toHaveLength(3);
     expect(inserted.find((i) => i.row.payoutRoute === "anchor_hop")).toMatchObject({
       row: { payoutRoute: "anchor_hop", payoutMemo: "customer-ref-123", txHash: "fakehash123" },
     });
+    expect(inserted.find((i) => i.row.account === "usdc_cash")).toMatchObject({
+      row: { account: "usdc_cash", debit: "5000.0000000", credit: "0.0000000", ccy: "USDC" },
+    });
     expect(inserted.find((i) => i.row.account === "operator:payout_hop")).toMatchObject({
-      row: { account: "operator:payout_hop", credit: "5000.0000000", ccy: "USDC" },
+      row: { account: "operator:payout_hop", debit: "0.0000000", credit: "5000.0000000", ccy: "USDC" },
     });
   });
 
@@ -86,8 +90,13 @@ describe("forwardPayout", () => {
     expect(signer.submittedTx?.memo.type).toBe(MemoID);
     expect(signer.submittedTx?.memo.value?.toString()).toBe("88221199");
 
-    // no quoteId -> no exit_fill row, only the journal_entry leg
-    expect(inserted).toHaveLength(1);
-    expect(inserted[0].row).toMatchObject({ account: "operator:payout_hop", credit: "10.0000000" });
+    // no quoteId -> no exit_fill row, just the balanced pair of journal_entry legs
+    expect(inserted).toHaveLength(2);
+    expect(inserted.find((i) => i.row.account === "usdc_cash")).toMatchObject({
+      row: { account: "usdc_cash", debit: "10.0000000", credit: "0.0000000" },
+    });
+    expect(inserted.find((i) => i.row.account === "operator:payout_hop")).toMatchObject({
+      row: { account: "operator:payout_hop", debit: "0.0000000", credit: "10.0000000" },
+    });
   });
 });

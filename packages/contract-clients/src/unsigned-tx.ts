@@ -8,6 +8,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "@ballast/network-config";
+import { normalizeContractValue } from "./scval.js";
 
 /**
  * Read-only contract calls (`asset`, `guardedPrice`, `ltv`, `quote`, ...) are simulated, not
@@ -111,7 +112,7 @@ export async function simulateRead<T = unknown>(
   if (!sim.result) {
     throw new Error(`contract-clients: simulation of "${method}" returned no result`);
   }
-  return scValToNative(sim.result.retval) as T;
+  return normalizeContractValue(scValToNative(sim.result.retval)) as T;
 }
 
 /** `Account` is only needed by callers who want to inspect/mutate a fetched source account. */

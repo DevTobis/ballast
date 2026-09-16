@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
-import { classifyMargin } from "@ballast/domain-types";
+import { classifyMargin, decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-types";
 import type { ContractClients } from "../contract-clients.js";
 import {
   createDrawSchema,
@@ -32,7 +32,7 @@ export function registerCreditLineRoutes(
         lenderId: body.lenderId,
         borrowerId: body.borrowerId,
         loanCcy: body.loanCcy,
-        limitAmount: body.limit.toString(),
+        limitAmount: scaledToDecimalString(body.limit),
         rateBps: body.rateBps,
         feeBps: body.feeBps,
         cureWindowS: body.cureWindowS,
@@ -71,7 +71,10 @@ export function registerCreditLineRoutes(
       lenderId: line.lenderId,
       borrowerId: line.borrowerId,
       loanCcy: line.loanCcy,
-      limit: line.limitAmount,
+      // Both returned as raw 7-decimal-scaled-bigint strings (the on-chain/request-body
+      // convention), not the Postgres decimal-string form `limitAmount` is stored as — a
+      // response that mixed the two conventions for the same kind of quantity was a real bug.
+      limit: decimalStringToScaled(line.limitAmount).toString(),
       drawn: debt.toString(),
       rateBps: line.rateBps,
       feeBps: line.feeBps,
@@ -103,18 +106,20 @@ export function registerCreditLineRoutes(
       .values({
         creditLineId: line.id,
         assetId: asset.id,
-        units: body.units.toString(),
+        units: scaledToDecimalString(body.units),
         custodyMode: body.custodyMode,
         status: "pending",
       })
       .returning();
 
+    // Custody mode is a property of the asset (set via `PledgeVault.configure_asset`), not a
+    // per-call choice, so it's recorded on the `pledge` row for our own bookkeeping but not sent
+    // on-chain here.
     const xdr = await contracts.pledgeVault.pledge(
       borrowerAccount,
       BigInt(line.contractLineId),
       asset.contractC,
       body.units,
-      body.custodyMode,
     );
 
     return reply.code(201).send({ xdr, pledgeId: row.id });
@@ -159,7 +164,7 @@ export function registerCreditLineRoutes(
         borrowerAccount,
         BigInt(line.contractLineId),
         asset.contractC,
-        BigInt(Math.round(Number(pledge.units))),
+        decimalStringToScaled(pledge.units),
       );
 
       return { xdr, pledgeId: pledge.id, projectedLtvBps: postReleaseLtvBps };

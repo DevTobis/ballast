@@ -54,13 +54,15 @@ pub trait PriceGuardInterface {
     fn guarded_price(env: Env, asset: Address) -> GuardedPrice;
 }
 
-/// Cross-contract call to CreditLine's `ltv` view. `LtvView` is redefined locally (see the struct
-/// below) rather than imported, since PledgeVault and CreditLine are decoupled crates by design —
-/// they're built together in this pass, so the shape is hand-kept in sync between the two rather
-/// than shared from a common source. That hand-sync is the wiring compromise called out above.
+/// Cross-contract call to CreditLine's `ltv` view and its `borrower_of` getter. `LtvView` is
+/// redefined locally (see the struct below) rather than imported, since PledgeVault and CreditLine
+/// are decoupled crates by design — they're built together in this pass, so the shape is
+/// hand-kept in sync between the two rather than shared from a common source. That hand-sync is
+/// the wiring compromise called out above.
 #[contractclient(name = "CreditLineClient")]
 pub trait CreditLineInterface {
     fn ltv(env: Env, line: u64) -> LtvView;
+    fn borrower_of(env: Env, line: u64) -> Address;
 }
 
 /// Mirrors `ballast_credit_line::LtvView` field-for-field. Soroban structs are encoded on the
@@ -93,7 +95,13 @@ pub struct AssetConfig {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Position {
+    /// Collateral actually counted toward this line's LTV. In escrow mode this is credited the
+    /// moment `pledge` transfers the token in (the transfer itself is the trust boundary). In
+    /// lien mode it is credited only once `record_lien` confirms the issuer/custodian has
+    /// actually placed the lien — see `pending_lien_units`.
     pub units: i128,
+    /// Lien-mode units pledged but not yet gateway-confirmed. Always 0 in escrow mode.
+    pub pending_lien_units: i128,
     pub mode: CustodyMode,
     pub lien_ref: Option<Bytes>,
 }
@@ -125,6 +133,7 @@ fn read_position(env: &Env, line: u64, asset: &Address) -> Position {
         .get(&DataKey::Position(line, asset.clone()))
         .unwrap_or(Position {
             units: 0,
+            pending_lien_units: 0,
             mode: CustodyMode::Escrow,
             lien_ref: None,
         })
@@ -206,26 +215,31 @@ impl PledgeVault {
     /// `set_authorized` / SEP-57 `verify_identity`) actually gets enforced — an unauthorized
     /// holder's transfer simply reverts there (PRD §8 invariant 8).
     ///
-    /// Lien modes (`IssuerLien` / `CustodianLien`): no token transfer, just a recorded position.
+    /// Lien modes (`IssuerLien` / `CustodianLien`): no token transfer. **The pledged units do not
+    /// count toward the line's LTV yet** — they land in `pending_lien_units` until `record_lien`
+    /// confirms the issuer/custodian has actually placed the lien (PRD: "a lien is considered
+    /// established" only at that point). Before that fix, this function credited `position.units`
+    /// immediately in lien mode, letting a borrower's uncorroborated pledge count as real
+    /// collateral for `CreditLine`'s LTV math ahead of any issuer confirmation.
+    ///
     /// The mode comes from the asset's `configure_asset` record, not a caller-supplied argument
     /// (PRD §8's `pledge` signature takes no mode — custody mode is a property of the asset, not
-    /// a per-call choice). A real issuer-lien flow needs off-chain confirmation from the
-    /// `issuer-gateway` service before a lien is considered established — that confirmation is
-    /// what `record_lien` attaches, gated on the gateway role.
+    /// a per-call choice).
     pub fn pledge(env: Env, borrower: Address, line: u64, asset: Address, units: i128) {
         borrower.require_auth();
         pause::require_not_paused(&env, &PauseScope::Pledges);
         assert!(units > 0, "pledge-vault: units must be positive");
 
         let config = read_asset_config(&env, &asset);
+        let mut position = read_position(&env, line, &asset);
 
         if config.custody_mode == CustodyMode::Escrow {
             let token_client = token::Client::new(&env, &asset);
             token_client.transfer(&borrower, &muxed(&env.current_contract_address()), &units);
+            position.units += units;
+        } else {
+            position.pending_lien_units += units;
         }
-
-        let mut position = read_position(&env, line, &asset);
-        position.units += units;
         position.mode = config.custody_mode;
         write_position(&env, line, &asset, &position);
 
@@ -236,17 +250,31 @@ impl PledgeVault {
     /// Releases `units` of collateral back to `borrower`, but only if doing so leaves the linked
     /// `CreditLine` at a healthy or warning LTV — never margin-call or liquidation. This is the
     /// only borrower-initiated way RWA leaves the vault (PRD §8 invariant 4).
+    ///
+    /// **Security-critical check**: `Position` is keyed by `(line, asset)`, not `(borrower, line,
+    /// asset)` (see the module doc comment on why), so nothing about the storage key itself proves
+    /// `borrower` is the real borrower of `line`. Without cross-checking against
+    /// `CreditLine::borrower_of`, `borrower.require_auth()` alone only proves *someone* signed —
+    /// any account could name itself as `borrower` against another party's line id (line ids are
+    /// sequential and easily enumerable) and drain that line's escrowed collateral to itself,
+    /// since the health check that follows validates the *line's* LTV, not who's asking.
     pub fn release(env: Env, borrower: Address, line: u64, asset: Address, units: i128) {
         borrower.require_auth();
         assert!(units > 0, "pledge-vault: units must be positive");
+
+        let config = read_asset_config(&env, &asset);
+
+        let real_borrower = CreditLineClient::new(&env, &config.credit_line).borrower_of(&line);
+        assert_eq!(
+            borrower, real_borrower,
+            "pledge-vault: caller is not this line's borrower"
+        );
 
         let mut position = read_position(&env, line, &asset);
         assert!(
             units <= position.units,
             "pledge-vault: release exceeds pledged units"
         );
-
-        let config = read_asset_config(&env, &asset);
 
         let guarded: GuardedPrice = PriceGuardClient::new(&env, &config.price_guard).guarded_price(&asset);
         assert!(
@@ -278,11 +306,13 @@ impl PledgeVault {
             .publish((Symbol::new(&env, "released"), line), (asset, units));
     }
 
-    /// Attaches an off-chain lien reference to a lien-mode position (modes B/C), for audit (PRD
-    /// §7 `pledge.lien_ref`). Only the configured `issuer-gateway` operator may call this — it
-    /// does so once it has confirmed the issuer (or custodian) has actually placed the lien.
-    /// `units` is informational (expected to match the position established via `pledge`) rather
-    /// than something this call uses to mutate the balance.
+    /// Confirms a lien-mode pledge (modes B/C): moves `units` from `pending_lien_units` into the
+    /// counted `position.units` that backs the line's LTV, and records the lien reference for
+    /// audit (PRD §7 `pledge.lien_ref`). Only the configured `issuer-gateway` operator may call
+    /// this — it does so once it has confirmed the issuer (or custodian) has actually placed the
+    /// lien. `units` is load-bearing, not informational: it can never exceed what's still pending,
+    /// so the gateway can confirm a pledge in partial tranches but never manufacture collateral
+    /// beyond what the borrower actually pledged.
     pub fn record_lien(env: Env, gateway: Address, line: u64, asset: Address, units: i128, lien_ref: Bytes) {
         gateway.require_auth();
         let stored: Address = env
@@ -294,9 +324,15 @@ impl PledgeVault {
             gateway, stored,
             "pledge-vault: caller is not the configured gateway"
         );
-        let _ = units;
+        assert!(units > 0, "pledge-vault: units must be positive");
 
         let mut position = read_position(&env, line, &asset);
+        assert!(
+            units <= position.pending_lien_units,
+            "pledge-vault: units exceed pending (unconfirmed) lien units"
+        );
+        position.pending_lien_units -= units;
+        position.units += units;
         position.lien_ref = Some(lien_ref);
         write_position(&env, line, &asset, &position);
     }
@@ -425,12 +461,12 @@ mod test {
         }
     }
 
-    // A minimal in-crate mock CreditLine exposing just `ltv`, returning a canned `LtvView`-shaped
-    // value — this crate never depends on the real `ballast-credit-line` crate.
+    // A minimal in-crate mock CreditLine exposing just `ltv`/`borrower_of`, returning canned
+    // values — this crate never depends on the real `ballast-credit-line` crate.
     mod mock_credit_line {
         use crate::LtvView;
         use ballast_common::{margin::MarginState, price::PriceStatus};
-        use soroban_sdk::{contract, contractimpl, contracttype, Env};
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
         #[contract]
         pub struct MockCreditLine;
@@ -438,12 +474,17 @@ mod test {
         #[contracttype]
         enum DataKey {
             Debt,
+            Borrower,
         }
 
         #[contractimpl]
         impl MockCreditLine {
             pub fn set_debt(env: Env, debt: i128) {
                 env.storage().instance().set(&DataKey::Debt, &debt);
+            }
+
+            pub fn set_borrower(env: Env, borrower: Address) {
+                env.storage().instance().set(&DataKey::Borrower, &borrower);
             }
 
             pub fn ltv(env: Env, _line: u64) -> LtvView {
@@ -455,6 +496,13 @@ mod test {
                     state: MarginState::Healthy,
                     price_status: PriceStatus::Ok,
                 }
+            }
+
+            pub fn borrower_of(env: Env, _line: u64) -> Address {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Borrower)
+                    .expect("mock-credit-line: borrower not set")
             }
         }
     }
@@ -514,6 +562,7 @@ mod test {
 
         price_guard.set_price(&price, &ballast_common::price::PriceStatus::Ok);
         credit_line.set_debt(&debt);
+        credit_line.set_borrower(&borrower);
 
         Harness {
             env,
@@ -547,6 +596,21 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "pledge-vault: caller is not this line's borrower")]
+    fn release_by_non_borrower_panics() {
+        // Regression test: `release` must check the caller is the *real* borrower of `line`, not
+        // just that *someone* signed. Positions are keyed by `(line, asset)` with no borrower
+        // dimension, so without this check any signer naming itself as `borrower` against
+        // another party's line id could drain that line's escrowed collateral to itself.
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        let attacker = Address::generate(&h.env);
+        h.vault.release(&attacker, &1, &h.asset, &(50 * PRICE_SCALE));
+    }
+
+    #[test]
     #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
     fn release_breaching_ltv_panics() {
         // 5% haircut, $900 debt, $1.00 price -> already close to the edge.
@@ -577,16 +641,45 @@ mod test {
         );
 
         h.vault.pledge(&h.borrower, &2, &h.asset, &(100 * PRICE_SCALE));
-        // No token movement in lien mode.
+        // No token movement in lien mode, and the pledge doesn't count toward LTV yet — it's
+        // pending gateway confirmation.
         assert_eq!(h.token.balance(&h.vault.address), 0);
+        assert_eq!(h.vault.position_units(&2, &h.asset), 0);
 
         let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-123");
         h.vault
             .record_lien(&gateway, &2, &h.asset, &(100 * PRICE_SCALE), &lien_ref);
+        // Now confirmed: counts toward LTV.
+        assert_eq!(h.vault.position_units(&2, &h.asset), 100 * PRICE_SCALE);
 
         // Keeper can liquidate a lien-mode position without any token transfer needed.
         let to = Address::generate(&h.env);
         h.vault.liquidate(&Address::generate(&h.env), &2, &h.asset, &(100 * PRICE_SCALE), &to);
         assert_eq!(h.vault.position_units(&2, &h.asset), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units exceed pending (unconfirmed) lien units")]
+    fn record_lien_cannot_confirm_more_than_pending() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        h.vault.pledge(&h.borrower, &3, &h.asset, &(100 * PRICE_SCALE));
+
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-456");
+        // Only 100 units are pending; confirming 101 must panic rather than manufacture
+        // collateral beyond what was actually pledged.
+        h.vault
+            .record_lien(&gateway, &3, &h.asset, &(101 * PRICE_SCALE), &lien_ref);
     }
 }

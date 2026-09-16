@@ -1,6 +1,11 @@
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
-import { collateralValue as computeCollateralValue, ltvBps as computeLtvBps, classifyMargin } from "@ballast/domain-types";
+import {
+  collateralValue as computeCollateralValue,
+  ltvBps as computeLtvBps,
+  classifyMargin,
+  decimalStringToScaled,
+} from "@ballast/domain-types";
 
 export async function requireStellarAccount(db: Database, partyId: string): Promise<string> {
   const [account] = await db
@@ -34,8 +39,8 @@ export async function outstandingDebt(db: Database, creditLineId: string): Promi
     .select()
     .from(schema.repayment)
     .where(eq(schema.repayment.creditLineId, creditLineId));
-  const drawn = draws.reduce((sum, d) => sum + BigInt(Math.round(Number(d.amount))), 0n);
-  const repaid = repayments.reduce((sum, r) => sum + BigInt(Math.round(Number(r.principal))), 0n);
+  const drawn = draws.reduce((sum, d) => sum + decimalStringToScaled(d.amount), 0n);
+  const repaid = repayments.reduce((sum, r) => sum + decimalStringToScaled(r.principal), 0n);
   const debt = drawn - repaid;
   return debt > 0n ? debt : 0n;
 }
@@ -47,7 +52,7 @@ async function latestGuardedPrice(db: Database, assetId: string): Promise<{ valu
     .where(eq(schema.priceSnapshot.assetId, assetId));
   if (rows.length === 0) return null;
   const latest = rows.reduce((a, b) => (b.createdAt > a.createdAt ? b : a));
-  return { value: BigInt(Math.round(Number(latest.guardedValue))), status: latest.status };
+  return { value: decimalStringToScaled(latest.guardedValue), status: latest.status };
 }
 
 /**
@@ -74,7 +79,7 @@ export async function estimateLtvBps(
     const price = await latestGuardedPrice(db, pledge.assetId);
     if (!price || price.status !== "Ok") continue;
     totalCollateral += computeCollateralValue(
-      BigInt(Math.round(Number(pledge.units))),
+      decimalStringToScaled(pledge.units),
       price.value,
       asset.haircutBaseBps + asset.haircutFxBps,
     );
