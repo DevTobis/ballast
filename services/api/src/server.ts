@@ -4,6 +4,7 @@ import { loadApiConfig, type ApiConfig } from "./config.js";
 import { registerAuth } from "./auth.js";
 import { getDb } from "./db.js";
 import { getContractClients, type ContractClients } from "./contract-clients.js";
+import { registerDevAuthRoutes } from "./routes/dev-auth.js";
 import { registerAssetRoutes } from "./routes/assets.js";
 import { registerCreditLineRoutes } from "./routes/credit-lines.js";
 import { registerExitRoutes } from "./routes/exit.js";
@@ -35,6 +36,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   // supported assets/prices); everything else needs a resolved partyId.
   app.get("/healthz", { config: { public: true } }, async () => ({ ok: true }));
 
+  registerDevAuthRoutes(app, db, config);
   registerAssetRoutes(app, db);
   registerCreditLineRoutes(app, db, contracts);
   registerExitRoutes(app, db, contracts);

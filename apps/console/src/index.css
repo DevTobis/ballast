@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+/*
+ * Tactical Telemetry theme (industrial-brutalist-ui skill, CRT terminal variant).
+ * Dark substrate only, no light mode, no gradients, no border-radius, no soft shadows.
+ * Monospace dominates both macro and micro typography per the skill's "absolute dominance of
+ * monospaced typography" rule for this variant.
+ */
+@theme {
+  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --color-bg: #0a0a0a;
+  --color-bg-raised: #121212;
+  --color-fg: #eaeaea;
+  --color-fg-dim: #8a8a8a;
+  --color-line: #2a2a2a;
+  --color-accent: #ff2a2a;
+  --color-ok: #4af626;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* CRT scanline overlay, fixed and pointer-events-none per the skill's DOM-cost guardrail. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgb(255 255 255 / 0.015) 2px,
+    rgb(255 255 255 / 0.015) 4px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

@@ -7,6 +7,7 @@ import {
   createDrawSchema,
   createPledgeSchema,
   createRepaymentSchema,
+  fundCreditLineSchema,
   openCreditLineSchema,
 } from "../schemas.js";
 import { estimateLtvBps, outstandingDebt, requireAsset, requireCreditLine, requireStellarAccount } from "./helpers.js";
@@ -84,6 +85,29 @@ export function registerCreditLineRoutes(
       ltvBps,
       marginState: classifyMargin(ltvBps, MARGIN_THRESHOLDS),
     };
+  });
+
+  // Not in the PRD §9 route list (which covers borrower-facing actions), but `CreditLine.fund`
+  // is a real, lender-authed on-chain function with no other way to reach it from this API - a
+  // credit line a lender never funds can never be drawn against.
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/fund", async (request, reply) => {
+    const body = fundCreditLineSchema.parse(request.body);
+    let line;
+    try {
+      line = await requireCreditLine(db, request.params.id);
+    } catch {
+      return reply.code(404).send({ error: "credit line not found" });
+    }
+    if (!line.contractLineId) {
+      return reply.code(409).send({ error: "credit line has not settled on-chain yet" });
+    }
+    if (line.lenderId !== request.partyId) {
+      return reply.code(403).send({ error: "only this line's lender may fund it" });
+    }
+
+    const lenderAccount = await requireStellarAccount(db, line.lenderId);
+    const xdr = await contracts.creditLine.fund(lenderAccount, BigInt(line.contractLineId), body.amount);
+    return reply.code(201).send({ xdr });
   });
 
   app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/pledges", async (request, reply) => {

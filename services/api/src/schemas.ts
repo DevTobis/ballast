@@ -25,6 +25,10 @@ export const createPledgeSchema = z.object({
   custodyMode: z.enum(["escrow", "issuer_lien", "custodian_lien"]),
 });
 
+export const fundCreditLineSchema = z.object({
+  amount: bigintish,
+});
+
 export const createDrawSchema = z.object({
   amount: bigintish,
   to: z.string(),
