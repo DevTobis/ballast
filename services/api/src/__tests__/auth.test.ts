@@ -7,10 +7,15 @@ import { createFakeDb } from "./fake-db.js";
 
 const config: ApiConfig = {
   port: 0,
-  sep10SigningKey: "test-signing-key",
+  jwtSigningSecret: "test-signing-key",
+  sep10ServerSecret: "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  sep10HomeDomain: "localhost",
+  sep10WebAuthDomain: "localhost",
+  networkPassphrase: "Test SDF Network ; September 2015",
   webhookHmacSecret: "test-webhook-secret",
   webhookSubscribers: [],
   institutionApiKeys: {},
+  consoleOrigin: "http://localhost:5173",
 };
 
 function testServer() {

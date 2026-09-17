@@ -1,12 +1,16 @@
-import { Account, Keypair, Transaction, rpc } from "@stellar/stellar-sdk";
+import { Account, Transaction, TransactionBuilder, rpc } from "@stellar/stellar-sdk";
 import type { Logger } from "@ballast/observability";
+import { createOperatorSigner, type KmsSigner } from "@ballast/operator-signing";
 
 /**
  * The seam between "who authorises and submits the operator's classic hop transaction" and "how
- * that key/RPC connection is managed" (PRD §5 Phase 2: the operator G-account hop). Ballast never
- * holds customer keys — this operator key is the deliberate exception, and production should back
- * it with a real KMS rather than a raw env var. `hop.ts` only depends on this interface, so
- * swapping the implementation never touches call sites.
+ * that key/RPC connection is managed" (PRD §5 Phase 2: the operator G-account hop). `hop.ts` only
+ * depends on this interface, so swapping the implementation never touches call sites.
+ *
+ * This needs more than `@ballast/operator-signing`'s `KmsSigner` (`loadSequenceAccount()` and
+ * `networkPassphrase()` are payout-hop-specific, `KmsSigner` doesn't have them), so it stays its
+ * own interface — `OperatorPayoutSigner` below implements it by composing a `KmsSigner` for the
+ * actual signing.
  */
 export interface PayoutSigner {
   /** The operator's classic G-address. */
@@ -19,32 +23,31 @@ export interface PayoutSigner {
 }
 
 /**
- * MOCK-ish, same caveat as `services/keeper`'s `MockEnvKeypairSigner`: fine for local dev, but a
- * production deployment must use a KMS-backed signer that never exposes the raw secret key to
- * this process. Reads `PAYOUT_HOP_SECRET_KEY` from the environment.
+ * `PayoutSigner` implementation for the operator's classic hop account. Delegates the actual
+ * signing to a `KmsSigner` from `@ballast/operator-signing` (resolved via `createOperatorSigner`,
+ * mode controlled by `PAYOUT_HOP_SIGNER_MODE`), so this class only owns the payout-hop-specific
+ * bits: loading the account's sequence number and submitting the signed tx.
  */
-export class EnvKeypairPayoutSigner implements PayoutSigner {
-  private readonly keypair: Keypair;
+export class OperatorPayoutSigner implements PayoutSigner {
   private readonly rpcServer: rpc.Server;
 
   constructor(
     private readonly logger: Logger,
     private readonly rpcUrl: string,
     private readonly passphrase: string,
-    secretKeyEnvVar = "PAYOUT_HOP_SECRET_KEY",
+    private readonly kmsSigner: KmsSigner,
   ) {
-    const secret = process.env[secretKeyEnvVar];
-    if (!secret) {
-      throw new Error(
-        `payout-hop: ${secretKeyEnvVar} is not set — the operator hop account key is required, there is no dry-run mode for moving anchor funds`,
-      );
-    }
-    this.keypair = Keypair.fromSecret(secret);
     this.rpcServer = new rpc.Server(rpcUrl);
   }
 
+  /** Resolves the operator signer per `PAYOUT_HOP_SIGNER_MODE` and builds an `OperatorPayoutSigner` around it. */
+  static async create(logger: Logger, rpcUrl: string, passphrase: string): Promise<OperatorPayoutSigner> {
+    const kmsSigner = await createOperatorSigner("payout-hop", passphrase);
+    return new OperatorPayoutSigner(logger, rpcUrl, passphrase, kmsSigner);
+  }
+
   publicKey(): string {
-    return this.keypair.publicKey();
+    return this.kmsSigner.publicKey();
   }
 
   networkPassphrase(): string {
@@ -52,13 +55,14 @@ export class EnvKeypairPayoutSigner implements PayoutSigner {
   }
 
   async loadSequenceAccount(): Promise<Account> {
-    const account = await this.rpcServer.getAccount(this.keypair.publicKey());
+    const account = await this.rpcServer.getAccount(this.kmsSigner.publicKey());
     return account;
   }
 
   async signAndSubmit(tx: Transaction): Promise<{ hash: string; status: string }> {
-    tx.sign(this.keypair);
-    const result = await this.rpcServer.sendTransaction(tx);
+    const signedXdr = await this.kmsSigner.sign(tx.toXDR());
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, this.passphrase) as Transaction;
+    const result = await this.rpcServer.sendTransaction(signedTx);
     this.logger.info({ hash: result.hash, status: result.status }, "payout-hop: submitted anchor hop transaction");
     return { hash: result.hash, status: result.status };
   }

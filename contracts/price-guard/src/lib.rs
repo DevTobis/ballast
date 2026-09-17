@@ -17,19 +17,35 @@
 //! matches SEP-40's `{ price, timestamp }` closely enough that swapping the ingestion path
 //! wouldn't change `guarded_price`'s logic.
 //!
-//! **Documented simplification — `publish_nav`'s `sig` parameter.** There is no on-chain
-//! ed25519-verification of the issuer's signature against a registered issuer public key here —
-//! `Address` in Soroban doesn't expose a raw public key, and no key-registration mechanism exists
-//! in this skeleton. `sig` is stored as an audit-trail field only. The real trust boundary is
-//! `require_price_publisher`'s `require_auth()`: only the configured off-chain publisher may call
-//! `publish_nav`/`publish_source` at all, and that publisher is expected to have already checked
-//! the issuer's signature itself before submitting.
+//! **`publish_nav`'s `sig` parameter — now verified on-chain.** `Address` in Soroban doesn't
+//! expose a raw public key, so this contract adds its own tiny key-registration mechanism:
+//! `configure_issuer_key` (admin-only) stores a raw Ed25519 public key per asset
+//! (`DataKey::IssuerPubKey`), and `publish_nav` verifies `sig` against it via
+//! `env.crypto().ed25519_verify(..)` over the canonical message `"{asset_code}:{ts}:{value}"` —
+//! the SAME message the off-chain `price-guard` service verifies before it ever calls
+//! `publish_nav` (see `services/price-guard/src/navSignature.ts`). `asset_code` is passed in as
+//! raw UTF-8 `Bytes` (rather than derived from `Address`, which has no ASCII/ticker
+//! representation this contract can cheaply reconstruct) so both sides build byte-for-byte the
+//! same message.
+//!
+//! An admin-settable `require_nav_signature` flag (default `true`, global — not per-asset; see
+//! `configure_signature_requirement`) exists as a local-testing/bring-up affordance: a fresh
+//! local/testnet deploy has no issuer keys registered yet, and forcing signature checks on from
+//! the very first `publish_nav` call would brick the smoke-test flow before anyone's had a chance
+//! to run `configure_issuer_key`. It is NOT a security control — production deploys should leave
+//! it at its default `true` once real issuer keys are configured. See `contracts/README.md` for
+//! the testnet-smoke-flow implication.
+//!
+//! The real trust boundary is still `require_price_publisher`'s `require_auth()`: only the
+//! configured off-chain publisher may call `publish_nav`/`publish_source` at all. Signature
+//! verification adds a second, independent check — the publisher itself must have received a
+//! validly-signed reading from the issuer, not just be an authorized caller.
 
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 const ISSUER_SOURCE: &str = "issuer";
 
@@ -68,6 +84,78 @@ enum DataKey {
     /// promotes it to `LastGood` — otherwise the very next read would recompute the same
     /// still-too-large move against the stale `LastGood` and immediately re-halt.
     PendingHaltValue(Address),
+    /// Raw 32-byte Ed25519 public key for the issuer that signs `asset`'s NAV readings, set via
+    /// `configure_issuer_key`. `publish_nav` verifies `sig` against this when
+    /// `require_nav_signature` is `true`.
+    IssuerPubKey(Address),
+    /// Global (not per-asset) admin-settable flag, default `true` when unset — see the module doc
+    /// comment on why this exists and why it isn't a security control.
+    RequireNavSignature,
+}
+
+/// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
+/// NAV message's `ts`/`value` segments on-chain — mirrors `alloc_free_sort` above in spirit
+/// (stack-only buffers, no heap).
+mod decimal_ascii {
+    use soroban_sdk::{Bytes, Env};
+
+    /// u64::MAX is 20 digits.
+    pub fn u64_to_bytes(env: &Env, mut n: u64) -> Bytes {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        if n == 0 {
+            i -= 1;
+            buf[i] = b'0';
+        }
+        while n > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        Bytes::from_slice(env, &buf[i..])
+    }
+
+    /// i128::MIN/MAX is 39 digits, plus an optional leading `-`.
+    pub fn i128_to_bytes(env: &Env, n: i128) -> Bytes {
+        let negative = n < 0;
+        let mut magnitude = n.unsigned_abs();
+        let mut buf = [0u8; 40];
+        let mut i = buf.len();
+        if magnitude == 0 {
+            i -= 1;
+            buf[i] = b'0';
+        }
+        while magnitude > 0 {
+            i -= 1;
+            buf[i] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+        }
+        if negative {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        Bytes::from_slice(env, &buf[i..])
+    }
+}
+
+/// Builds the canonical NAV message `"{asset_code}:{ts}:{value}"` (UTF-8 bytes) that both this
+/// contract and the off-chain `price-guard` service (`services/price-guard/src/navSignature.ts`)
+/// sign/verify against. Keep these two builders in lockstep — see the module doc comment.
+fn build_nav_message(env: &Env, asset_code: &Bytes, ts: u64, value: i128) -> Bytes {
+    let colon = Bytes::from_slice(env, b":");
+    let mut message = asset_code.clone();
+    message.append(&colon);
+    message.append(&decimal_ascii::u64_to_bytes(env, ts));
+    message.append(&colon);
+    message.append(&decimal_ascii::i128_to_bytes(env, value));
+    message
+}
+
+fn require_nav_signature(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::RequireNavSignature)
+        .unwrap_or(true)
 }
 
 fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
@@ -241,11 +329,54 @@ impl PriceGuard {
         );
     }
 
-    /// PRD §8: issuer-signed NAV. See the module doc comment on `sig`.
-    pub fn publish_nav(env: Env, publisher: Address, asset: Address, value: i128, ts: u64, sig: BytesN<64>) {
+    /// Admin-only. Registers/rotates the raw Ed25519 public key `asset`'s issuer signs NAV
+    /// readings with — see the module doc comment. Required before `publish_nav` can succeed for
+    /// `asset` while `require_nav_signature` is `true`.
+    pub fn configure_issuer_key(env: Env, admin: Address, asset: Address, issuer_pubkey: BytesN<32>) {
+        admin.require_auth();
+        access::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::IssuerPubKey(asset), &issuer_pubkey);
+    }
+
+    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all —
+    /// see the module doc comment on why this exists and why it defaults to `true`.
+    pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
+        admin.require_auth();
+        access::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::RequireNavSignature, &required);
+    }
+
+    /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
+    /// asset's registered issuer key (`configure_issuer_key`) whenever `require_nav_signature` is
+    /// `true` (the default), over the canonical message built from `asset_code`/`ts`/`value`.
+    pub fn publish_nav(
+        env: Env,
+        publisher: Address,
+        asset: Address,
+        asset_code: Bytes,
+        value: i128,
+        ts: u64,
+        sig: BytesN<64>,
+    ) {
         publisher.require_auth();
         access::require_price_publisher(&env);
         read_config(&env, &asset); // asserts the asset is configured
+
+        if require_nav_signature(&env) {
+            let issuer_pubkey: BytesN<32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::IssuerPubKey(asset.clone()))
+                .expect("price-guard: no issuer public key configured for asset (call configure_issuer_key)");
+            let message = build_nav_message(&env, &asset_code, ts, value);
+            // Panics (traps the whole invocation) if `sig` doesn't verify — see
+            // `soroban_sdk::crypto::Crypto::ed25519_verify`'s doc comment.
+            env.crypto().ed25519_verify(&issuer_pubkey, &message, &sig);
+        }
 
         env.storage()
             .instance()
@@ -425,16 +556,47 @@ mod test {
         let asset = Address::generate(&env);
         client.configure_asset(&admin, &asset, &band_bps, &daily_move_band_bps, &max_staleness_s);
 
+        // These tests exercise the median/band/staleness/halt logic, not signature verification
+        // (which has its own dedicated tests below) — turn the check off so a zero-filled `sig`
+        // doesn't panic every call here.
+        client.configure_signature_requirement(&admin, &false);
+
         (env, client, price_publisher, risk, asset)
     }
 
     const SCALE: i128 = ballast_common::price::PRICE_SCALE;
 
+    fn asset_code(env: &Env) -> Bytes {
+        Bytes::from_slice(env, b"TESTASSET")
+    }
+
+    /// A real (but fixed/deterministic, test-only) Ed25519 keypair via `ed25519-dalek`, plus a
+    /// helper to sign the exact canonical message `publish_nav` verifies
+    /// (`build_nav_message` above) — so the signature tests below exercise real crypto, not a
+    /// stub.
+    fn test_issuer_keypair(env: &Env) -> (BytesN<32>, ed25519_dalek::SigningKey) {
+        let seed = [9u8; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pubkey_bytes = signing_key.verifying_key().to_bytes();
+        (BytesN::from_array(env, &pubkey_bytes), signing_key)
+    }
+
+    fn sign_nav(env: &Env, signing_key: &ed25519_dalek::SigningKey, code: &Bytes, ts: u64, value: i128) -> BytesN<64> {
+        use ed25519_dalek::Signer;
+        let message = build_nav_message(env, code, ts, value);
+        let mut message_bytes = [0u8; 256];
+        let len = message.len() as usize;
+        message.copy_into_slice(&mut message_bytes[..len]);
+        let sig = signing_key.sign(&message_bytes[..len]);
+        BytesN::from_array(env, &sig.to_bytes())
+    }
+
     #[test]
     fn fewer_than_two_fresh_sources_is_degraded() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
-        client.publish_nav(&publisher, &asset, &SCALE, &env.ledger().timestamp(), &sig);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &env.ledger().timestamp(), &sig);
 
         let price = client.guarded_price(&asset);
         assert_eq!(price.status, PriceStatus::Degraded);
@@ -443,9 +605,10 @@ mod test {
     #[test]
     fn disagreeing_fresh_sources_beyond_band_is_degraded() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
         // 5% off from SCALE -> 500 bps, well beyond a 50 bps band.
         let redstone = Symbol::new(&env, "redston");
         client.publish_source(&publisher, &asset, &redstone, &(SCALE + SCALE / 20), &now);
@@ -457,9 +620,10 @@ mod test {
     #[test]
     fn stale_source_is_excluded_and_can_drop_below_threshold() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 100);
+        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let t0 = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &SCALE, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
         let redstone = Symbol::new(&env, "redston");
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &t0);
 
@@ -472,12 +636,13 @@ mod test {
     #[test]
     fn big_daily_move_halts_and_stays_halted_until_cleared() {
         let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let t0 = env.ledger().timestamp();
         let redstone = Symbol::new(&env, "redston");
 
         // First establish a good median at SCALE.
-        client.publish_nav(&publisher, &asset, &SCALE, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &t0);
         let first = client.guarded_price(&asset);
         assert_eq!(first.status, PriceStatus::Ok);
@@ -485,7 +650,7 @@ mod test {
         // Now both sources agree on a value 2% higher -> within band (50bps band would actually
         // reject this pair too, so widen band check: use a large jump both sources agree on).
         let moved = SCALE + SCALE / 50; // +2%
-        client.publish_nav(&publisher, &asset, &moved, &(t0 + 10), &sig);
+        client.publish_nav(&publisher, &asset, &code, &moved, &(t0 + 10), &sig);
         client.publish_source(&publisher, &asset, &redstone, &moved, &(t0 + 10));
 
         let second = client.guarded_price(&asset);
@@ -503,14 +668,54 @@ mod test {
     #[test]
     fn agreeing_fresh_sources_within_band_is_ok() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
         let redstone = Symbol::new(&env, "redston");
-        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
 
         let price = client.guarded_price(&asset);
         assert_eq!(price.status, PriceStatus::Ok);
         assert_eq!(price.value, SCALE);
+    }
+
+    #[test]
+    fn valid_issuer_signature_is_accepted() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env); // note: distinct from setup()'s internal admin —
+        // configure_issuer_key/configure_signature_requirement mock_all_auths() so any address
+        // passes require_auth() in this test env; what matters here is the pubkey/signature match.
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+
+        let redstone = Symbol::new(&env, "redston");
+        client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, SCALE);
+    }
+
+    #[test]
+    #[should_panic]
+    fn invalid_issuer_signature_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        // Signed over a DIFFERENT value than what's actually published -> verification must fail.
+        let sig = sign_nav(&env, &signing_key, &code, now, SCALE + 1);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
     }
 }

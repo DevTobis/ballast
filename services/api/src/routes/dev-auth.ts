@@ -29,7 +29,7 @@ export function registerDevAuthRoutes(app: FastifyInstance, db: Database, config
       return reply.code(404).send({ error: "stellar account not linked to a known party" });
     }
 
-    const token = jwt.sign({ sub: body.stellarAccount }, config.sep10SigningKey, { expiresIn: "12h" });
+    const token = jwt.sign({ sub: body.stellarAccount }, config.jwtSigningSecret, { expiresIn: "12h" });
     return { token, partyId: account.partyId };
   });
 }

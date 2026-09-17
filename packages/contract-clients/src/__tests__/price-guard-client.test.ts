@@ -25,7 +25,17 @@ describe("PriceGuardClient", () => {
   });
 
   it("publishNav() returns non-empty unsigned XDR", async () => {
-    const xdr = await client.publishNav(source, asset, 100_000_000n, Date.now(), Buffer.alloc(64));
+    const xdr = await client.publishNav(source, asset, "SPIKO", 100_000_000n, Date.now(), Buffer.alloc(64));
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("configureIssuerKey() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureIssuerKey(source, asset, Buffer.alloc(32));
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("configureSignatureRequirement() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureSignatureRequirement(source, true);
     expect(xdr.length).toBeGreaterThan(0);
   });
 

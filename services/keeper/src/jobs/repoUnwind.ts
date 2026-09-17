@@ -13,8 +13,7 @@ import { and, eq, lte } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
 import { loadNetworkConfig } from "@ballast/network-config";
 import type { RepoDvpClient } from "@ballast/contract-clients";
-import type { KmsSigner } from "../submit.js";
-import { submitSignedTx } from "../submit.js";
+import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
 import { emptyResult, type JobResult } from "./types.js";
 
 function contractTradeId(id: string): bigint | null {

@@ -10,25 +10,32 @@ declare module "fastify" {
     partyId: string;
     stellarAccount: string | null;
   }
+  // `@fastify/rate-limit` augments `FastifyContextConfig` with its own `rateLimit` field, which
+  // turns it from an effectively-open type into a closed one — route configs using this app's
+  // own `public` convention (see `buildAuthHook` below) need to be declared here too, or every
+  // `{ config: { public: true } }` route option becomes a TS excess-property error.
+  interface FastifyContextConfig {
+    public?: boolean;
+  }
 }
 
 /**
  * Auth per PRD §9: "SEP-10 JWT for Stellar accounts; API key + HMAC for institutions."
  *
- * Gap (documented, follow-up): this is NOT real SEP-10. A production implementation issues a
- * SEP-10 "challenge transaction" (an unsigned, unsubmittable Stellar tx encoding the domain +
- * nonce), has the wallet sign it with the account's Stellar key, verifies that signature, and
- * *then* mints a JWT. Here we skip challenge issuance/verification entirely and just verify a
- * JWT signed with a shared `SEP10_SIGNING_KEY` secret (HMAC, not the account's own key) — good
- * enough to exercise the request pipeline for this skeleton, not good enough for production.
+ * SEP-10 is real: `routes/auth.ts` issues a genuine challenge transaction (via
+ * `@stellar/stellar-sdk`'s `WebAuth.buildChallengeTx`), the wallet signs it with the account's
+ * own Stellar key, and `WebAuth.verifyChallengeTxSigners` verifies that signature before a JWT is
+ * minted. This hook only verifies the resulting JWT — signed with `jwtSigningSecret` (HMAC), a
+ * secret distinct from the SEP-10 server keypair — and never re-derives Stellar-key proof itself.
  *
  * The JWT is expected to carry a `sub` claim equal to the caller's Stellar G-address, matching
  * SEP-10 JWT convention; we then resolve `partyId` from the `party_account` table.
  *
  * The institution path (`x-api-key` + `x-signature`) is verified against a per-party secret
  * from `ApiConfig.institutionApiKeys` (env-var JSON stub — see config.ts for the gap re: not
- * reading a real `party` table column/secret store yet). The signature covers the raw JSON body
- * only (no timestamp/nonce yet, so this skeleton has no replay protection — follow-up).
+ * reading a real `party` table column/secret store yet). The signature covers
+ * `${x-timestamp}.${raw JSON body}`, and a required `x-timestamp` header (Unix seconds, checked
+ * against a ±300s tolerance) prevents replaying a captured request indefinitely.
  */
 export function buildAuthHook(config: ApiConfig, db: Database) {
   return async function authHook(request: FastifyRequest, reply: FastifyReply): Promise<void> {
@@ -41,14 +48,25 @@ export function buildAuthHook(config: ApiConfig, db: Database) {
     const authHeader = request.headers.authorization;
     const apiKey = request.headers["x-api-key"];
     const signature = request.headers["x-signature"];
+    const timestampHeader = request.headers["x-timestamp"];
 
     if (typeof apiKey === "string" && typeof signature === "string") {
       const institution = config.institutionApiKeys[apiKey];
       if (!institution) {
         return reply.code(401).send({ error: "unknown api key" });
       }
+
+      if (typeof timestampHeader !== "string" || !/^\d+$/.test(timestampHeader)) {
+        return reply.code(400).send({ error: "missing or invalid x-timestamp header" });
+      }
+      const timestamp = Number(timestampHeader);
+      const skewS = Math.abs(Date.now() / 1000 - timestamp);
+      if (skewS > 300) {
+        return reply.code(401).send({ error: "stale or future x-timestamp" });
+      }
+
       const expected = createHmac("sha256", institution.hmacSecret)
-        .update(JSON.stringify(request.body ?? {}))
+        .update(`${timestampHeader}.${JSON.stringify(request.body ?? {})}`)
         .digest("hex");
       const expectedBuf = Buffer.from(expected, "hex");
       const givenBuf = Buffer.from(signature, "hex");
@@ -66,7 +84,7 @@ export function buildAuthHook(config: ApiConfig, db: Database) {
       const token = authHeader.slice("Bearer ".length);
       let payload: jwt.JwtPayload;
       try {
-        const decoded = jwt.verify(token, config.sep10SigningKey);
+        const decoded = jwt.verify(token, config.jwtSigningSecret);
         if (typeof decoded === "string") throw new Error("unexpected string payload");
         payload = decoded;
       } catch {

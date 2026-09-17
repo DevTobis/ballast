@@ -13,24 +13,12 @@ import { createConsoleAlerter } from "@ballast/observability";
 import { loadNetworkConfig } from "@ballast/network-config";
 import type { AssetConfig } from "@ballast/domain-types";
 import type { PriceGuardClient } from "@ballast/contract-clients";
-import { issuerAdapterForAsset } from "./adapters/mockIssuers.js";
-import { MockRedstoneAdapter } from "./adapters/mockRedstone.js";
-import type { IndependentFeedAdapter } from "./adapters/types.js";
+import { getIndependentFeedAdapter, getIssuerNavAdapter } from "./adapters/registry.js";
+import { loadIssuerNavPublicKeys, verifyNavSignature } from "./navSignature.js";
 import { scaledToDecimalString } from "./scaled.js";
-import { submitSignedTx, type KmsSigner, type SubmitResult } from "./submit.js";
+import { submitSignedTx, type KmsSigner, type SubmitResult } from "@ballast/operator-signing";
 
 const alerter = createConsoleAlerter("price-guard");
-const independentFeedAdapter: IndependentFeedAdapter = new MockRedstoneAdapter();
-
-/** MOCK issuer signature — real issuer-signed NAV verification is Phase 0/1 work (PRD §6.4). */
-function mockSignatureBytes(seed: string): Buffer {
-  const seedBytes = Buffer.from(seed, "utf8");
-  const bytes = Buffer.alloc(64);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = seedBytes[i % seedBytes.length] ?? 0;
-  }
-  return bytes;
-}
 
 type SubmitFn = (signedXdr: string) => Promise<SubmitResult>;
 
@@ -49,68 +37,103 @@ export async function runPriceUpdateCycle(
   signer: KmsSigner,
   assets: AssetConfig[],
   submit: SubmitFn = defaultSubmit,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   const publisherPublicKey = signer.publicKey();
+  const independentFeedAdapter = getIndependentFeedAdapter(env);
+  const issuerPublicKeys = loadIssuerNavPublicKeys(env);
 
   for (const asset of assets) {
-    const adapter = issuerAdapterForAsset(asset.code);
-    const [nav, feed] = await Promise.all([
-      adapter.fetchNav(asset.code),
-      independentFeedAdapter.fetchPrice(asset.code),
-    ]);
+    try {
+      const issuerAdapter = getIssuerNavAdapter(asset.issuerCode, env);
+      const [nav, feed] = await Promise.all([
+        issuerAdapter.fetchNav(asset.code),
+        independentFeedAdapter.fetchPrice(asset.code),
+      ]);
 
-    await db.insert(schema.priceObservation).values({
-      assetId: asset.id,
-      source: "issuer_nav",
-      value: scaledToDecimalString(nav.value),
-      observedAt: new Date(nav.ts * 1000),
-      stale: false,
-    });
-    await db.insert(schema.priceObservation).values({
-      assetId: asset.id,
-      source: "redstone",
-      value: scaledToDecimalString(feed.value),
-      observedAt: new Date(feed.ts * 1000),
-      stale: false,
-    });
+      const issuerPublicKey = issuerPublicKeys[asset.issuerCode];
+      if (!issuerPublicKey) {
+        alerter.fire("price_degraded", {
+          assetId: asset.id,
+          code: asset.code,
+          reason: `no ISSUER_NAV_PUBLIC_KEYS entry for issuer code "${asset.issuerCode}"`,
+        });
+        console.error(
+          `price-guard: skipping ${asset.code} this cycle — no ISSUER_NAV_PUBLIC_KEYS entry for issuer code "${asset.issuerCode}"`,
+        );
+        continue;
+      }
+      const verified = verifyNavSignature(asset.code, nav.ts, nav.value, nav.sig, issuerPublicKey);
+      if (!verified) {
+        alerter.fire("price_degraded", {
+          assetId: asset.id,
+          code: asset.code,
+          reason: "issuer NAV signature verification failed",
+        });
+        console.error(
+          `price-guard: skipping ${asset.code} this cycle — issuer NAV signature verification failed`,
+        );
+        continue;
+      }
 
-    const navUnsignedXdr = await priceGuardClient.publishNav(
-      publisherPublicKey,
-      asset.contractC,
-      nav.value,
-      nav.ts,
-      mockSignatureBytes(`${asset.code}:${nav.ts}`),
-    );
-    const navSignedXdr = await signer.sign(navUnsignedXdr);
-    await submit(navSignedXdr);
+      await db.insert(schema.priceObservation).values({
+        assetId: asset.id,
+        source: "issuer_nav",
+        value: scaledToDecimalString(nav.value),
+        observedAt: new Date(nav.ts * 1000),
+        stale: false,
+      });
+      await db.insert(schema.priceObservation).values({
+        assetId: asset.id,
+        source: "redstone",
+        value: scaledToDecimalString(feed.value),
+        observedAt: new Date(feed.ts * 1000),
+        stale: false,
+      });
 
-    const feedUnsignedXdr = await priceGuardClient.publishFeed(
-      publisherPublicKey,
-      asset.contractC,
-      "redstone",
-      feed.value,
-      feed.ts,
-    );
-    const feedSignedXdr = await signer.sign(feedUnsignedXdr);
-    await submit(feedSignedXdr);
+      const navUnsignedXdr = await priceGuardClient.publishNav(
+        publisherPublicKey,
+        asset.contractC,
+        asset.code,
+        nav.value,
+        nav.ts,
+        nav.sig,
+      );
+      const navSignedXdr = await signer.sign(navUnsignedXdr);
+      await submit(navSignedXdr);
 
-    // Read-only; the underlying client simulates this against STELLAR_SIMULATION_SOURCE rather
-    // than taking a caller argument (see @ballast/contract-clients' base-client.ts).
-    const guarded = await priceGuardClient.guardedPrice(asset.contractC);
+      const feedUnsignedXdr = await priceGuardClient.publishFeed(
+        publisherPublicKey,
+        asset.contractC,
+        "redstone",
+        feed.value,
+        feed.ts,
+      );
+      const feedSignedXdr = await signer.sign(feedUnsignedXdr);
+      await submit(feedSignedXdr);
 
-    await db.insert(schema.priceSnapshot).values({
-      assetId: asset.id,
-      guardedValue: scaledToDecimalString(guarded.value),
-      status: guarded.status,
-      // jsonb can't hold bigint directly — serialize values to strings first.
-      sources: guarded.sources.map((s) => ({ ...s, value: s.value.toString() })),
-      ledger: 0, // filled in by the indexer once the on-chain tx is confirmed
-    });
+      // Read-only; the underlying client simulates this against STELLAR_SIMULATION_SOURCE rather
+      // than taking a caller argument (see @ballast/contract-clients' base-client.ts).
+      const guarded = await priceGuardClient.guardedPrice(asset.contractC);
 
-    if (guarded.status === "Degraded") {
-      alerter.fire("price_degraded", { assetId: asset.id, code: asset.code, status: guarded.status });
-    } else if (guarded.status === "Halted") {
-      alerter.fire("price_halted", { assetId: asset.id, code: asset.code, status: guarded.status });
+      await db.insert(schema.priceSnapshot).values({
+        assetId: asset.id,
+        guardedValue: scaledToDecimalString(guarded.value),
+        status: guarded.status,
+        // jsonb can't hold bigint directly — serialize values to strings first.
+        sources: guarded.sources.map((s) => ({ ...s, value: s.value.toString() })),
+        ledger: 0, // filled in by the indexer once the on-chain tx is confirmed
+      });
+
+      if (guarded.status === "Degraded") {
+        alerter.fire("price_degraded", { assetId: asset.id, code: asset.code, status: guarded.status });
+      } else if (guarded.status === "Halted") {
+        alerter.fire("price_halted", { assetId: asset.id, code: asset.code, status: guarded.status });
+      }
+    } catch (err) {
+      // Don't let one asset's adapter/verification failure crash the whole cycle — other assets
+      // still need their prices published this run.
+      console.error(`price-guard: cycle failed for asset ${asset.code}`, err);
     }
   }
 }

@@ -17,8 +17,7 @@ import { schema, type Database } from "@ballast/db";
 import { decimalStringToScaled } from "@ballast/domain-types";
 import { loadNetworkConfig } from "@ballast/network-config";
 import type { CreditLineClient } from "@ballast/contract-clients";
-import type { KmsSigner } from "../submit.js";
-import { submitSignedTx } from "../submit.js";
+import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
 import { emptyResult, type JobResult } from "./types.js";
 
 export async function runSyncCollateralJob(

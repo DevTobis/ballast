@@ -7,6 +7,7 @@ build/
 *.tsbuildinfo
 .env
 .env.local
+.env.*-deploy
 
 # Rust
 /target/

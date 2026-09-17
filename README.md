@@ -7,9 +7,8 @@ holds about **$4B** of tokenized real-world assets that just sit there. Only abo
 in Blend and about $8.4M in Templar (SDF Dune dashboard; RedStone, 2026-08). These ideas turn
 that idle weight into something that moves money.
 
-Two ideas are not here. Idea 4 (compliance-preserving RWA bridging) lives on Xebra's roadmap:
-`../xebra/docs/roadmap.md`. Idea 6 (DTCC readiness) is its own company and repo:
-`../concord/`.
+Two ideas are not here: idea 4 (compliance-preserving RWA bridging) and idea 6 (DTCC readiness)
+are out of scope for this repo.
 
 The build plan for Ballast is [`PRD.md`](./PRD.md).
 
@@ -56,37 +55,11 @@ collateral pool) → 2 (repo, once there are two sides to match) → 5 (sell the
 fintech treasuries).
 
 **Overlap:** this is the direction chosen on 2026-09-09 (a corridor liquidity + compliance
-network for anchors), with RWAs as the collateral. It shares anchor customers with Xebra's RWA
-bridge and with `stellar-intel`.
-
-### Company 2 — **Concord** (idea 6, stand-alone, now `../concord/`)
-
-**What it is:** reconciliation between on-chain token events and the official books kept by
-transfer agents and custodians, starting with DTCC's Stellar connection.
-
-It stands alone because nothing important is shared with Ballast:
-
-| | Ballast | Concord |
-|---|---|---|
-| Buyer | anchors, fintechs, market makers | transfer agents, custodians, fund administrators |
-| Handles money | yes: custody partner, balance sheet | **no**: read-only software |
-| Regulatory load | heavy (lending, repo) | light (vendor to regulated firms) |
-| Core skill | credit, liquidity, contracts | data, indexing (CAP-67 events), accounting |
-| Timing | now | DTCC targets H1 2027: build now, sell then |
-| Revenue | spread, fees on volume | SaaS seats and per-asset fees |
-
-Putting it inside Ballast would slow both. The sales cycle, the buyer and the risk profile are
-different. Concord can also serve issuers Ballast never touches (BENJI, WisdomTree, Spiko). It
-does not depend on RWAs being used in DeFi at all, so it survives if Ballast's core assumption
-fails.
+network for anchors), with RWAs as the collateral.
 
 ## Portfolio
 
-| Company | Ideas | Status |
-|---|---|---|
-| **Xebra** | 4 — RWA bridging | on Xebra's roadmap, after the USDC corridor goes live |
-| **Ballast** | 1, 2, 3, 5 | strongest fit with the corridor thesis; needs a custody partner |
-| **Concord** | 6 | stand-alone; timed to DTCC H1 2027 |
+Ballast: strongest fit with the corridor thesis; needs a custody partner.
 
 ## What decides whether Ballast is real
 
@@ -96,7 +69,7 @@ DeFi?**
 - If issuers block transfers, collateral cannot move: Ballast must go through the issuer.
 - If the cause is missing oracles and risk settings after the USTRY exploit: Ballast's pricing
   layer is the product.
-- If institutions simply do not want it: stop, and put the effort into Concord.
+- If institutions simply do not want it: stop — this repo's core assumption doesn't hold.
 
 Ask 2–3 anchors and one issuer (Spiko or Etherfuse) before writing code.
 

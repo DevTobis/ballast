@@ -38,6 +38,12 @@ export const asset = pgTable("asset", {
   id: uuid("id").primaryKey().defaultRandom(),
   code: text("code").notNull(),
   issuerG: text("issuer_g").notNull(),
+  /** Issuer registry code (e.g. `"spiko"`, `"etherfuse"`, `"franklin"`) — resolves the exact
+   * `IssuerNavAdapter` in `services/price-guard/src/adapters/registry.ts`. Added to replace a
+   * substring-match-on-asset-code heuristic that silently fell back to "spiko" on no match; every
+   * asset row must now explicitly declare which issuer NAV feed it maps to. No seed/fixture data
+   * exists in this repo as of this column's addition, so it's `not null` with no default. */
+  issuerCode: text("issuer_code").notNull(),
   contractC: text("contract_c").notNull(),
   standard: assetStandard("standard").notNull(),
   yieldType: yieldTypeEnum("yield_type").notNull(),

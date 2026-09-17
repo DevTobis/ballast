@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { requestAccess, signTransaction } from "@stellar/freighter-api";
 import { api } from "./api.ts";
 
 interface Session {
@@ -11,7 +12,7 @@ interface AuthContextValue {
   session: Session | null;
   loading: boolean;
   error: string | null;
-  login: (stellarAccount: string) => Promise<void>;
+  login: () => Promise<void>;
   logout: () => void;
 }
 
@@ -35,11 +36,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  async function login(stellarAccount: string) {
+  /**
+   * Real SEP-10 flow: connect Freighter for the account -> fetch a challenge transaction ->
+   * have Freighter sign it with that account's own Stellar key -> submit the signed challenge
+   * for a session JWT. Replaces the old raw-G-address `devLogin` (still reachable server-side
+   * behind `ENABLE_DEV_LOGIN`, but not from this UI).
+   */
+  async function login() {
     setLoading(true);
     setError(null);
     try {
-      const result = await api.devLogin(stellarAccount);
+      const access = await requestAccess();
+      if (access.error) throw new Error(access.error.message);
+      const stellarAccount = access.address;
+
+      const { transaction } = await api.challenge(stellarAccount);
+
+      const signed = await signTransaction(transaction, {
+        address: stellarAccount,
+        networkPassphrase: import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE,
+      });
+      if (signed.error) throw new Error(signed.error.message);
+
+      const result = await api.token(signed.signedTxXdr);
       const next: Session = { token: result.token, partyId: result.partyId, stellarAccount };
       setSession(next);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(next));

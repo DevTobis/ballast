@@ -3,7 +3,7 @@ import { createDatabase } from "@ballast/db";
 import { loadNetworkConfig, requireContractId } from "@ballast/network-config";
 import { createLogger } from "@ballast/observability";
 import { CreditLineClient, RepoDvpClient } from "@ballast/contract-clients";
-import { SecretKeySigner } from "./submit.js";
+import { createOperatorSigner } from "@ballast/operator-signing";
 import { runRepoUnwindJob } from "./jobs/repoUnwind.js";
 import { runCureExpiryJob } from "./jobs/cureExpiry.js";
 import { runInterestAccrualJob } from "./jobs/interestAccrual.js";
@@ -13,7 +13,7 @@ import type { JobResult } from "./jobs/types.js";
 const logger = createLogger("keeper");
 const db = createDatabase();
 const network = loadNetworkConfig();
-const signer = new SecretKeySigner("KEEPER_SECRET_KEY", network.networkPassphrase);
+const signer = await createOperatorSigner("keeper", network.networkPassphrase);
 
 const creditLineClient = new CreditLineClient({
   network,

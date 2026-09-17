@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { submitMock } = vi.hoisted(() => ({ submitMock: vi.fn() }));
 
-vi.mock("../submit.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../submit.js")>();
+vi.mock("@ballast/operator-signing", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@ballast/operator-signing")>();
   return { ...actual, submitSignedTx: submitMock };
 });
 

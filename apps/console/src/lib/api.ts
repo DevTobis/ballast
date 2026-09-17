@@ -25,16 +25,28 @@ async function request<T>(path: string, token: string | null, init?: RequestInit
   return body as T;
 }
 
-export interface DevLoginResult {
+export interface ChallengeResult {
+  transaction: string;
+}
+
+export interface TokenResult {
   token: string;
   partyId: string;
 }
 
 export const api = {
-  devLogin: (stellarAccount: string) =>
-    request<DevLoginResult>("/v1/auth/dev-login", null, {
+  /** SEP-10 step 1: get a challenge transaction (base64 XDR) to sign with `account`'s own key. */
+  challenge: (account: string) =>
+    request<ChallengeResult>("/v1/auth/challenge", null, {
       method: "POST",
-      body: JSON.stringify({ stellarAccount }),
+      body: JSON.stringify({ account }),
+    }),
+
+  /** SEP-10 step 2: submit the wallet-signed challenge transaction and get back a session JWT. */
+  token: (signedTransaction: string) =>
+    request<TokenResult>("/v1/auth/token", null, {
+      method: "POST",
+      body: JSON.stringify({ transaction: signedTransaction }),
     }),
 
   assets: (token: string) => request<{ assets: AssetSummary[] }>("/v1/assets", token),

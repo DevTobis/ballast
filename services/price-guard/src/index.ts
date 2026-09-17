@@ -5,8 +5,8 @@ import { loadNetworkConfig, requireContractId } from "@ballast/network-config";
 import { createLogger } from "@ballast/observability";
 import { PriceGuardClient } from "@ballast/contract-clients";
 import type { AssetConfig } from "@ballast/domain-types";
+import { createOperatorSigner } from "@ballast/operator-signing";
 import { runPriceUpdateCycle } from "./pipeline.js";
-import { SecretKeySigner } from "./submit.js";
 import { decimalStringToScaled } from "./scaled.js";
 
 const logger = createLogger("price-guard");
@@ -18,7 +18,7 @@ const priceGuardClient = new PriceGuardClient({
   contractId: requireContractId(network, "priceGuard"),
 });
 
-const signer = new SecretKeySigner("PRICE_PUBLISHER_SECRET_KEY", network.networkPassphrase);
+const signer = await createOperatorSigner("price-publisher", network.networkPassphrase);
 
 // PRD §5 Phase 1: "every 60s is a reasonable default", configurable via env.
 const CRON_EXPR = process.env.PRICE_GUARD_CRON ?? "*/1 * * * *";
@@ -28,6 +28,7 @@ function toAssetConfig(row: typeof schema.asset.$inferSelect): AssetConfig {
     id: row.id,
     code: row.code,
     issuerG: row.issuerG,
+    issuerCode: row.issuerCode,
     contractC: row.contractC,
     standard: row.standard,
     yieldType: row.yieldType,

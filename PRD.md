@@ -121,8 +121,8 @@ Phase 0 must confirm it.
 - **Issuing tokens.** The OpenZeppelin RWA Wizard covers this.
 - **A retail lending market.** Blend and Templar serve retail. Ballast serves businesses.
 - **A public AMM or exchange.** Octarine and the classic DEX exist. Ballast routes to them.
-- **Cross-chain bridging.** That is Xebra's roadmap (`../xebra/docs/roadmap.md`).
-- **Reconciliation software for transfer agents.** That is Concord (`../concord/`).
+- **Cross-chain bridging.** Out of scope for this repo.
+- **Reconciliation software for transfer agents.** Out of scope for this repo.
 - **Reusable KYC.** This idea was killed on 2026-09-09. Ballast uses partner and issuer KYC.
 - **Uncollateralised credit.** Every USDC out is backed by pledged assets.
 
@@ -153,7 +153,7 @@ somewhere different:
 |---|---|
 | Issuers restrict transfers and whitelists | Ballast must be issuer-in-the-loop. Issuer-lien mode (§6.3) becomes the default. |
 | Missing oracles and risk settings after the USTRY exploit | The Price Guard (§6.4) is the core product. |
-| Holders do not want to borrow | **Stop.** Put the effort into Concord. |
+| Holders do not want to borrow | **Stop.** This repo's core assumption doesn't hold. |
 
 **Work:**
 
@@ -351,7 +351,7 @@ flowchart LR
 | `ExitDesk` | Quotes and settles RWA → USDC swaps within caps, drawing on the exit facility | RWA inventory, USDC float |
 | `RepoDvP` | Repo trades: atomic leg 1, scheduled leg 2, margin, fail handling | RWA and USDC during term |
 
-All contracts follow the conventions already used in Xebra's `XebraCctpWrapper`:
+All contracts follow the same conventions:
 
 - `require_auth` on every user action
 - single-purpose admin functions
@@ -457,8 +457,8 @@ timelock; decreases never do.
 | Decision | Choice | Why |
 |---|---|---|
 | Chain | Stellar mainnet, Soroban contracts | The assets and anchors are here |
-| Contract language | Rust, `soroban-sdk`, OpenZeppelin Stellar contracts where they apply | Same stack as Xebra; OZ identity and access modules are audited building blocks |
-| Services | TypeScript, pnpm + Turborepo monorepo | Same as Xebra; shared packages (`network-config`, `observability`) can be lifted |
+| Contract language | Rust, `soroban-sdk`, OpenZeppelin Stellar contracts where they apply | OZ identity and access modules are audited building blocks |
+| Services | TypeScript, pnpm + Turborepo monorepo | Shared packages (`network-config`, `observability`) keep services consistent |
 | Database | Postgres (not Convex) | A credit product needs double-entry books, point-in-time queries and auditor access |
 | Price | Median of independent sources with status | The YieldBlox lesson |
 | Liquidation | Issuer redemption or transfer in kind first; RFQ sale second; AMM never | Thin RWA markets cannot absorb forced sales |
@@ -523,7 +523,7 @@ reconciliation_run (id, scope, started_at, breaks int, report jsonb)
 
 Every row that reflects on-chain state stores the `tx_hash` and ledger that produced it. The
 nightly `reconciliation_run` compares Postgres books against contract state and CAP-67 events.
-Any break pages the on-call engineer. Concord could later sell this same function to others.
+Any break pages the on-call engineer.
 
 ---
 
@@ -581,7 +581,7 @@ fn default_close(e: Env, keeper: Address, id: u64);
 5. **Pausing cannot move funds.** `pause` blocks new risk only. Repayment, cure and liquidation
    always work while paused.
 6. **The admin cannot move user funds.** No admin function can send pledged RWA or lender USDC
-   to an arbitrary address. This is the same property as Xebra's `withdraw_fees`.
+   to an arbitrary address.
 7. **Repo legs are atomic.** Leg 1 settles both assets or neither.
 8. **Issuer controls stay intact.** Every RWA transfer out of a Ballast contract goes to an address
    the issuer has authorised. If the target is not authorised, the transfer reverts; it is never
@@ -730,7 +730,7 @@ their interest is ASSUMPTION):
 
 | Type | Targets | Why |
 |---|---|---|
-| Anchors / fintechs (borrowers) | Anclap (Argentina), Cowrie and NGNC (Nigeria), nTokens, Zeam (Brazil) | Already probed by `stellar-intel`; LATAM ones fit Phase 4 |
+| Anchors / fintechs (borrowers) | Anclap (Argentina), Cowrie and NGNC (Nigeria), nTokens, Zeam (Brazil) | LATAM ones fit Phase 4 |
 | Issuers (partners) | Spiko, Etherfuse, Franklin Templeton, Figure, Ondo | Largest or most LATAM-relevant RWAs on Stellar |
 | Custodian (partner) | Anchorage Digital | Already custodies Etherfuse CETES on Stellar |
 | Liquidity (partner) | Octarine | Liquidation and exit venue; SCF-funded, KYC'd RFQ |
@@ -745,8 +745,6 @@ their interest is ASSUMPTION):
   RFP track says "more coming soon" (VERIFIED).
 - **Blend and Templar.** License the Price Guard SEP-40 feed. This brings early revenue and puts
   Ballast in front of every RWA pool.
-- **`stellar-intel`.** Anchor health and uptime data from its probes becomes a counterparty-risk
-  input for lenders. That is a reason to use Ballast that competitors cannot copy.
 
 **Content:** a monthly "Stellar RWA utilisation" report from Ballast's indexer. It covers what is
 issued versus what is put to work, and price-source health per asset. No one publishes this
@@ -774,11 +772,10 @@ today.
 | 3 Repo | 8.5–12.5 | 3 counterparties; $10M notional |
 | 4 LATAM bundle | 5.5 onwards | 3 fintechs; $5M local sovereign debt pledged |
 
-**Reuse from existing repos:**
+**Prior art / conventions this repo follows:**
 
-- **Xebra:** contract conventions (timelock, pauser, no-custody-by-admin invariant),
-  `network-config`, `observability`, CI layout.
-- **stellar-intel:** anchor probes and SEP-10 client.
+- Contract conventions: timelock, pauser, no-custody-by-admin invariant.
+- SEP-10 client shape.
 
 ---
 
@@ -786,7 +783,7 @@ today.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Holders don't want to borrow against RWAs (the unanswered utilisation question) | Medium | Fatal | Phase 0 gate; fall back to Concord |
+| Holders don't want to borrow against RWAs (the unanswered utilisation question) | Medium | Fatal | Phase 0 gate; stop if this doesn't clear |
 | Issuers refuse to authorise contracts or run liens | Medium | High | Three custody modes; start with the most cooperative issuer; custodian-lien as fallback |
 | Price manipulation or a stale NAV causes wrong draws or liquidations | Medium | High | Price Guard: median, bands, status, two-read liquidation, DEX price excluded; USTRY replay in tests |
 | A pledged RWA's issuer freezes or claws back the collateral | Low | High | Concentration caps per issuer; issuer agreements define what happens to pledged units; asset-level haircut for issuer risk |

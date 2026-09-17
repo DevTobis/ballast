@@ -26,3 +26,31 @@ stellar contract build
 
 This produces `../target/wasm32v1-none/release/<crate>.wasm`. `cargo test -p <crate>` (run from
 `contracts/`, on the host target) works normally for unit tests and does not need `stellar-cli`.
+
+## Deploying to testnet
+
+See `scripts/README.md`'s "Testnet end-to-end run" section for how to build, deploy, and wire up
+all six contracts against the public Stellar testnet.
+
+## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
+
+`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
+e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
+`require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
+issuer key (`configure_issuer_key`, admin-only) over the canonical message
+`"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+
+This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
+`scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
+— see `TESTNET_DEPLOYMENT.md`):
+
+- `scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
+  after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
+  key for its test `RWA1` asset.
+- `scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
+  bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
+
+`require_nav_signature` defaults to `true` on a fresh deploy (see the crate's module doc comment on
+why this flag exists — it's a local-testing/bring-up affordance, not a security control) — a real
+testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if
+it was ever turned off, and should leave it at its default `true` otherwise.

@@ -8,10 +8,15 @@ import { createFakeDb } from "./fake-db.js";
 
 const config: ApiConfig = {
   port: 0,
-  sep10SigningKey: "test-signing-key",
+  jwtSigningSecret: "test-signing-key",
+  sep10ServerSecret: "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  sep10HomeDomain: "localhost",
+  sep10WebAuthDomain: "localhost",
+  networkPassphrase: "Test SDF Network ; September 2015",
   webhookHmacSecret: "test-webhook-secret",
   webhookSubscribers: [],
   institutionApiKeys: {},
+  consoleOrigin: "http://localhost:5173",
 };
 
 const LENDER_PARTY_ID = "44444444-4444-4444-4444-444444444444";
@@ -19,7 +24,7 @@ const LENDER_ACCOUNT = "GLENDERACCOUNT";
 const LINE_ID = "55555555-5555-5555-5555-555555555555";
 
 function tokenFor(stellarAccount: string) {
-  return jwt.sign({ sub: stellarAccount }, config.sep10SigningKey);
+  return jwt.sign({ sub: stellarAccount }, config.jwtSigningSecret);
 }
 
 describe("POST /v1/credit-lines/:id/fund", () => {

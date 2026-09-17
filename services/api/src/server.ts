@@ -1,9 +1,13 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import cors from "@fastify/cors";
+import helmet from "@fastify/helmet";
+import rateLimit from "@fastify/rate-limit";
 import type { Database } from "@ballast/db";
 import { loadApiConfig, type ApiConfig } from "./config.js";
 import { registerAuth } from "./auth.js";
 import { getDb } from "./db.js";
 import { getContractClients, type ContractClients } from "./contract-clients.js";
+import { registerAuthRoutes } from "./routes/auth.js";
 import { registerDevAuthRoutes } from "./routes/dev-auth.js";
 import { registerAssetRoutes } from "./routes/assets.js";
 import { registerCreditLineRoutes } from "./routes/credit-lines.js";
@@ -30,13 +34,37 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
 
   const app = Fastify({ logger: false });
 
+  // Registered before auth: this is a pure JSON API (no HTML, so helmet's defaults are fine
+  // as-is) that the console browser app calls cross-origin, so CORS must be locked to that one
+  // known origin rather than left as `*`.
+  void app.register(helmet);
+  void app.register(cors, { origin: config.consoleOrigin });
+  // Cheap differentiation using the existing `x-api-key` institution-auth header: authenticated
+  // institutions get a much higher ceiling than anonymous/JWT-bearer callers. `/healthz` is
+  // exempted below via its own route config.
+  void app.register(rateLimit, {
+    max: (req: { headers: Record<string, unknown> }) => (req.headers["x-api-key"] ? 1000 : 100),
+    timeWindow: "1 minute",
+  });
+
   registerAuth(app, config, db);
 
   // GET /v1/assets and /v1/assets/:id/price are public per PRD §9 (no auth required to browse
   // supported assets/prices); everything else needs a resolved partyId.
-  app.get("/healthz", { config: { public: true } }, async () => ({ ok: true }));
+  app.get("/healthz", { config: { public: true, rateLimit: false } }, async () => ({ ok: true }));
 
-  registerDevAuthRoutes(app, db, config);
+  registerAuthRoutes(app, db, config);
+
+  // Dev-only raw-G-address login (see routes/dev-auth.ts's module doc comment) — never wired up
+  // unless explicitly opted into, and never the default even in local dev, so it can't be reached
+  // by accident.
+  if (process.env.ENABLE_DEV_LOGIN === "true") {
+    app.log.warn(
+      "services/api: ENABLE_DEV_LOGIN=true — /v1/auth/dev-login is active (no proof of Stellar key ownership). Never set this in production.",
+    );
+    registerDevAuthRoutes(app, db, config);
+  }
+
   registerAssetRoutes(app, db);
   registerCreditLineRoutes(app, db, contracts);
   registerExitRoutes(app, db, contracts);

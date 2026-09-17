@@ -8,6 +8,9 @@ export interface AssetConfig {
   id: string;
   code: string;
   issuerG: string;
+  /** Issuer registry code (e.g. `"spiko"`, `"etherfuse"`, `"franklin"`) — resolves the
+   * `IssuerNavAdapter` in `services/price-guard/src/adapters/registry.ts` by exact match. */
+  issuerCode: string;
   contractC: string;
   standard: AssetStandard;
   yieldType: YieldType;

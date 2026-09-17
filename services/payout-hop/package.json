@@ -17,6 +17,7 @@
     "@ballast/domain-types": "workspace:*",
     "@ballast/network-config": "workspace:*",
     "@ballast/observability": "workspace:*",
+    "@ballast/operator-signing": "workspace:*",
     "@stellar/stellar-sdk": "^13.1.0",
     "fastify": "^5.1.0"
   },

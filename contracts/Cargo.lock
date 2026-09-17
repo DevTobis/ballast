@@ -222,6 +222,7 @@ name = "ballast-price-guard"
 version = "0.1.0"
 dependencies = [
  "ballast-common",
+ "ed25519-dalek",
  "soroban-sdk",
 ]
 

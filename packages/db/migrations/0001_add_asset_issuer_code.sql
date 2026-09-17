@@ -1,0 +1,1 @@
+ALTER TABLE "asset" ADD COLUMN "issuer_code" text NOT NULL;

@@ -11,7 +11,7 @@ import { createDatabase, type Database } from "@ballast/db";
 import { loadNetworkConfig } from "@ballast/network-config";
 import { createLogger } from "@ballast/observability";
 import { forwardPayout } from "./hop.js";
-import { EnvKeypairPayoutSigner, type PayoutSigner } from "./signer.js";
+import { OperatorPayoutSigner, type PayoutSigner } from "./signer.js";
 
 interface ForwardPayoutRequestBody {
   fromContractPayoutTxHash: string;
@@ -51,7 +51,7 @@ async function main() {
   const logger = createLogger("payout-hop");
   const db = createDatabase();
   const network = loadNetworkConfig();
-  const signer = new EnvKeypairPayoutSigner(logger, network.rpcUrl, network.networkPassphrase);
+  const signer = await OperatorPayoutSigner.create(logger, network.rpcUrl, network.networkPassphrase);
 
   const app = buildServer(db, signer);
   const port = Number(process.env.PAYOUT_HOP_PORT ?? 3002);

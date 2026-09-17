@@ -15,12 +15,19 @@ export interface IssuerAdapter {
 
   /**
    * SEP-8 (Regulated Assets) approval flow: the issuer inspects a proposed transaction and either
-   * approves it as-is, returns a revised (issuer-signed) transaction, or rejects it with a reason.
+   * approves it as-is, returns a revised (issuer-signed) transaction, rejects it with a reason, or
+   * (for manual-review issuers) defers with a `pending` retry hint.
    */
   requestSep8Approval(
     assetCode: string,
     txXdr: string,
-  ): Promise<{ approved: boolean; approvedTxXdr?: string; reason?: string }>;
+  ): Promise<{
+    approved: boolean;
+    approvedTxXdr?: string;
+    reason?: string;
+    /** Set when the issuer needs manual review rather than an immediate decision. */
+    pending?: { retryAfterS: number };
+  }>;
 
   /**
    * Issuer-lien custody mode (PRD §6.3): the asset stays in the holder's own account, and the
