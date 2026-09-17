@@ -41,6 +41,17 @@ See the NOTE in `deploy.sh`'s header comment: CLI identity names (`admin`, `paus
 network-namespaced, so running the testnet deploy after a local one overwrites those local
 identities' keypairs.
 
+Both scripts wrap every `stellar` network call in a `retry()` helper (a few attempts with a short
+backoff) - real testnet runs have shown intermittent transient TLS failures from some networks
+unrelated to the contracts themselves. If a retried call reports failure but the underlying
+transaction actually landed (the drop hit status confirmation, not submission), the next retry
+will correctly hit the target contract's own idempotency guard (e.g. "already initialized") and
+panic - that panic means the step already succeeded, not that something is broken; check the
+contract's state before assuming otherwise.
+
+This has been run for real against public testnet - see `TESTNET_DEPLOYMENT.md` at the repo root
+for the live contract IDs, role addresses, and e2e smoke-test result.
+
 ## What this does and doesn't prove
 
 `deploy.sh` and `e2e-smoke.sh` drive the contracts directly via `stellar contract invoke`
@@ -58,8 +69,11 @@ both are named stand-ins for the real service, not the real service.
 
 ## If a CLI flag doesn't match
 
-`deploy.sh`'s comment block explains this: the flag names were derived from `stellar
-contract info interface --wasm <path>` (offline, no network needed), but the auto-generated
-`contract invoke` flag names themselves weren't hand-verified against a live deployment before
-this script was committed. If one is wrong, `stellar contract invoke --id <CID> --source admin
---network local -- <fn> --help` against your own deployment shows the real one.
+The flag names were originally derived offline from `stellar contract info interface --wasm
+<path>`, then hand-verified against a real testnet deployment (see `TESTNET_DEPLOYMENT.md`) -
+two real bugs surfaced that way and are now fixed: `deploy.sh` was missing a TUSD trustline for
+the borrower (needed for `CreditLine.draw` to reach them), and `e2e-smoke.sh`'s `publish_nav` call
+needed an `--asset_code` argument after `contracts/price-guard`'s on-chain issuer-signature
+verification change (see `contracts/README.md`). If a contract changes again and a flag stops
+matching, `stellar contract invoke --id <CID> --source admin --network local -- <fn> --help`
+against your own deployment shows the current one.
