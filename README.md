@@ -74,3 +74,12 @@ DeFi?**
 Ask 2–3 anchors and one issuer (Spiko or Etherfuse) before writing code.
 
 Names are working names. Check trademarks and domains before using them publicly.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development setup, repo layout, and per-surface
+checks (TypeScript and Rust/Soroban). All contributors are expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md). Found a security issue? See
+[`SECURITY.md`](SECURITY.md) — please don't open a public issue for it.
+
+Ballast is [MIT licensed](LICENSE).
