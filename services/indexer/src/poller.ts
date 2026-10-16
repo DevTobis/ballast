@@ -12,7 +12,7 @@ import type { RpcClient } from "./rpc.js";
 const metrics = createConsoleMetricsSink("indexer");
 
 /** How many ledgers to look back on a cold start (no rows in `chain_event` yet). */
-const COLD_START_LOOKBACK_LEDGERS = 1000;
+const COLD_START_LOOKBACK_LEDGERS = 10000;
 
 /** Events requested per RPC call; a full page means there may be more behind it. */
 const PAGE_SIZE = 100;
