@@ -47,6 +47,7 @@
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
+    ttl,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -169,8 +170,9 @@ fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
 }
 
 fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed_at: u64) {
+    let key = DataKey::Source(asset.clone(), name.clone());
     env.storage().persistent().set(
-        &DataKey::Source(asset.clone(), name.clone()),
+        &key,
         &PriceSource {
             name: name.clone(),
             value,
@@ -178,6 +180,7 @@ fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed
             stale: false,
         },
     );
+    ttl::extend_persistent(env, &key);
 }
 
 /// Every source name ever published for `asset`. Soroban has no native "list keys matching a
@@ -422,6 +425,7 @@ impl PriceGuard {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("price-guard: already initialized");
         }
@@ -450,6 +454,7 @@ impl PriceGuard {
     ) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage().instance().set(
             &DataKey::Config(asset),
             &AssetGuardConfig {
@@ -471,6 +476,7 @@ impl PriceGuard {
     ) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .set(&DataKey::IssuerPubKey(asset), &issuer_pubkey);
@@ -481,6 +487,7 @@ impl PriceGuard {
     pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .set(&DataKey::RequireNavSignature, &required);
@@ -500,6 +507,7 @@ impl PriceGuard {
     ) {
         publisher.require_auth();
         access::require_price_publisher(&env);
+        ttl::extend_instance(&env);
         read_config(&env, &asset); // asserts the asset is configured
         require_sane_reading(&env, value, ts);
 
@@ -539,6 +547,7 @@ impl PriceGuard {
     ) {
         publisher.require_auth();
         access::require_price_publisher(&env);
+        ttl::extend_instance(&env);
         read_config(&env, &asset);
         require_sane_reading(&env, value, ts);
 
@@ -571,6 +580,8 @@ impl PriceGuard {
     pub fn confirm_halt_cleared(env: Env, risk: Address, asset: Address) {
         risk.require_auth();
         access::require_risk(&env);
+        ttl::extend_instance(&env);
+
 
         if let Some(pending) = env
             .storage()
@@ -994,4 +1005,37 @@ mod test {
         assert!(result.is_err(), "only the risk role may clear a halt");
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
     }
+
+    #[test]
+    fn publish_extends_ttl_and_survives_ledger_advancement() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        // Initial publish establishes the persistent source entries and instance state.
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+
+        let initial_price = client.guarded_price(&asset);
+        assert_eq!(initial_price.status, PriceStatus::Ok);
+        assert_eq!(initial_price.value, SCALE);
+
+        // Advance sequence number past initial TTL (10,000 ledgers).
+        let current_seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(current_seq + 10_000);
+        env.ledger().set_timestamp(now + 60);
+
+        // State remains accessible because publish extended instance and persistent TTL.
+        // A subsequent publish and read both succeed.
+        let next_now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &next_now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &next_now);
+
+        let next_price = client.guarded_price(&asset);
+        assert_eq!(next_price.status, PriceStatus::Ok);
+        assert_eq!(next_price.value, SCALE);
+    }
 }
+
