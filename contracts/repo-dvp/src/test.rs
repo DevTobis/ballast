@@ -439,7 +439,10 @@ fn default_close_gives_the_lender_only_what_covers_the_exposure() {
     // lender (rounded up) and the rest of the 100 pledged comes back to the borrower.
     let lender_units = rwa_balance(&h, &h.cash_lender);
     let borrower_back = rwa_balance(&h, &h.cash_borrower) - borrower_before;
-    assert!(lender_units >= 90 * PRICE_SCALE && lender_units < 91 * PRICE_SCALE, "lender got {lender_units}");
+    assert!(
+        lender_units >= 90 * PRICE_SCALE && lender_units < 91 * PRICE_SCALE,
+        "lender got {lender_units}"
+    );
     assert_eq!(lender_units + borrower_back, 100 * PRICE_SCALE);
     assert_eq!(rwa_balance(&h, &h.repo), 0);
     assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
@@ -474,7 +477,10 @@ fn a_price_recovery_cures_the_call_and_blocks_default() {
     set_price(&h, 2 * PRICE_SCALE);
     h.env.ledger().set_timestamp(deadline);
     let refused = panic::catch_unwind(AssertUnwindSafe(|| repo.default_close(&h.keeper, &id)));
-    assert!(refused.is_err(), "default must refuse once the position is healthy again");
+    assert!(
+        refused.is_err(),
+        "default must refuse once the position is healthy again"
+    );
 
     repo.call_margin(&h.keeper, &id); // the keeper's next evaluation clears the call
     let trade = repo.trade(&id);
@@ -518,7 +524,9 @@ fn only_the_cash_borrower_can_top_up() {
     let h = setup();
     let id = settled_under_margin(&h);
     let repo = RepoDvpClient::new(&h.env, &h.repo);
-    let result = panic::catch_unwind(AssertUnwindSafe(|| repo.top_up(&h.cash_lender, &id, &PRICE_SCALE)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.top_up(&h.cash_lender, &id, &PRICE_SCALE)
+    }));
     assert!(result.is_err());
 }
 
@@ -531,10 +539,16 @@ fn calling_margin_again_does_not_move_the_cure_deadline() {
     repo.call_margin(&h.keeper, &id);
     let first = repo.trade(&id).cure_deadline.unwrap();
 
-    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 3_600);
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 3_600);
     repo.call_margin(&h.keeper, &id);
 
-    assert_eq!(repo.trade(&id).cure_deadline.unwrap(), first, "a keeper must not extend the borrower's window");
+    assert_eq!(
+        repo.trade(&id).cure_deadline.unwrap(),
+        first,
+        "a keeper must not extend the borrower's window"
+    );
 }
 
 #[test]
@@ -557,10 +571,16 @@ fn margin_view_reports_the_position_without_changing_it() {
     assert!(view.price_ok);
     assert_eq!(view.state, MarginState::MarginCall);
     assert!(view.ltv_bps >= 8_000 && view.exposure >= 90 * PRICE_SCALE);
-    assert!(!repo.trade(&id).pending_margin_call, "reading must not open a call");
+    assert!(
+        !repo.trade(&id).pending_margin_call,
+        "reading must not open a call"
+    );
 
     MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
-        &h.rwa, &PRICE_SCALE, &PriceStatus::Degraded, &h.env.ledger().timestamp(),
+        &h.rwa,
+        &PRICE_SCALE,
+        &PriceStatus::Degraded,
+        &h.env.ledger().timestamp(),
     );
     assert!(!repo.margin_view(&id).price_ok);
 }
@@ -586,6 +606,215 @@ fn the_cure_window_has_a_floor_and_only_the_admin_sets_it() {
     let too_short = panic::catch_unwind(AssertUnwindSafe(|| repo.set_cure_grace(&h.admin, &30)));
     assert!(too_short.is_err(), "a 30s window must be refused");
     let stranger = Address::generate(&h.env);
-    let not_admin = panic::catch_unwind(AssertUnwindSafe(|| repo.set_cure_grace(&stranger, &3_600)));
+    let not_admin =
+        panic::catch_unwind(AssertUnwindSafe(|| repo.set_cure_grace(&stranger, &3_600)));
     assert!(not_admin.is_err(), "only the admin may set it");
+}
+
+mod sac {
+    use super::*;
+
+    fn setup_sac() -> Harness {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_sequence_number(100);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+
+        let repo = env.register(RepoDvp, ());
+        RepoDvpClient::new(&env, &repo).initialize(
+            &admin,
+            &pauser,
+            &keeper,
+            &price_publisher,
+            &risk,
+        );
+
+        let price_guard = env.register(MockPriceGuard, ());
+
+        let rwa_admin = Address::generate(&env);
+        let usdc_admin = Address::generate(&env);
+        let rwa = env.register_stellar_asset_contract_v2(rwa_admin).address();
+        let usdc = env.register_stellar_asset_contract_v2(usdc_admin).address();
+
+        RepoDvpClient::new(&env, &repo).set_usdc(&admin, &usdc);
+        RepoDvpClient::new(&env, &repo).configure_asset(
+            &admin,
+            &rwa,
+            &price_guard,
+            &500u32, // 5% haircut
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_500,
+            },
+        );
+        MockPriceGuardClient::new(&env, &price_guard).set_price(
+            &rwa,
+            &PRICE_SCALE,
+            &PriceStatus::Ok,
+            &env.ledger().timestamp(),
+        );
+
+        let cash_lender = Address::generate(&env);
+        let cash_borrower = Address::generate(&env);
+
+        Harness {
+            env,
+            repo,
+            admin,
+            keeper,
+            price_guard,
+            rwa,
+            usdc,
+            cash_lender,
+            cash_borrower,
+        }
+    }
+
+    #[test]
+    fn sac_propose_settle_unwind_end_to_end() {
+        let h = setup_sac();
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 90 * PRICE_SCALE;
+        let rate_bps = 500u32;
+        let term_seconds = 3_600u64;
+        let maturity = h.env.ledger().timestamp() + term_seconds;
+        let id = propose(&h, units, cash_amount, rate_bps, maturity);
+
+        token::StellarAssetClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        token::StellarAssetClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+
+        let token_rwa = token::Client::new(&h.env, &h.rwa);
+        let token_usdc = token::Client::new(&h.env, &h.usdc);
+
+        assert_eq!(token_rwa.balance(&h.repo), units);
+        assert_eq!(token_usdc.balance(&h.cash_borrower), cash_amount);
+
+        let interest = accrue_interest(cash_amount, rate_bps, term_seconds);
+        token::StellarAssetClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &interest);
+
+        h.env.ledger().set_timestamp(maturity);
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_lender, &id);
+
+        assert_eq!(token_usdc.balance(&h.cash_lender), cash_amount + interest);
+        assert_eq!(token_rwa.balance(&h.cash_borrower), units);
+        assert_eq!(token_rwa.balance(&h.repo), 0);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Unwound
+        );
+    }
+
+    #[test]
+    fn expired_allowance_unwind_by_keeper_fails_while_borrower_succeeds() {
+        let h = setup_sac();
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 90 * PRICE_SCALE;
+        let rate_bps = 500u32;
+        let term_seconds = 3_600u64;
+        let maturity = h.env.ledger().timestamp() + term_seconds;
+        let id = propose(&h, units, cash_amount, rate_bps, maturity);
+
+        token::StellarAssetClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        token::StellarAssetClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+
+        let interest = accrue_interest(cash_amount, rate_bps, term_seconds);
+        token::StellarAssetClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &interest);
+
+        let token_usdc = token::Client::new(&h.env, &h.usdc);
+        let token_rwa = token::Client::new(&h.env, &h.rwa);
+
+        // Advance timestamp to maturity so unwind is allowed by time.
+        h.env.ledger().set_timestamp(maturity);
+
+        // Advance ledger sequence past the leg-2 allowance expiry bucket.
+        // At settlement, seq was 100. Allowance was bucketed to 155_520.
+        // Advancing past 155_520 expires the SAC allowance.
+        let expiry = allowance_expiry(&h.env, term_seconds, UNWIND_ALLOWANCE_GRACE_LEDGERS);
+        h.env.ledger().set_sequence_number(expiry + 1);
+
+        // Allowance read back from SAC is now 0 because it has expired.
+        assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
+
+        // Keeper unwind uses transfer_from which must fail because the allowance has expired.
+        let keeper = h.keeper.clone();
+        let repo = h.repo.clone();
+        let env = h.env.clone();
+        let keeper_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            RepoDvpClient::new(&env, &repo).unwind(&keeper, &id);
+        }));
+        assert!(
+            keeper_result.is_err(),
+            "keeper unwind must fail when allowance is expired"
+        );
+
+        // Borrower-signed unwind uses direct transfer, which succeeds even after allowance expiry.
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_borrower, &id);
+
+        assert_eq!(token_usdc.balance(&h.cash_lender), cash_amount + interest);
+        assert_eq!(token_rwa.balance(&h.cash_borrower), units);
+        assert_eq!(token_rwa.balance(&h.repo), 0);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Unwound
+        );
+    }
+
+    #[test]
+    fn sac_allowance_expiry_is_not_before_maturity_plus_grace() {
+        let h = setup_sac();
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 90 * PRICE_SCALE;
+        let rate_bps = 500u32;
+        let term_seconds = 3_600u64;
+        let maturity = h.env.ledger().timestamp() + term_seconds;
+        let id = propose(&h, units, cash_amount, rate_bps, maturity);
+
+        token::StellarAssetClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        token::StellarAssetClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+        let settlement_seq = h.env.ledger().sequence();
+        let expected_expiry =
+            allowance_expiry(&h.env, term_seconds, UNWIND_ALLOWANCE_GRACE_LEDGERS);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+
+        let token_usdc = token::Client::new(&h.env, &h.usdc);
+
+        // Maturity in ledgers from settlement
+        let maturity_ledger = settlement_seq + (term_seconds / SECONDS_PER_LEDGER) as u32;
+        let min_required_expiry = maturity_ledger + UNWIND_ALLOWANCE_GRACE_LEDGERS;
+
+        assert!(
+            expected_expiry >= min_required_expiry,
+            "allowance expiry ({expected_expiry}) must be >= maturity + grace ({min_required_expiry})"
+        );
+
+        // Verify that at maturity + UNWIND_ALLOWANCE_GRACE_LEDGERS, the allowance read back from SAC is still valid.
+        h.env.ledger().set_sequence_number(min_required_expiry);
+        assert!(
+            token_usdc.allowance(&h.cash_borrower, &h.repo) > 0,
+            "allowance read back from SAC must not expire before maturity plus grace"
+        );
+
+        // Advance to the exact computed bucketed expiry and verify allowance is still accessible.
+        h.env.ledger().set_sequence_number(expected_expiry);
+        assert!(
+            token_usdc.allowance(&h.cash_borrower, &h.repo) > 0,
+            "allowance must still be active at expected expiry"
+        );
+
+        // One ledger past expiry, SAC treats it as 0.
+        h.env.ledger().set_sequence_number(expected_expiry + 1);
+        assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
+    }
 }
