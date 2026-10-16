@@ -593,11 +593,11 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
-    fn setup(
+    fn setup_with_admin(
         band_bps: u32,
         daily_move_band_bps: u32,
         max_staleness_s: u64,
-    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address) {
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -625,6 +625,16 @@ mod test {
         // doesn't panic every call here.
         client.configure_signature_requirement(&admin, &false);
 
+        (env, client, admin, price_publisher, risk, asset)
+    }
+
+    fn setup(
+        band_bps: u32,
+        daily_move_band_bps: u32,
+        max_staleness_s: u64,
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address) {
+        let (env, client, _admin, price_publisher, risk, asset) =
+            setup_with_admin(band_bps, daily_move_band_bps, max_staleness_s);
         (env, client, price_publisher, risk, asset)
     }
 
@@ -993,5 +1003,112 @@ mod test {
         }));
         assert!(result.is_err(), "only the risk role may clear a halt");
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_an_asset() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let new_asset = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_asset",
+                args: (stranger.clone(), new_asset.clone(), 60u32, 120u32, 1800u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(&stranger, &new_asset, &60, &120, &1800);
+        }));
+        assert!(result.is_err(), "only the stored admin may configure an asset");
+
+        // The real admin authorising only themselves succeeds
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_asset",
+                args: (admin.clone(), new_asset.clone(), 60u32, 120u32, 1800u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.configure_asset(&admin, &new_asset, &60, &120, &1800);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_issuer_key() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let (pubkey, _) = test_issuer_keypair(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_issuer_key",
+                args: (stranger.clone(), asset.clone(), pubkey.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_issuer_key(&stranger, &asset, &pubkey);
+        }));
+        assert!(result.is_err(), "only the stored admin may configure issuer key");
+
+        // The real admin authorising only themselves succeeds
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_issuer_key",
+                args: (admin.clone(), asset.clone(), pubkey.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_signature_requirement() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_signature_requirement",
+                args: (stranger.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_signature_requirement(&stranger, &true);
+        }));
+        assert!(
+            result.is_err(),
+            "only the stored admin may configure signature requirement"
+        );
+
+        // The real admin authorising only themselves succeeds
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_signature_requirement",
+                args: (admin.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.configure_signature_requirement(&admin, &true);
     }
 }
