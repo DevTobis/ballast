@@ -8,3 +8,4 @@ pub mod pause;
 pub mod price;
 pub mod risk;
 pub mod timelock;
+pub mod ttl;
