@@ -46,8 +46,8 @@ inv --id "$NEW" -- configure_asset --admin "$ADMIN" --asset "$RWA_SAC" \
   --band_bps 50 --daily_move_band_bps 100 --max_staleness_s 21600 >/dev/null
 
 # The deploy file is what configure-nav-key.sh and configure-desks.sh read, so it changes first.
-sed -i "s/^PRICE_GUARD_CID=.*/PRICE_GUARD_CID=$NEW/" "$DEPLOY_FILE"
-[[ -f .env ]] && sed -i "s/^PRICE_GUARD_CONTRACT_ID=.*/PRICE_GUARD_CONTRACT_ID=$NEW/" .env
+sed "s/^PRICE_GUARD_CID=.*/PRICE_GUARD_CID=$NEW/" "$DEPLOY_FILE" > "$DEPLOY_FILE.tmp" && mv "$DEPLOY_FILE.tmp" "$DEPLOY_FILE"
+[[ -f .env ]] && sed "s/^PRICE_GUARD_CONTRACT_ID=.*/PRICE_GUARD_CONTRACT_ID=$NEW/" .env > .env.tmp && mv .env.tmp .env
 
 log "Registering the NAV attestor key and requiring signatures"
 scripts/configure-nav-key.sh "$NETWORK"
