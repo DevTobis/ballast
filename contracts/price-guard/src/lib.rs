@@ -43,6 +43,17 @@
 //! configured off-chain publisher may call `publish_nav`/`publish_source` at all. Signature
 //! verification adds a second, independent check — the publisher itself must have received a
 //! validly-signed reading from the issuer, not just be an authorized caller.
+//!
+//! **Rotating the publisher without redeploying.** Roles live in this contract's storage, so the
+//! admin can queue a `price_publisher` rotation (`queue_role_change`), wait out the same 48h
+//! timelock used for risk parameters, and apply it with `execute_role_change`. `LastGood`, a
+//! `Halted` latch, configured assets and registered issuer keys all survive the rotation, unlike
+//! `scripts/redeploy-price-guard.sh`, which deploys a new contract id and therefore loses them.
+//! When the publisher key is also the NAV attestor (the default wiring — see
+//! `scripts/configure-nav-key.sh`), call `configure_issuer_key` with the new key in the same
+//! operational window: `publish_nav` verifies `sig` against the registered issuer key, not
+//! against the `price_publisher` role, so until that call lands the new publisher cannot publish
+//! NAV. See `contracts/README.md` for the full sequence.
 
 use ballast_common::{
     access::{self, Roles},
@@ -437,6 +448,46 @@ impl PriceGuard {
         );
     }
 
+    /// Current role addresses. Used by scripts and tests to confirm a rotation landed.
+    pub fn roles(env: Env) -> Roles {
+        access::read_roles(&env)
+    }
+
+    /// Step 1 of a two-step admin transfer: the stored admin names its successor. A later proposal
+    /// replaces an earlier one, so a mistyped address can be corrected without waiting.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        access::propose_admin(&env, &new_admin);
+    }
+
+    /// Step 2 of a two-step admin transfer: the proposed successor accepts. Consumes the proposal.
+    pub fn accept_admin(env: Env) {
+        access::accept_admin(&env);
+    }
+
+    /// The proposed successor from `propose_admin`, if a transfer is pending.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        access::pending_admin(&env)
+    }
+
+    /// Queues a timelocked non-admin role rotation and returns the id to pass to
+    /// `execute_role_change` once the 48h delay has elapsed. Only the admin may queue; execution is
+    /// permissionless. Rotating `price_publisher` this way preserves all contract state — see the
+    /// module doc comment and `contracts/README.md` for the accompanying `configure_issuer_key`
+    /// step.
+    pub fn queue_role_change(env: Env, role: access::RoleKind, new_address: Address) -> u64 {
+        access::queue_role_change(&env, role, &new_address)
+    }
+
+    /// Applies a `queue_role_change` entry once its 48h timelock has elapsed.
+    pub fn execute_role_change(env: Env, id: u64) {
+        access::execute_role_change(&env, id)
+    }
+
+    /// The outstanding queued change for `id`, including its `executes_at` timestamp.
+    pub fn pending_role_change(env: Env, id: u64) -> Option<access::PendingRoleChange> {
+        access::pending_role_change(&env, id)
+    }
+
     /// Admin-set per-asset thresholds. Kept local to this contract rather than cross-called from
     /// `Registry` — see the module docs on the general Registry-decoupling simplification used
     /// across this pass's contracts.
@@ -462,7 +513,8 @@ impl PriceGuard {
 
     /// Admin-only. Registers/rotates the raw Ed25519 public key `asset`'s issuer signs NAV
     /// readings with — see the module doc comment. Required before `publish_nav` can succeed for
-    /// `asset` while `require_nav_signature` is `true`.
+    /// `asset` while `require_nav_signature` is `true`. Call this with the new publisher's raw
+    /// public key when rotating `price_publisher` and the publisher is also the NAV attestor.
     pub fn configure_issuer_key(
         env: Env,
         admin: Address,
@@ -794,6 +846,188 @@ mod test {
         // Signed over a DIFFERENT value than what's actually published -> verification must fail.
         let sig = sign_nav(&env, &signing_key, &code, now, SCALE + 1);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    // --- publisher rotation ------------------------------------------------------------------
+
+    /// A publisher rotation is queued, waits out the 48h timelock, and then applies in place: the
+    /// old publisher is rejected, the new one is accepted, and the state a redeploy would have lost
+    /// (`LastGood`, the published sources) is still there.
+    #[test]
+    fn queued_publisher_rotation_rejects_the_old_publisher_and_accepts_the_new_one() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        // A week of staleness so the 48h wait does not age the readings out: this test is about
+        // the rotation preserving them, not about freshness.
+        let (env, client, old_publisher, _risk, asset) = setup(50, 10_000, 7 * 24 * 3600);
+        let code = asset_code(&env);
+        let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
+        let source = feed(&env);
+        let t0 = env.ledger().timestamp();
+
+        client.publish_nav(&old_publisher, &asset, &code, &SCALE, &t0, &zero_sig);
+        client.publish_source(&old_publisher, &asset, &source, &SCALE, &t0);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        let new_publisher = Address::generate(&env);
+        let id = client.queue_role_change(&access::RoleKind::PricePublisher, &new_publisher);
+        assert_eq!(
+            client.roles().price_publisher,
+            old_publisher,
+            "queueing must not change the role yet"
+        );
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_role_change(&id);
+        }));
+        assert!(
+            early.is_err(),
+            "a queued rotation must wait out the timelock"
+        );
+
+        env.ledger()
+            .set_timestamp(t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1);
+        client.execute_role_change(&id);
+        assert_eq!(client.roles().price_publisher, new_publisher);
+
+        // Neither the guarded price nor its baseline was reset by the rotation.
+        let price = client.guarded_price(&asset);
+        assert_eq!((price.status, price.value), (PriceStatus::Ok, SCALE));
+
+        let now = env.ledger().timestamp();
+        env.mock_auths(&[MockAuth {
+            address: &old_publisher,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "publish_source",
+                args: (
+                    old_publisher.clone(),
+                    asset.clone(),
+                    source.clone(),
+                    SCALE,
+                    now,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&old_publisher, &asset, &source, &SCALE, &now);
+        }));
+        assert!(old.is_err(), "the rotated-out publisher must be rejected");
+
+        // `publish_source` authenticates the caller and then the stored publisher role; when those
+        // are the same address, both checks need a mock entry (real auth is one signature covering
+        // both).
+        let new_auth = MockAuth {
+            address: &new_publisher,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "publish_source",
+                args: (
+                    new_publisher.clone(),
+                    asset.clone(),
+                    source.clone(),
+                    SCALE,
+                    now,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        };
+        env.mock_auths(&[new_auth.clone(), new_auth]);
+        client.publish_source(&new_publisher, &asset, &source, &SCALE, &now);
+
+        // The role also gates `publish_nav`, which is the key that signs every NAV.
+        let nav_auth = MockAuth {
+            address: &new_publisher,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "publish_nav",
+                args: (
+                    new_publisher.clone(),
+                    asset.clone(),
+                    code.clone(),
+                    SCALE,
+                    now,
+                    zero_sig.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        };
+        env.mock_auths(&[nav_auth.clone(), nav_auth]);
+        client.publish_nav(&new_publisher, &asset, &code, &SCALE, &now, &zero_sig);
+    }
+
+    #[test]
+    fn admin_transfer_requires_the_proposed_admin_to_accept() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _publisher, _risk, _asset) = setup(50, 10_000, 3600);
+        let current_admin = client.roles().admin;
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&new_admin);
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.accept_admin();
+        }));
+        assert!(
+            rejected.is_err(),
+            "only the proposed admin may accept the transfer"
+        );
+        assert_eq!(client.roles().admin, current_admin);
+
+        env.mock_auths(&[MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_admin();
+        assert_eq!(client.roles().admin, new_admin);
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_a_role_change() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _publisher, _risk, _asset) = setup(50, 10_000, 3600);
+        let stranger = Address::generate(&env);
+        let new_publisher = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_role_change",
+                args: (access::RoleKind::PricePublisher, new_publisher.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_role_change(&access::RoleKind::PricePublisher, &new_publisher);
+        }));
+        assert!(
+            result.is_err(),
+            "only the stored admin may queue a role change"
+        );
     }
 
     // --- adversarial cases -------------------------------------------------------------------
