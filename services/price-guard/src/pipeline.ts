@@ -1,4 +1,4 @@
-/**
+/*
  * PRD §6.5: "Pulls issuer NAV and feeds, signs and pushes updates to `PriceGuard`."
  *
  * For each configured asset: fetch issuer NAV (where the issuer has an API) + independent feed, record both as
@@ -14,7 +14,7 @@ import { loadNetworkConfig } from "@ballast/network-config";
 import type { AssetConfig } from "@ballast/domain-types";
 import type { PriceGuardClient } from "@ballast/contract-clients";
 import { getIndependentFeedAdapter, getIssuerNavAdapter } from "./adapters/registry.js";
-import { attestNav } from "./navAttestor.js";
+import { attestNav } from "./navSttestor.js";
 import { scaledToDecimalString } from "./scaled.js";
 import { submitSignedTx, type KmsSigner, type SubmitResult } from "@ballast/operator-signing";
 
@@ -120,27 +120,43 @@ export async function runPriceUpdateCycle(
       const publisher = signer!;
       const publisherPublicKey = publisher.publicKey();
 
+      // Publish each source independently: a failed NAV tx must not stop the feed publish (and
+      // vice versa). Collect per-source errors and alert after the read-back.
+      const publishErrors: { source: string; reason: string }[] = [];
+
       if (nav) {
-        const sig = await attestNav(publisher, asset.code, nav.ts, nav.value);
-        const navUnsignedXdr = await client.publishNav(
-          publisherPublicKey,
-          asset.contractC,
-          asset.code,
-          nav.value,
-          nav.ts,
-          sig,
-        );
-        await submit(await publisher.sign(navUnsignedXdr));
+        try {
+          const sig = await attestNav(publisher, asset.code, nav.ts, nav.value);
+          const navUnsignedXdr = await client.publishNav(
+            publisherPublicKey,
+            asset.contractC,
+            asset.code,
+            nav.value,
+            nav.ts,
+            sig,
+          );
+          await submit(await publisher.sign(navUnsignedXdr));
+        } catch (err) {
+          const reason = `issuer NAV publish failed: ${err instanceof Error ? err.message : String(err)}`;
+          publishErrors.push({ source: "issuer NAV", reason });
+          console.error(`price-guard: ${asset.code}: ${reason}`);
+        }
       }
       if (feed) {
-        const feedUnsignedXdr = await client.publishFeed(
-          publisherPublicKey,
-          asset.contractC,
-          "redstone",
-          feed.value,
-          feed.ts,
-        );
-        await submit(await publisher.sign(feedUnsignedXdr));
+        try {
+          const feedUnsignedXdr = await client.publishFeed(
+            publisherPublicKey,
+            asset.contractC,
+            "redstone",
+            feed.value,
+            feed.ts,
+          );
+          await submit(await publisher.sign(feedUnsignedXdr));
+        } catch (err) {
+          const reason = `RedStone feed publish failed: ${err instanceof Error ? err.message : String(err)}`;
+          publishErrors.push({ source: "RedStone feed", reason });
+          console.error(`price-guard: ${asset.code}: ${reason}`);
+        }
       }
 
       // Read-only; the underlying client simulates this against STELLAR_SIMULATION_SOURCE rather
@@ -158,6 +174,11 @@ export async function runPriceUpdateCycle(
         ),
         ledger: 0, // filled in by the indexer once the on-chain tx is confirmed
       });
+
+      // Alert for any source that failed to publish, naming the source.
+      for (const { source, reason } of publishErrors) {
+        alerter.fire("price_degraded", { assetId: asset.id, code: asset.code, source, reason });
+      }
 
       if (guarded.status === "Degraded") {
         alerter.fire("price_degraded", { assetId: asset.id, code: asset.code, status: guarded.status });
