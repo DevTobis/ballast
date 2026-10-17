@@ -2,6 +2,7 @@
 // Contract entry points take their inputs as flat arguments (that's the on-chain interface), and
 // `#[contractimpl]` generates client functions with the same arity.
 #![allow(clippy::too_many_arguments)]
+#![allow(deprecated)]
 
 //! `PriceGuard` (PRD §6.2, §6.4, §8): the median/band/staleness/halt rules that stand between a
 //! manipulated or stale price and a draw/exit/repo/liquidation. This is the contract that exists
@@ -94,6 +95,8 @@ enum DataKey {
     /// Global (not per-asset) admin-settable flag, default `true` when unset — see the module doc
     /// comment on why this exists and why it isn't a security control.
     RequireNavSignature,
+    /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
+    LastStatus(Address),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -309,6 +312,31 @@ fn within_band(values: &[i128], band_bps: u32) -> bool {
 /// stick and the baseline would never move until some unrelated transaction happened to call it;
 /// the daily-move check would then compare against a baseline days old and halt on ordinary yield
 /// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
+fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, value: i128) {
+    let key = DataKey::LastStatus(asset.clone());
+    let prev: Option<PriceStatus> = env.storage().instance().get(&key);
+    let changed = match &prev {
+        Some(from) => from != &to,
+        None => true,
+    };
+    if changed {
+        let from = prev.unwrap_or(PriceStatus::Degraded);
+        env.storage().instance().set(&key, &to);
+        env.events().publish(
+            (Symbol::new(env, "status_changed"), asset.clone()),
+            (from, to, value),
+        );
+    }
+}
+
+/// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
+/// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
+///
+/// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
+/// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
+/// stick and the baseline would never move until some unrelated transaction happened to call it;
+/// the daily-move check would then compare against a baseline days old and halt on ordinary yield
+/// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
 fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let config = read_config(&env, &asset);
     let all_sources = read_all_sources(&env, &asset);
@@ -335,9 +363,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let now = env.ledger().timestamp();
 
     if already_halted {
+        let val = last_good.unwrap_or(0);
+        check_and_emit_status_change(env, &asset, PriceStatus::Halted, val);
         return GuardedPrice {
             asset,
-            value: last_good.unwrap_or(0),
+            value: val,
             status: PriceStatus::Halted,
             ts: now,
             sources: fresh_sources,
@@ -345,9 +375,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     }
 
     if fresh_values.len() < 2 {
+        let val = last_good.unwrap_or(0);
+        check_and_emit_status_change(env, &asset, PriceStatus::Degraded, val);
         return GuardedPrice {
             asset,
-            value: last_good.unwrap_or(0),
+            value: val,
             status: PriceStatus::Degraded,
             ts: now,
             sources: fresh_sources,
@@ -365,9 +397,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         *slot = plain_values.get(i);
     }
     if !within_band(&as_array[..len], config.band_bps) {
+        let val = last_good.unwrap_or(0);
+        check_and_emit_status_change(env, &asset, PriceStatus::Degraded, val);
         return GuardedPrice {
             asset,
-            value: last_good.unwrap_or(0),
+            value: val,
             status: PriceStatus::Degraded,
             ts: now,
             sources: fresh_sources,
@@ -384,6 +418,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                 env.storage()
                     .instance()
                     .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                env.events().publish(
+                    (Symbol::new(env, "halt_latched"), asset.clone()),
+                    (last, median_value),
+                );
+                check_and_emit_status_change(env, &asset, PriceStatus::Halted, last);
                 return GuardedPrice {
                     asset,
                     value: last,
@@ -399,6 +438,8 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         .instance()
         .set(&DataKey::LastGood(asset.clone()), &median_value);
 
+    check_and_emit_status_change(env, &asset, PriceStatus::Ok, median_value);
+
     GuardedPrice {
         asset,
         value: median_value,
@@ -406,7 +447,6 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         ts: now,
         sources: fresh_sources,
     }
-
 }
 
 #[contract]
@@ -451,12 +491,20 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         env.storage().instance().set(
-            &DataKey::Config(asset),
+            &DataKey::Config(asset.clone()),
             &AssetGuardConfig {
                 band_bps,
                 daily_move_band_bps,
                 max_staleness_s,
             },
+        );
+        env.storage().instance().set(
+            &DataKey::LastStatus(asset.clone()),
+            &PriceStatus::Degraded,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "configure_asset"), asset),
+            (band_bps, daily_move_band_bps, max_staleness_s),
         );
     }
 
@@ -473,7 +521,11 @@ impl PriceGuard {
         access::require_admin(&env);
         env.storage()
             .instance()
-            .set(&DataKey::IssuerPubKey(asset), &issuer_pubkey);
+            .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
+        env.events().publish(
+            (Symbol::new(&env, "configure_issuer_key"), asset),
+            issuer_pubkey,
+        );
     }
 
     /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all —
@@ -484,6 +536,10 @@ impl PriceGuard {
         env.storage()
             .instance()
             .set(&DataKey::RequireNavSignature, &required);
+        env.events().publish(
+            (Symbol::new(&env, "configure_signature_requirement"),),
+            required,
+        );
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
@@ -523,6 +579,12 @@ impl PriceGuard {
         let name = Symbol::new(&env, ISSUER_SOURCE);
         track_source_name(&env, &asset, &name);
         write_source(&env, &asset, &name, value, ts);
+
+        env.events().publish(
+            (Symbol::new(&env, "nav_published"), asset.clone()),
+            (Symbol::new(&env, ISSUER_SOURCE), value, ts),
+        );
+
         evaluate(&env, asset);
     }
 
@@ -544,6 +606,12 @@ impl PriceGuard {
 
         track_source_name(&env, &asset, &source);
         write_source(&env, &asset, &source, value, ts);
+
+        env.events().publish(
+            (Symbol::new(&env, "source_published"), asset.clone()),
+            (source.clone(), value, ts),
+        );
+
         evaluate(&env, asset);
     }
 
@@ -572,6 +640,7 @@ impl PriceGuard {
         risk.require_auth();
         access::require_risk(&env);
 
+        let mut new_last_good = 0i128;
         if let Some(pending) = env
             .storage()
             .instance()
@@ -580,12 +649,27 @@ impl PriceGuard {
             env.storage()
                 .instance()
                 .set(&DataKey::LastGood(asset.clone()), &pending);
+            new_last_good = pending;
             env.storage()
                 .instance()
                 .remove(&DataKey::PendingHaltValue(asset.clone()));
+        } else if let Some(last) = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::LastGood(asset.clone()))
+        {
+            new_last_good = last;
         }
-        env.storage().instance().remove(&DataKey::Halted(asset));
+        env.storage().instance().remove(&DataKey::Halted(asset.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "halt_cleared"), asset.clone()),
+            new_last_good,
+        );
+
+        evaluate(&env, asset);
     }
+
 }
 
 #[cfg(test)]
@@ -994,4 +1078,80 @@ mod test {
         assert!(result.is_err(), "only the risk role may clear a halt");
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
     }
+
+    #[test]
+    fn events_emitted_for_all_state_changes_and_configurations() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        let asset = Address::generate(&env);
+
+        let has_event = |events: &soroban_sdk::testutils::ContractEvents, topic0: &str| -> bool {
+            let target = ScVal::Symbol(ScSymbol(topic0.try_into().unwrap()));
+            events
+                .filter_by_contract(&client.address)
+                .events()
+                .iter()
+                .any(|e| match &e.body {
+                    ContractEventBody::V0(b) => b.topics.first() == Some(&target),
+                })
+        };
+
+        // 1. configure_asset event
+        client.configure_asset(&admin, &asset, &50, &100, &3600);
+        let events = env.events().all();
+        assert!(has_event(&events, "configure_asset"), "configure_asset event must be emitted");
+
+        // 2. configure_issuer_key event
+        let (pubkey, _) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        let events = env.events().all();
+        assert!(has_event(&events, "configure_issuer_key"), "configure_issuer_key event must be emitted");
+
+        // 3. configure_signature_requirement event
+        client.configure_signature_requirement(&admin, &false);
+        let events = env.events().all();
+        assert!(has_event(&events, "configure_signature_requirement"), "configure_signature_requirement event must be emitted");
+
+        // 4. nav_published event
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&price_publisher, &asset, &code, &SCALE, &now, &sig);
+        let events = env.events().all();
+        assert!(has_event(&events, "nav_published"), "nav_published event must be emitted");
+
+        // 5. source_published event & status_changed event (from Degraded -> Ok)
+        client.publish_source(&price_publisher, &asset, &feed(&env), &SCALE, &now);
+        let events = env.events().all();
+        assert!(has_event(&events, "source_published"), "source_published event must be emitted");
+        assert!(has_event(&events, "status_changed"), "status_changed event must be emitted");
+
+        // 6. halt_latched event & status_changed event (from Ok -> Halted)
+        let jumped = SCALE * 2;
+        client.publish_nav(&price_publisher, &asset, &code, &jumped, &now, &sig);
+        client.publish_source(&price_publisher, &asset, &feed(&env), &jumped, &now);
+        let events = env.events().all();
+        assert!(has_event(&events, "halt_latched"), "halt_latched event must be emitted");
+
+        // 7. halt_cleared event & status_changed event (from Halted -> Ok)
+        client.confirm_halt_cleared(&risk, &asset);
+        let events = env.events().all();
+        assert!(has_event(&events, "halt_cleared"), "halt_cleared event must be emitted");
+    }
+
 }
+
