@@ -149,9 +149,26 @@ cargo fmt --check           # not in CI, and currently fails on main (pre-existi
 cargo clippy --all-targets -- -D warnings   # not in CI
 ```
 
-CI only runs `cargo test`. `cargo fmt --check` already reports differences on `main`, so do not reformat
-whole files in an unrelated PR: format only the files you changed (`rustfmt <file>`), or send a
-formatting-only PR on its own. Wiring `fmt` and `clippy` into CI is an open task.
+CI runs the contract tests and separately builds each deployable contract to WASM. The WASM job
+fails if a contract does not compile for `wasm32v1-none`, if an expected artifact is missing, or if
+an artifact exceeds the shared **100 KiB per-contract budget**. It prints each artifact's size in
+the GitHub Actions job summary. The budget is defined once in
+[`scripts/check-contract-wasm-size.sh`](scripts/check-contract-wasm-size.sh) as
+`WASM_SIZE_BUDGET_BYTES` (default `102400`); adjust that value there if the contracts' size
+requirements change.
+
+To run the same check locally, install the Rust `wasm32v1-none` target and Stellar CLI, then run:
+
+```bash
+scripts/check-contract-wasm-size.sh
+```
+
+You can temporarily override the shared budget for a local run with
+`WASM_SIZE_BUDGET_BYTES=120000 scripts/check-contract-wasm-size.sh`.
+
+`cargo fmt --check` already reports differences on `main`, so do not reformat whole files in an
+unrelated PR: format only the files you changed (`rustfmt <file>`), or send a formatting-only PR on
+its own. Wiring `fmt` and `clippy` into CI is an open task.
 
 To confirm a contract actually builds to wasm (needed before any deploy):
 
