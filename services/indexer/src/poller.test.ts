@@ -28,7 +28,7 @@ function fakeRpc(overrides: Partial<RpcClient> = {}): RpcClient {
 }
 
 describe("pollOnce", () => {
-  it("cold-starts from latestLedger - 1000 when chain_event is empty", async () => {
+  it("cold-starts from latestLedger - 10000 when chain_event is empty", async () => {
     const inserted: unknown[] = [];
     const db = fakeDb({ lastLedger: null, inserted });
     const getEvents = vi.fn().mockResolvedValue({ latestLedger: 5000, events: [] });
@@ -37,9 +37,9 @@ describe("pollOnce", () => {
     const result = await pollOnce(db, rpc, ["CCONTRACT1"]);
 
     expect(getEvents).toHaveBeenCalledWith(
-      expect.objectContaining({ startLedger: 4000, filters: [{ contractIds: ["CCONTRACT1"] }] }),
+      expect.objectContaining({ startLedger: 1, filters: [{ contractIds: ["CCONTRACT1"] }] }),
     );
-    expect(result.fromLedger).toBe(4000);
+    expect(result.fromLedger).toBe(1);
     expect(result.latestLedger).toBe(5000);
     expect(inserted).toHaveLength(0);
   });
