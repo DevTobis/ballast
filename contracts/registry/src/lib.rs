@@ -14,7 +14,7 @@ use ballast_common::{
     pause::{self, PauseScope},
     timelock,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, symbol_short};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
 #[contracttype]
 struct PendingParamChange {
@@ -90,7 +90,7 @@ impl Registry {
         );
         write_asset(&env, &asset, &config);
         env.events()
-            .publish((symbol_short!("asset_registered"), asset.clone()), config);
+            .publish((Symbol::new(&env, "asset_registered"), asset.clone()), config);
     }
 
     pub fn asset(env: Env, asset: Address) -> AssetConfig {
@@ -113,8 +113,10 @@ impl Registry {
             executes_at,
         };
         env.storage().temporary().set(&DataKey::PendingParam(id), &pending);
-        env.events()
-            .publish((symbol_short!("param_queued"), id), (&pending.asset, &pending.change, pending.executes_at));
+        env.events().publish(
+            (Symbol::new(&env, "param_queued"), id),
+            (pending.asset.clone(), pending.change.clone(), pending.executes_at),
+        );
         id
     }
 
@@ -132,43 +134,36 @@ impl Registry {
         );
 
         let mut config = read_asset(&env, &pending.asset);
-        // Capture old values before modifying
-        let old_value = match &pending.change {
-            ParamChange::HaircutBaseBps(v) => v.clone(),
-            ParamChange::HaircutFxBps(v) => v.clone(),
-            ParamChange::PriceBandBps(v) => v.clone(),
-            ParamChange::DailyMoveBandBps(v) => v.clone(),
-            ParamChange::RedemptionLagDays(v) => *v as i128,
-            ParamChange::Status(v) => v.clone(),
-        };
         // `raise_haircut_now` enforces `<= 10_000` bps on its own write path; this path must
         // enforce the same bound (and a sane bound on the other bps-denominated fields) so a
         // queued change can't silently push a field past 100% after the timelock elapses.
-        match pending.change {
+        match &pending.change {
             ParamChange::HaircutBaseBps(v) => {
-                assert!(v <= 10_000, "registry: haircut cannot exceed 100%");
-                config.haircut_base_bps = v;
+                assert!(*v <= 10_000, "registry: haircut cannot exceed 100%");
+                config.haircut_base_bps = *v;
             }
             ParamChange::HaircutFxBps(v) => {
-                assert!(v <= 10_000, "registry: haircut cannot exceed 100%");
-                config.haircut_fx_bps = v;
+                assert!(*v <= 10_000, "registry: haircut cannot exceed 100%");
+                config.haircut_fx_bps = *v;
             }
             ParamChange::PriceBandBps(v) => {
-                assert!(v <= 10_000, "registry: band cannot exceed 100%");
-                config.price_band_bps = v;
+                assert!(*v <= 10_000, "registry: band cannot exceed 100%");
+                config.price_band_bps = *v;
             }
             ParamChange::DailyMoveBandBps(v) => {
-                assert!(v <= 10_000, "registry: band cannot exceed 100%");
-                config.daily_move_band_bps = v;
+                assert!(*v <= 10_000, "registry: band cannot exceed 100%");
+                config.daily_move_band_bps = *v;
             }
-            ParamChange::RedemptionLagDays(v) => config.redemption_lag_days = v,
-            ParamChange::Status(v) => config.status = v,
+            ParamChange::RedemptionLagDays(v) => config.redemption_lag_days = *v,
+            ParamChange::Status(v) => config.status = v.clone(),
         }
         write_asset(&env, &pending.asset, &config);
         env.storage().temporary().remove(&DataKey::PendingParam(id));
-        // Emit param_executed event
-        env.events()
-            .publish((symbol_short!("param_executed"), id), (&pending.asset, old_value, &config));
+        // Emit param_executed: the queued change and the config it produced.
+        env.events().publish(
+            (Symbol::new(&env, "param_executed"), id),
+            (pending.asset.clone(), pending.change.clone(), config.clone()),
+        );
     }
 
     /// The emergency brake (PRD §6.4/§8): raises `haircut_base_bps` immediately, with no
@@ -179,7 +174,6 @@ impl Registry {
         access::require_risk(&env);
 
         let mut config = read_asset(&env, &asset);
-        let old_haircut = config.haircut_base_bps;
         let new_haircut = config
             .haircut_base_bps
             .checked_add(add_bps)
@@ -191,7 +185,7 @@ impl Registry {
         config.haircut_base_bps = new_haircut;
         write_asset(&env, &asset, &config);
         env.events()
-            .publish((symbol_short!("haircut_raised"), asset), (add_bps, new_haircut));
+            .publish((Symbol::new(&env, "haircut_raised"), asset.clone()), (add_bps, new_haircut));
     }
 
     /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
@@ -200,7 +194,7 @@ impl Registry {
         access::require_pauser(&env);
         pause::set_paused(&env, &scope, true);
         env.events()
-            .publish((symbol_short!("paused"), scope), true);
+            .publish((Symbol::new(&env, "paused"), scope.clone()), true);
     }
 
     /// Queues an unpause, executable after the 48h timelock — unlike `pause`, lifting a stop is
@@ -209,12 +203,15 @@ impl Registry {
         admin.require_auth();
         access::require_admin(&env);
         let id = timelock::next_id(&env);
-        env.storage().temporary().set(
-            &DataKey::PendingUnpause(id),
-            &PendingUnpause {
-                scope,
-                executes_at: timelock::executes_at(&env),
-            },
+        let executes_at = timelock::executes_at(&env);
+        let pending = PendingUnpause {
+            scope: scope.clone(),
+            executes_at,
+        };
+        env.storage().temporary().set(&DataKey::PendingUnpause(id), &pending);
+        env.events().publish(
+            (Symbol::new(&env, "unpause_queued"), id),
+            (scope.clone(), executes_at),
         );
         id
     }
@@ -230,6 +227,10 @@ impl Registry {
             "registry: timelock has not elapsed"
         );
         pause::set_paused(&env, &pending.scope, false);
+        env.events().publish(
+            (Symbol::new(&env, "unpause_executed"), id),
+            pending.scope.clone(),
+        );
         env.storage()
             .temporary()
             .remove(&DataKey::PendingUnpause(id));
@@ -244,8 +245,8 @@ impl Registry {
 mod test {
     use super::*;
     use ballast_common::asset::{AssetStandard, CustodyMode, YieldType};
-    use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::{symbol_short, Symbol};
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
+    use soroban_sdk::{symbol_short, Symbol, TryFromVal};
 
     fn setup() -> (Env, RegistryClient<'static>, Address, Address, Address) {
         let env = Env::default();
@@ -353,6 +354,173 @@ mod test {
         });
         client.execute_unpause(&id);
         assert!(!client.is_paused(&PauseScope::Draws));
+    }
+
+    // Builds the XDR form of an expected event so it can be compared against what the contract
+    // published. Mirrors the conversion `testutils::ContractEvents` uses internally.
+    fn expected_event(
+        env: &Env,
+        addr: &Address,
+        topics: soroban_sdk::Vec<soroban_sdk::Val>,
+        data: soroban_sdk::Val,
+    ) -> soroban_sdk::xdr::ContractEvent {
+        let contract_id = match soroban_sdk::xdr::ScVal::try_from_val(env, &addr.to_val()) {
+            Ok(soroban_sdk::xdr::ScVal::Address(soroban_sdk::xdr::ScAddress::Contract(cid))) => {
+                Some(cid)
+            }
+            _ => None,
+        };
+        soroban_sdk::xdr::ContractEvent {
+            ext: soroban_sdk::xdr::ExtensionPoint::V0,
+            type_: soroban_sdk::xdr::ContractEventType::Contract,
+            contract_id,
+            body: soroban_sdk::xdr::ContractEventBody::V0(soroban_sdk::xdr::ContractEventV0 {
+                topics: topics.into(),
+                data: soroban_sdk::xdr::ScVal::try_from_val(env, &data).unwrap(),
+            }),
+        }
+    }
+
+    // The event published by the most recent contract call, so assertions hold regardless of
+    // whether the test env keeps events across calls or only for the latest invocation.
+    fn last_event(env: &Env) -> Option<soroban_sdk::xdr::ContractEvent> {
+        env.events().all().events().last().cloned()
+    }
+
+    #[test]
+    fn every_state_change_emits_an_event() {
+        use soroban_sdk::{vec, IntoVal};
+
+        let (env, client, admin, risk, asset) = setup();
+        // Reading the config is itself a contract call, and a call resets the observable event
+        // buffer, so `setup`'s own `asset_registered` can no longer be seen here. Register a
+        // fresh asset and assert on that call instead.
+        let config = client.asset(&asset);
+        let addr = client.address.clone();
+        let fresh = Address::generate(&env);
+
+        client.register_asset(&admin, &fresh, &config);
+        let registered = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "asset_registered").into_val(&env),
+                fresh.clone().into_val(&env),
+            ],
+            config.clone().into_val(&env),
+        );
+        assert_eq!(
+            last_event(&env),
+            Some(registered),
+            "register_asset must emit asset_registered"
+        );
+
+        let change = ParamChange::HaircutBaseBps(700);
+        let param_id = client.queue_param(&admin, &fresh, &change);
+        let executes_at =
+            env.ledger().timestamp() + ballast_common::timelock::TIMELOCK_DELAY_SECONDS;
+        let queued = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "param_queued").into_val(&env),
+                param_id.into_val(&env),
+            ],
+            (fresh.clone(), change.clone(), executes_at).into_val(&env),
+        );
+        assert_eq!(
+            last_event(&env),
+            Some(queued),
+            "queue_param must emit param_queued"
+        );
+
+        client.raise_haircut_now(&risk, &fresh, &200);
+        let raised = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "haircut_raised").into_val(&env),
+                fresh.clone().into_val(&env),
+            ],
+            (200u32, 500u32).into_val(&env),
+        );
+        assert_eq!(
+            last_event(&env),
+            Some(raised),
+            "raise_haircut_now must emit haircut_raised"
+        );
+
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let paused = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "paused").into_val(&env),
+                PauseScope::Draws.into_val(&env),
+            ],
+            true.into_val(&env),
+        );
+        assert_eq!(last_event(&env), Some(paused), "pause must emit paused");
+
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        let unpause_queued = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "unpause_queued").into_val(&env),
+                unpause_id.into_val(&env),
+            ],
+            (PauseScope::Draws, executes_at).into_val(&env),
+        );
+        assert_eq!(
+            last_event(&env),
+            Some(unpause_queued),
+            "queue_unpause must emit unpause_queued"
+        );
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&param_id);
+        let mut updated = config.clone();
+        updated.haircut_base_bps = 700;
+        let executed = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "param_executed").into_val(&env),
+                param_id.into_val(&env),
+            ],
+            (fresh.clone(), change.clone(), updated.clone()).into_val(&env),
+        );
+        assert_eq!(
+            last_event(&env),
+            Some(executed),
+            "execute_param must emit param_executed"
+        );
+
+        client.execute_unpause(&unpause_id);
+        let unpaused = expected_event(
+            &env,
+            &addr,
+            vec![
+                &env,
+                Symbol::new(&env, "unpause_executed").into_val(&env),
+                unpause_id.into_val(&env),
+            ],
+            PauseScope::Draws.into_val(&env),
+        );
+        assert_eq!(
+            last_event(&env),
+            Some(unpaused),
+            "execute_unpause must emit unpause_executed"
+        );
     }
 
     // Test-only helper: there's no public getter for the stored pauser address, so this reaches
