@@ -15,6 +15,46 @@ in this skeleton pass.
 | `exit-desk` | RWA → USDC instant exit |
 | `repo-dvp` | Bilateral repo, atomic DvP |
 
+## Pause scopes
+
+`ballast-common::pause::PauseScope` has four targeted scopes plus an `All` override that `is_paused`
+applies to every scope. This is the complete map of what each scope gates, taken from the
+`pause::require_not_paused` call sites:
+
+| Scope | Contract | Entry point | Gated |
+|---|---|---|---|
+| `Pledges` | `pledge-vault` | `pledge` | yes |
+| `Draws` | `credit-line` | `draw` | yes |
+| `Exits` | `exit-desk` | `exit` | yes |
+| `Repos` | `repo-dvp` | `accept_and_settle` | yes |
+| `All` | n/a | none; overrides every scope above | n/a |
+
+### Intentionally ungated
+
+These move no new risk, so they stay callable while a scope (or `All`) is paused. PRD §8
+invariant 5 ("pausing cannot move funds") requires it.
+
+| Contract | Entry point | Why it is not gated |
+|---|---|---|
+| `credit-line` | `repay` | Repayment must always work. |
+| `credit-line` | `liquidate`, `close_liquidated` | Liquidation must run while paused, or a bad line can never be cleared. |
+| `credit-line` | `withdraw_undrawn`, `withdraw_interest` | The lender taking its own capital back out only lowers exposure. |
+| `pledge-vault` | `release` | The borrower returning collateral, checked to leave the line healthy. |
+| `pledge-vault` | `liquidate` | The keeper seizing collateral must work while paused. |
+| `repo-dvp` | `unwind` | Leg 2 at or after maturity closes the trade and returns collateral. |
+| `repo-dvp` | `top_up` | Adds collateral; a borrower must be able to cure a call while paused. |
+| `repo-dvp` | `call_margin`, `default_close` | Keeper evaluation and enforcement must keep running. |
+| `exit-desk` | `withdraw` | The desk withdrawing its own balance, not a holder's funds. |
+
+Read-only entry points (`quote`, `ltv`, `margin_view` and the other getters) are ungated as well.
+
+### Known gaps
+
+- `repo-dvp::propose` is not gated, although `require_not_paused`'s doc comment treats a new repo as
+  new risk. Tracked in #846.
+- The gating contracts read pause flags from their own storage and only `Registry::pause` writes a
+  flag, so a flag cannot currently be set on the contract that checks it. Tracked in #30 and #32.
+
 ## Building
 
 `soroban-sdk` 28.x's build script refuses a plain `cargo build --target wasm32-unknown-unknown`
