@@ -14,7 +14,7 @@ use ballast_common::{
     pause::{self, PauseScope},
     timelock,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, symbol_short};
 
 #[contracttype]
 struct PendingParamChange {
@@ -89,6 +89,8 @@ impl Registry {
             "registry: asset already registered"
         );
         write_asset(&env, &asset, &config);
+        env.events()
+            .publish((symbol_short!("asset_registered"), asset.clone()), config);
     }
 
     pub fn asset(env: Env, asset: Address) -> AssetConfig {
@@ -104,14 +106,15 @@ impl Registry {
         read_asset(&env, &asset);
 
         let id = timelock::next_id(&env);
-        env.storage().temporary().set(
-            &DataKey::PendingParam(id),
-            &PendingParamChange {
-                asset,
-                change,
-                executes_at: timelock::executes_at(&env),
-            },
-        );
+        let executes_at = timelock::executes_at(&env);
+        let pending = PendingParamChange {
+            asset: asset.clone(),
+            change,
+            executes_at,
+        };
+        env.storage().temporary().set(&DataKey::PendingParam(id), &pending);
+        env.events()
+            .publish((symbol_short!("param_queued"), id), (&pending.asset, &pending.change, pending.executes_at));
         id
     }
 
@@ -129,6 +132,15 @@ impl Registry {
         );
 
         let mut config = read_asset(&env, &pending.asset);
+        // Capture old values before modifying
+        let old_value = match &pending.change {
+            ParamChange::HaircutBaseBps(v) => v.clone(),
+            ParamChange::HaircutFxBps(v) => v.clone(),
+            ParamChange::PriceBandBps(v) => v.clone(),
+            ParamChange::DailyMoveBandBps(v) => v.clone(),
+            ParamChange::RedemptionLagDays(v) => *v as i128,
+            ParamChange::Status(v) => v.clone(),
+        };
         // `raise_haircut_now` enforces `<= 10_000` bps on its own write path; this path must
         // enforce the same bound (and a sane bound on the other bps-denominated fields) so a
         // queued change can't silently push a field past 100% after the timelock elapses.
@@ -154,6 +166,9 @@ impl Registry {
         }
         write_asset(&env, &pending.asset, &config);
         env.storage().temporary().remove(&DataKey::PendingParam(id));
+        // Emit param_executed event
+        env.events()
+            .publish((symbol_short!("param_executed"), id), (&pending.asset, old_value, &config));
     }
 
     /// The emergency brake (PRD §6.4/§8): raises `haircut_base_bps` immediately, with no
@@ -164,6 +179,7 @@ impl Registry {
         access::require_risk(&env);
 
         let mut config = read_asset(&env, &asset);
+        let old_haircut = config.haircut_base_bps;
         let new_haircut = config
             .haircut_base_bps
             .checked_add(add_bps)
@@ -174,6 +190,8 @@ impl Registry {
         );
         config.haircut_base_bps = new_haircut;
         write_asset(&env, &asset, &config);
+        env.events()
+            .publish((symbol_short!("haircut_raised"), asset), (add_bps, new_haircut));
     }
 
     /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
@@ -181,6 +199,8 @@ impl Registry {
         pauser.require_auth();
         access::require_pauser(&env);
         pause::set_paused(&env, &scope, true);
+        env.events()
+            .publish((symbol_short!("paused"), scope), true);
     }
 
     /// Queues an unpause, executable after the 48h timelock — unlike `pause`, lifting a stop is
