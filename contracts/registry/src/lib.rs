@@ -12,7 +12,7 @@ use ballast_common::{
     access::{self, Roles},
     asset::{AssetConfig, ParamChange},
     pause::{self, PauseScope},
-    timelock,
+    timelock, ttl,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
@@ -38,15 +38,17 @@ enum DataKey {
 
 fn read_asset(env: &Env, asset: &Address) -> AssetConfig {
     env.storage()
-        .instance()
+        .persistent()
         .get(&DataKey::Asset(asset.clone()))
         .expect("registry: asset not registered")
 }
 
 fn write_asset(env: &Env, asset: &Address, config: &AssetConfig) {
+    let key = DataKey::Asset(asset.clone());
     env.storage()
-        .instance()
-        .set(&DataKey::Asset(asset.clone()), config);
+        .persistent()
+        .set(&key, config);
+    ttl::extend_persistent(env, &key);
 }
 
 #[contract]
@@ -62,6 +64,7 @@ impl Registry {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("registry: already initialized");
         }
@@ -84,14 +87,17 @@ impl Registry {
     pub fn register_asset(env: Env, admin: Address, asset: Address, config: AssetConfig) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         assert!(
-            !env.storage().instance().has(&DataKey::Asset(asset.clone())),
+            !env.storage().persistent().has(&DataKey::Asset(asset.clone())),
             "registry: asset already registered"
         );
         write_asset(&env, &asset, &config);
     }
 
     pub fn asset(env: Env, asset: Address) -> AssetConfig {
+        let key = DataKey::Asset(asset.clone());
+        ttl::extend_persistent(&env, &key);
         read_asset(&env, &asset)
     }
 
@@ -100,6 +106,7 @@ impl Registry {
     pub fn queue_param(env: Env, admin: Address, asset: Address, change: ParamChange) -> u64 {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         // Fail fast if the asset doesn't exist yet, rather than queuing a change for nothing.
         read_asset(&env, &asset);
 
@@ -118,6 +125,7 @@ impl Registry {
     /// Permissionless: anyone may trigger execution once the 48h delay has elapsed — this is the
     /// standard timelock pattern, the *queueing* is what's access-controlled, not the execution.
     pub fn execute_param(env: Env, id: u64) {
+        ttl::extend_instance(&env);
         let pending: PendingParamChange = env
             .storage()
             .temporary()
@@ -162,6 +170,7 @@ impl Registry {
     pub fn raise_haircut_now(env: Env, risk: Address, asset: Address, add_bps: u32) {
         risk.require_auth();
         access::require_risk(&env);
+        ttl::extend_instance(&env);
 
         let mut config = read_asset(&env, &asset);
         let new_haircut = config
@@ -180,6 +189,7 @@ impl Registry {
     pub fn pause(env: Env, pauser: Address, scope: PauseScope) {
         pauser.require_auth();
         access::require_pauser(&env);
+        ttl::extend_instance(&env);
         pause::set_paused(&env, &scope, true);
     }
 
@@ -188,6 +198,7 @@ impl Registry {
     pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         let id = timelock::next_id(&env);
         env.storage().temporary().set(
             &DataKey::PendingUnpause(id),
@@ -200,6 +211,7 @@ impl Registry {
     }
 
     pub fn execute_unpause(env: Env, id: u64) {
+        ttl::extend_instance(&env);
         let pending: PendingUnpause = env
             .storage()
             .temporary()
@@ -224,6 +236,7 @@ impl Registry {
 mod test {
     use super::*;
     use ballast_common::asset::{AssetStandard, CustodyMode, YieldType};
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{symbol_short, Symbol};
 
@@ -333,6 +346,52 @@ mod test {
         });
         client.execute_unpause(&id);
         assert!(!client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    fn persistent_asset_storage_and_ttl_extension() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        // Asset is stored in persistent storage, not instance storage
+        env.as_contract(&client.address, || {
+            let key = DataKey::Asset(asset.clone());
+            assert!(env.storage().persistent().has(&key));
+            assert!(!env.storage().instance().has(&key));
+            let ttl = env.storage().persistent().get_ttl(&key);
+            assert!(ttl >= ballast_common::ttl::PERSISTENT_LIFETIME_THRESHOLD_LEDGERS);
+            let instance_ttl = env.storage().instance().get_ttl();
+            assert!(instance_ttl >= ballast_common::ttl::INSTANCE_LIFETIME_THRESHOLD_LEDGERS);
+        });
+
+        let initial_config = client.asset(&asset);
+        assert_eq!(initial_config.haircut_base_bps, 300);
+
+        // Advance sequence number past default initial TTL (10,000 ledgers)
+        let current_seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(current_seq + 10_000);
+
+        // State remains accessible because register_asset and asset() extend persistent TTL
+        // Note: As documented in issue #100, Soroban Env::default() does not automatically
+        // evict expired storage entries in unconfigured host unit tests, but advancing sequence_number
+        // and asserting successful reads and re-extensions verifies contract lifecycle continuity.
+        let fetched_config = client.asset(&asset);
+        assert_eq!(fetched_config.haircut_base_bps, 300);
+
+        // Re-verifying TTL extension on the persistent entry after read
+        env.as_contract(&client.address, || {
+            let key = DataKey::Asset(asset.clone());
+            let ttl = env.storage().persistent().get_ttl(&key);
+            assert!(ttl >= ballast_common::ttl::INSTANCE_LIFETIME_THRESHOLD_LEDGERS);
+        });
+
+        // Subsequent state-changing calls succeed and re-extend instance TTL
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(400));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+
+        assert_eq!(client.asset(&asset).haircut_base_bps, 400);
     }
 
     // Test-only helper: there's no public getter for the stored pauser address, so this reaches
