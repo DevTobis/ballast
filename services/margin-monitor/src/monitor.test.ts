@@ -113,4 +113,75 @@ describe("recomputeLine", () => {
     expect(result.changed).toBe(true);
     expect(db.values).toHaveBeenCalledWith(expect.objectContaining({ fromState: "Healthy", toState: "Warning" }));
   });
+
+  describe("priceSnapshotId linking", () => {
+    it("copies the newest snapshot id when both pledge and snapshot are present", async () => {
+      const db = makeDb([
+        [{ toState: "Healthy" }],
+        [{ assetId: "asset-1" }],
+        [{ id: "snapshot-42" }],
+      ]);
+      const client = {
+        ltv: vi.fn().mockResolvedValue({
+          debt: 500n,
+          collateralValue: 1000n,
+          ltvBps: 5000,
+          state: "Warning",
+          priceStatus: "Ok",
+        }),
+      };
+
+      await recomputeLine(db, client as any, { id: "line-1", contractLineId: "1" });
+
+      expect(db.values).toHaveBeenCalledWith(
+        expect.objectContaining({ priceSnapshotId: "snapshot-42" }),
+      );
+    });
+
+    it("sets priceSnapshotId to null when pledge exists but no snapshot is found", async () => {
+      const db = makeDb([
+        [{ toState: "Healthy" }],
+        [{ assetId: "asset-1" }],
+        [],
+      ]);
+      const client = {
+        ltv: vi.fn().mockResolvedValue({
+          debt: 500n,
+          collateralValue: 1000n,
+          ltvBps: 5000,
+          state: "Warning",
+          priceStatus: "Ok",
+        }),
+      };
+
+      await recomputeLine(db, client as any, { id: "line-1", contractLineId: "1" });
+
+      expect(db.values).toHaveBeenCalledWith(
+        expect.objectContaining({ priceSnapshotId: null }),
+      );
+    });
+
+    it("sets priceSnapshotId to null when no pledge exists for the credit line", async () => {
+      const db = makeDb([
+        [{ toState: "Healthy" }],
+        [],
+      ]);
+      const client = {
+        ltv: vi.fn().mockResolvedValue({
+          debt: 500n,
+          collateralValue: 1000n,
+          ltvBps: 5000,
+          state: "Warning",
+          priceStatus: "Ok",
+        }),
+      };
+
+      await recomputeLine(db, client as any, { id: "line-1", contractLineId: "1" });
+
+      expect(db.values).toHaveBeenCalledWith(
+        expect.objectContaining({ priceSnapshotId: null }),
+      );
+    });
+  });
 });
+
