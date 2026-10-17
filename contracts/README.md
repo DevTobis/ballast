@@ -12,17 +12,17 @@ in this skeleton pass.
 | `price-guard` | Median/band/staleness/halt price logic (PRD §6.4) |
 | `pledge-vault` | Escrow/lien collateral positions |
 | `credit-line` | Credit lines, draws, repayments, the margin state machine |
-| `exit-desk` | RWA → USDC instant exit |
+| `exit-desk` | rwa → USDC instant exit |
 | `repo-dvp` | Bilateral repo, atomic DvP |
 
 ## Building
 
-`soroban-sdk` 28.x's build script refuses a plain `cargo build --target wasm32-unknown-unknown`
+<sroban-sdk> 28.x's build script refuses a plain `cargo build --target wasm32-unknown-unknown`
 and requires the Stellar CLI's wrapper instead. From inside a contract's own directory:
 
 ```
 stellar contract build
-```
+[```
 
 This produces `../target/wasm32v1-none/release/<crate>.wasm`. `cargo test -p <crate>` (run from
 `contracts/`, on the host target) works normally for unit tests and does not need `stellar-cli`.
@@ -32,25 +32,53 @@ This produces `../target/wasm32v1-none/release/<crate>.wasm`. `cargo test -p <cr
 See `scripts/README.md`'s "Testnet end-to-end run" section for how to build, deploy, and wire up
 all six contracts against the public Stellar testnet.
 
+## Admin transfer and role rotation (`ballast_common::access`)
+
+The shared access module supports moving the admin address and rotating the other roles
+without redeploying (and thus without losing asset configs, LastGood, halts, etc.). The storage
+layout of `Roles` is unchanged.
+
+### Admin transfer — two-step, needs both signatures
+
+`propose_admin(new_admin)` is called by the current admin and stores a pending admin.
+`accept_admin()` must be called by the pending admin address itself. The transfer only
+completes once both sides have signed, so a typo'd or compromised admin key cannot hand off
+control to an attacker unilaterally. The pending admin is cleared on acceptance, so a
+proposal cannot be replayed.
+
+### Role rotation — what rotates immediately vs. what waits 48h
+
+Rotation goes through `queue_role_change(role, addr)` + `execute_role_change(id)`.
+The queued change is only executable after the timelock has elapsed.
+
+| Role | Rotation path | Delay |
+|---|---|---|
+| admin | `propose_admin` + `accept_admin`(` (both sign), or queue/execute with the admin timelock) | two-sign for the direct path; 48h for the queued path |
+| `pauser`, `keeper` | immediate rotation allowed (admin-only, event emitted) | none (immediate) |
+| `publisher`, `issuer`, and other privileged roles | `queue_role_change` + `execute_role_change` | 48h timelock |
+
+Rotating admin via the queued path is still subject to the timelock, but the two-sign
+`propose_admin`/`accept_admin`(` path is the preferred way to move the admin to the 3-of-5
+multisig after bootstrap. All rotations emit an event containing the role and the new address.
+
 ## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
 
 `PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
-e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
-`require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
+e.g. `"SPIKO", as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
+` require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
 issuer key (`configure_issuer_key`, admin-only) over the canonical message
 `"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
 
 This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
-`scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
+scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
 — see `TESTNET_DEPLOYMENT.md`):
 
-- `scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
-  after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
-  key for its test `RWA1` asset.
-- `scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
-  bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
+-` scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
+after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
+key for its test `RWA1` asset.
+-` scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
+bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
 
 `require_nav_signature` defaults to `true` on a fresh deploy (see the crate's module doc comment on
 why this flag exists — it's a local-testing/bring-up affordance, not a security control) — a real
-testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if
-it was ever turned off, and should leave it at its default `true` otherwise.
+testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if it was ever turned off, and should leave it at its default `true` otherwise.
