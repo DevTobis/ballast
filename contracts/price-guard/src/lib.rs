@@ -994,4 +994,53 @@ mod test {
         assert!(result.is_err(), "only the risk role may clear a halt");
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
     }
+
+    #[test]
+    fn halted_guard_stays_halted_across_further_publishes_and_keeps_last_good() {
+        let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let t0 = env.ledger().timestamp();
+        let feed = feed(&env);
+
+        // Establish a good baseline at SCALE.
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &SCALE, &t0);
+        let baseline = client.guarded_price(&asset);
+        assert_eq!(baseline.status, PriceStatus::Ok);
+        assert_eq!(baseline.value, SCALE);
+
+        // Both sources agree on a jump beyond the daily band -> halt latches at publish time.
+        let jumped = SCALE * 13 / 10;
+        client.publish_nav(&publisher, &asset, &code, &jumped, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &jumped, &t0);
+        let halted = client.guarded_price(&asset);
+        assert_eq!(halted.status, PriceStatus::Halted);
+        assert_eq!(halted.value, SCALE);
+
+        // Post-halt publishes: sources agree on calm values (including the old price). The guard
+        // must not move LastGood and must stay Halted.
+        for value in [SCALE, SCALE + SCALE / 100, SCALE] {
+            client.publish_nav(&publisher, &asset, &code, &value, &t0, &sig);
+            client.publish_source(&publisher, &asset, &feed, &value, &t0);
+            let price = client.guarded_price(&asset);
+            assert_eq!(price.status, PriceStatus::Halted);
+            assert_eq!(price.value, SCALE);
+        }
+
+        // Sources going stale while halted still report Halted, not Degraded.
+        env.ledger().set_timestamp(t0 + 3_601);
+        let stale = client.guarded_price(&asset);
+        assert_eq!(stale.status, PriceStatus::Halted);
+        assert_eq!(stale.value, SCALE);
+
+        // Confirm clears the halt; the next fresh publish evaluates normally.
+        client.confirm_halt_cleared(&risk, &asset);
+        let t1 = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t1, &sig);
+        client.publish_source(&publisher, &asset, &feed, &SCALE, &t1);
+        let after = client.guarded_price(&asset);
+        assert_eq!(after.status, PriceStatus::Ok);
+        assert_eq!(after.value, SCALE);
+    }
 }
