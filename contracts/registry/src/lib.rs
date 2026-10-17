@@ -97,6 +97,10 @@ impl Registry {
 
     /// Queues a change to an already-registered asset's parameters, executable after the 48h
     /// timelock (PRD §6.2). Returns the change id to pass to `execute_param`.
+    ///
+    /// Changes are stored in persistent storage with an initial TTL extended to cover the 48h
+    /// delay plus a 7-day grace window (~155,520 ledgers). If unexecuted after the grace period,
+    /// the entry expires per Soroban state archival rules unless refreshed or cancelled.
     pub fn queue_param(env: Env, admin: Address, asset: Address, change: ParamChange) -> u64 {
         admin.require_auth();
         access::require_admin(&env);
@@ -104,24 +108,40 @@ impl Registry {
         read_asset(&env, &asset);
 
         let id = timelock::next_id(&env);
-        env.storage().temporary().set(
-            &DataKey::PendingParam(id),
+        let key = DataKey::PendingParam(id);
+        env.storage().persistent().set(
+            &key,
             &PendingParamChange {
                 asset,
                 change,
                 executes_at: timelock::executes_at(&env),
             },
         );
+        timelock::extend_entry_ttl(&env, &key);
         id
+    }
+
+    /// Cancels a pending parameter change and removes its persistent storage entry.
+    /// Admin only.
+    pub fn cancel_param(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        let key = DataKey::PendingParam(id);
+        assert!(
+            env.storage().persistent().has(&key),
+            "registry: no such pending change"
+        );
+        env.storage().persistent().remove(&key);
     }
 
     /// Permissionless: anyone may trigger execution once the 48h delay has elapsed — this is the
     /// standard timelock pattern, the *queueing* is what's access-controlled, not the execution.
     pub fn execute_param(env: Env, id: u64) {
+        let key = DataKey::PendingParam(id);
         let pending: PendingParamChange = env
             .storage()
-            .temporary()
-            .get(&DataKey::PendingParam(id))
+            .persistent()
+            .get(&key)
             .expect("registry: no such pending change");
         assert!(
             timelock::is_ready(&env, pending.executes_at),
@@ -153,7 +173,7 @@ impl Registry {
             ParamChange::Status(v) => config.status = v,
         }
         write_asset(&env, &pending.asset, &config);
-        env.storage().temporary().remove(&DataKey::PendingParam(id));
+        env.storage().persistent().remove(&key);
     }
 
     /// The emergency brake (PRD §6.4/§8): raises `haircut_base_bps` immediately, with no
@@ -185,34 +205,51 @@ impl Registry {
 
     /// Queues an unpause, executable after the 48h timelock — unlike `pause`, lifting a stop is
     /// not urgent and deserves the same notice period as any other risk-loosening change.
+    ///
+    /// Stored in persistent storage with an initial TTL extended to cover 48h plus the 7-day
+    /// grace period (~155,520 ledgers).
     pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
         admin.require_auth();
         access::require_admin(&env);
         let id = timelock::next_id(&env);
-        env.storage().temporary().set(
-            &DataKey::PendingUnpause(id),
+        let key = DataKey::PendingUnpause(id);
+        env.storage().persistent().set(
+            &key,
             &PendingUnpause {
                 scope,
                 executes_at: timelock::executes_at(&env),
             },
         );
+        timelock::extend_entry_ttl(&env, &key);
         id
     }
 
+    /// Cancels a pending unpause and removes its persistent storage entry.
+    /// Admin only.
+    pub fn cancel_unpause(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        let key = DataKey::PendingUnpause(id);
+        assert!(
+            env.storage().persistent().has(&key),
+            "registry: no such pending unpause"
+        );
+        env.storage().persistent().remove(&key);
+    }
+
     pub fn execute_unpause(env: Env, id: u64) {
+        let key = DataKey::PendingUnpause(id);
         let pending: PendingUnpause = env
             .storage()
-            .temporary()
-            .get(&DataKey::PendingUnpause(id))
+            .persistent()
+            .get(&key)
             .expect("registry: no such pending unpause");
         assert!(
             timelock::is_ready(&env, pending.executes_at),
             "registry: timelock has not elapsed"
         );
         pause::set_paused(&env, &pending.scope, false);
-        env.storage()
-            .temporary()
-            .remove(&DataKey::PendingUnpause(id));
+        env.storage().persistent().remove(&key);
     }
 
     pub fn is_paused(env: Env, scope: PauseScope) -> bool {
@@ -342,5 +379,69 @@ mod test {
         env.as_contract(&client.address, || {
             ballast_common::access::read_roles(env).pauser
         })
+    }
+
+    #[test]
+    fn execute_param_survives_advancing_sequence_number_past_48h() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(850));
+
+        // Advance both timestamp past 48h AND sequence_number by 34,561 ledgers.
+        // With temporary storage, 34,561 ledgers would expire the entry; with persistent
+        // storage and extend_entry_ttl, the change survives and executes cleanly.
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 34_561;
+        });
+
+        client.execute_param(&id);
+
+        let updated = client.asset(&asset);
+        assert_eq!(updated.haircut_base_bps, 850);
+    }
+
+    #[test]
+    fn cancel_param_removes_pending_change_and_prevents_execution() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(900));
+
+        // Admin cancels the pending change
+        client.cancel_param(&admin, &id);
+
+        // Advance time past 48h
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        // Execution must fail because the pending entry was removed
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_param(&id);
+        }));
+        assert!(result.is_err(), "execute_param should fail after cancellation");
+    }
+
+    #[test]
+    fn cancel_unpause_removes_pending_unpause_and_prevents_execution() {
+        let (env, client, admin, _risk, _asset) = setup();
+
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        assert!(client.is_paused(&PauseScope::Draws));
+
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+
+        // Admin cancels the pending unpause
+        client.cancel_unpause(&admin, &id);
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_unpause(&id);
+        }));
+        assert!(result.is_err(), "execute_unpause should fail after cancellation");
+        assert!(client.is_paused(&PauseScope::Draws));
     }
 }
