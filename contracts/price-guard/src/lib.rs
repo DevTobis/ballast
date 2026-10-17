@@ -994,4 +994,9 @@ mod test {
         assert!(result.is_err(), "only the risk role may clear a halt");
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
     }
+
+    #[path = "../invariants.rs"]
+    mod invariants;
 }
+
+
