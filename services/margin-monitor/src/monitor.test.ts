@@ -95,6 +95,45 @@ describe("recomputeLine", () => {
     );
   });
 
+  it("records a margin_event and fires an alert when the state moves to Liquidation", async () => {
+    const db = makeDb([
+      [{ toState: "MarginCall" }], // last margin_event
+      [{ assetId: "asset-1" }], // pledge lookup
+      [{ id: "snapshot-1" }], // latest price_snapshot for that asset
+    ]);
+    const creditLineClient = {
+      ltv: vi.fn().mockResolvedValue({
+        debt: 950n,
+        collateralValue: 1000n,
+        ltvBps: 9500,
+        state: "Liquidation",
+        priceStatus: "Ok",
+      }),
+    };
+
+    const result = await recomputeLine(db, creditLineClient as any, { id: "line-1", contractLineId: "42" });
+
+    expect(result.changed).toBe(true);
+    expect(result.fromState).toBe("MarginCall");
+    expect(result.toState).toBe("Liquidation");
+    expect(result.ltvBps).toBe(9500);
+    expect(db.insert).toHaveBeenCalledTimes(1);
+    expect(db.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        creditLineId: "line-1",
+        fromState: "MarginCall",
+        toState: "Liquidation",
+        ltvBps: 9500,
+        priceSnapshotId: "snapshot-1",
+      }),
+    );
+    expect(fireSpy).toHaveBeenCalledWith("margin_call", {
+      creditLineId: "line-1",
+      state: "Liquidation",
+      ltvBps: 9500,
+    });
+  });
+
   it("treats a line with no prior margin_event as Healthy for the fromState comparison", async () => {
     const db = makeDb([[], [{ assetId: "asset-1" }], []]);
     const creditLineClient = {
