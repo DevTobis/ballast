@@ -12,7 +12,7 @@ use ballast_common::{
     access::{self, Roles},
     asset::{AssetConfig, ParamChange},
     pause::{self, PauseScope},
-    timelock,
+    timelock, ttl,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
@@ -62,6 +62,7 @@ impl Registry {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("registry: already initialized");
         }
@@ -84,6 +85,7 @@ impl Registry {
     pub fn register_asset(env: Env, admin: Address, asset: Address, config: AssetConfig) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         assert!(
             !env.storage().instance().has(&DataKey::Asset(asset.clone())),
             "registry: asset already registered"
@@ -100,6 +102,7 @@ impl Registry {
     pub fn queue_param(env: Env, admin: Address, asset: Address, change: ParamChange) -> u64 {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         // Fail fast if the asset doesn't exist yet, rather than queuing a change for nothing.
         read_asset(&env, &asset);
 
@@ -118,6 +121,7 @@ impl Registry {
     /// Permissionless: anyone may trigger execution once the 48h delay has elapsed — this is the
     /// standard timelock pattern, the *queueing* is what's access-controlled, not the execution.
     pub fn execute_param(env: Env, id: u64) {
+        ttl::extend_instance(&env);
         let pending: PendingParamChange = env
             .storage()
             .temporary()
@@ -162,6 +166,7 @@ impl Registry {
     pub fn raise_haircut_now(env: Env, risk: Address, asset: Address, add_bps: u32) {
         risk.require_auth();
         access::require_risk(&env);
+        ttl::extend_instance(&env);
 
         let mut config = read_asset(&env, &asset);
         let new_haircut = config
@@ -180,6 +185,7 @@ impl Registry {
     pub fn pause(env: Env, pauser: Address, scope: PauseScope) {
         pauser.require_auth();
         access::require_pauser(&env);
+        ttl::extend_instance(&env);
         pause::set_paused(&env, &scope, true);
     }
 
@@ -188,6 +194,7 @@ impl Registry {
     pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         let id = timelock::next_id(&env);
         env.storage().temporary().set(
             &DataKey::PendingUnpause(id),
@@ -200,6 +207,7 @@ impl Registry {
     }
 
     pub fn execute_unpause(env: Env, id: u64) {
+        ttl::extend_instance(&env);
         let pending: PendingUnpause = env
             .storage()
             .temporary()
@@ -335,6 +343,31 @@ mod test {
         assert!(!client.is_paused(&PauseScope::Draws));
     }
 
+    #[test]
+    fn state_remains_accessible_across_sequence_advancement() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        let initial_config = client.asset(&asset);
+        assert_eq!(initial_config.haircut_base_bps, 300);
+
+        // Advance sequence number past initial TTL (10,000 ledgers)
+        let current_seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(current_seq + 10_000);
+
+        // State remains accessible because register_asset extended instance TTL
+        let fetched_config = client.asset(&asset);
+        assert_eq!(fetched_config.haircut_base_bps, 300);
+
+        // Subsequent state-changing calls succeed and re-extend instance TTL
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(400));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+
+        assert_eq!(client.asset(&asset).haircut_base_bps, 400);
+    }
+
     // Test-only helper: there's no public getter for the stored pauser address, so this reaches
     // into the contract's own storage the same way `access::read_roles` would, purely so this
     // test can call `pause` with a validly-authorized address under `mock_all_auths`.
@@ -344,3 +377,4 @@ mod test {
         })
     }
 }
+
