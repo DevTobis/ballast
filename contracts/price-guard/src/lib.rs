@@ -796,6 +796,84 @@ mod test {
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
     }
 
+    #[test]
+    #[should_panic]
+    fn issuer_signature_for_another_asset_code_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
+        let other_code = Bytes::from_slice(&env, b"OTHERASSET");
+        client.publish_nav(&publisher, &asset, &other_code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn issuer_signature_for_another_timestamp_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &signing_key, &code, now + 1, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn issuer_signature_from_another_key_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, _signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let other_signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &other_signing_key, &code, now, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn random_issuer_signature_bytes_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, _signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let random_sig = BytesN::from_array(&env, &[0x5au8; 64]);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &random_sig);
+    }
+
+    #[test]
+    fn valid_historical_issuer_signature_is_accepted() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        env.ledger().set_timestamp(1_000);
+        let now = env.ledger().timestamp();
+        let historical_ts = now - 1;
+        let sig = sign_nav(&env, &signing_key, &code, historical_ts, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &historical_ts, &sig);
+    }
+
     // --- adversarial cases -------------------------------------------------------------------
 
     fn feed(env: &Env) -> Symbol {
