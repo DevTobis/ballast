@@ -335,6 +335,63 @@ mod test {
         assert!(!client.is_paused(&PauseScope::Draws));
     }
 
+    #[test]
+    fn pause_rejects_a_stranger_authorising_only_themselves() {
+        use soroban_sdk::testutils::MockAuth;
+        use soroban_sdk::testutils::MockAuthInvoke;
+        use soroban_sdk::IntoVal;
+
+        let (env, client, ..) = setup();
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "pause",
+                args: (&stranger, PauseScope::Draws).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        assert!(client.try_pause(&stranger, &PauseScope::Draws).is_err());
+        assert!(!client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    fn pause_all_pauses_every_scope() {
+        let (env, client, ..) = setup();
+        for scope in [
+            PauseScope::Pledges,
+            PauseScope::Draws,
+            PauseScope::Exits,
+            PauseScope::Repos,
+        ] {
+            assert!(!client.is_paused(&scope));
+        }
+
+        client.pause(&client_pauser(&env, &client), &PauseScope::All);
+
+        for scope in [
+            PauseScope::Pledges,
+            PauseScope::Draws,
+            PauseScope::Exits,
+            PauseScope::Repos,
+        ] {
+            assert!(client.is_paused(&scope));
+        }
+    }
+
+    #[test]
+    fn pausing_twice_is_idempotent() {
+        let (env, client, ..) = setup();
+        let pauser = client_pauser(&env, &client);
+
+        client.pause(&pauser, &PauseScope::Exits);
+        client.pause(&pauser, &PauseScope::Exits);
+
+        assert!(client.is_paused(&PauseScope::Exits));
+    }
+
     // Test-only helper: there's no public getter for the stored pauser address, so this reaches
     // into the contract's own storage the same way `access::read_roles` would, purely so this
     // test can call `pause` with a validly-authorized address under `mock_all_auths`.
