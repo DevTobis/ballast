@@ -88,6 +88,9 @@ impl Registry {
             !env.storage().instance().has(&DataKey::Asset(asset.clone())),
             "registry: asset already registered"
         );
+        if let Err(message) = config.validate(&env, &asset) {
+            panic!("{}", message);
+        }
         write_asset(&env, &asset, &config);
     }
 
@@ -129,28 +132,24 @@ impl Registry {
         );
 
         let mut config = read_asset(&env, &pending.asset);
-        // `raise_haircut_now` enforces `<= 10_000` bps on its own write path; this path must
-        // enforce the same bound (and a sane bound on the other bps-denominated fields) so a
-        // queued change can't silently push a field past 100% after the timelock elapses.
         match pending.change {
             ParamChange::HaircutBaseBps(v) => {
-                assert!(v <= 10_000, "registry: haircut cannot exceed 100%");
                 config.haircut_base_bps = v;
             }
             ParamChange::HaircutFxBps(v) => {
-                assert!(v <= 10_000, "registry: haircut cannot exceed 100%");
                 config.haircut_fx_bps = v;
             }
             ParamChange::PriceBandBps(v) => {
-                assert!(v <= 10_000, "registry: band cannot exceed 100%");
                 config.price_band_bps = v;
             }
             ParamChange::DailyMoveBandBps(v) => {
-                assert!(v <= 10_000, "registry: band cannot exceed 100%");
                 config.daily_move_band_bps = v;
             }
             ParamChange::RedemptionLagDays(v) => config.redemption_lag_days = v,
             ParamChange::Status(v) => config.status = v,
+        }
+        if let Err(message) = config.validate(&env, &pending.asset) {
+            panic!("{}", message);
         }
         write_asset(&env, &pending.asset, &config);
         env.storage().temporary().remove(&DataKey::PendingParam(id));
@@ -169,7 +168,7 @@ impl Registry {
             .checked_add(add_bps)
             .expect("registry: haircut overflow");
         assert!(
-            new_haircut <= 10_000,
+            u64::from(new_haircut) + u64::from(config.haircut_fx_bps) <= 10_000,
             "registry: haircut cannot exceed 100%"
         );
         config.haircut_base_bps = new_haircut;
@@ -226,6 +225,23 @@ mod test {
     use ballast_common::asset::{AssetStandard, CustodyMode, YieldType};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{symbol_short, Symbol};
+
+    fn valid_config(env: &Env, asset: &Address) -> AssetConfig {
+        AssetConfig {
+            issuer: Address::generate(env),
+            contract: asset.clone(),
+            standard: AssetStandard::ClassicSac,
+            yield_type: YieldType::Accumulating,
+            custody_mode: CustodyMode::Escrow,
+            ccy: Symbol::new(env, "USD"),
+            redemption_lag_days: 1,
+            haircut_base_bps: 300,
+            haircut_fx_bps: 0,
+            price_band_bps: 50,
+            daily_move_band_bps: 100,
+            status: symbol_short!("active"),
+        }
+    }
 
     fn setup() -> (Env, RegistryClient<'static>, Address, Address, Address) {
         let env = Env::default();
@@ -302,6 +318,87 @@ mod test {
     fn raise_haircut_now_rejects_overflow_past_100_percent() {
         let (_env, client, _admin, risk, asset) = setup();
         client.raise_haircut_now(&risk, &asset, &10_000);
+    }
+
+    #[test]
+    fn register_asset_accepts_a_valid_config_and_rejects_each_invalid_field() {
+        let (env, client, admin, _risk, _registered_asset) = setup();
+
+        let valid_asset = Address::generate(&env);
+        client.register_asset(&admin, &valid_asset, &valid_config(&env, &valid_asset));
+        assert_eq!(client.asset(&valid_asset).contract, valid_asset);
+
+        let mut invalid_configs = std::vec::Vec::new();
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.haircut_base_bps = 10_001;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.haircut_fx_bps = 10_001;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.haircut_base_bps = 6_000;
+        config.haircut_fx_bps = 4_001;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.price_band_bps = 0;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.price_band_bps = 10_001;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.daily_move_band_bps = 0;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.daily_move_band_bps = 10_001;
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.contract = Address::generate(&env);
+        invalid_configs.push((asset, config));
+
+        let asset = Address::generate(&env);
+        let mut config = valid_config(&env, &asset);
+        config.status = Symbol::new(&env, "whatever");
+        invalid_configs.push((asset, config));
+
+        for (asset, config) in invalid_configs {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.register_asset(&admin, &asset, &config);
+            }));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn execute_param_reuses_asset_config_validation() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(
+            &admin,
+            &asset,
+            &ParamChange::Status(Symbol::new(&env, "bad")),
+        );
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_param(&id);
+        }));
+        assert!(result.is_err());
+        assert_eq!(client.asset(&asset).status, symbol_short!("active"));
     }
 
     #[test]
