@@ -1,5 +1,4 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { AuthProvider } from "./lib/auth.tsx";
 import { Markets } from "./pages/Markets.tsx";
 import { Login } from "./pages/Login.tsx";
 import { ConsoleShell } from "./pages/ConsoleShell.tsx";
@@ -10,18 +9,16 @@ import { RepoView } from "./pages/RepoView.tsx";
 
 export default function App() {
   return (
-    <AuthProvider>
-      <Routes>
-        <Route path="/markets" element={<Markets />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/" element={<ConsoleShell />}>
-          <Route index element={<Navigate to="/borrower" replace />} />
-          <Route path="borrower" element={<BorrowerView />} />
-          <Route path="lender" element={<LenderView />} />
-          <Route path="exit" element={<ExitView />} />
-          <Route path="repo" element={<RepoView />} />
-        </Route>
-      </Routes>
-    </AuthProvider>
+    <Routes>
+      <Route path="/markets" element={<Markets />} />
+      <Route path="/login" element={<Login />} />
+      <Route path="/" element={<ConsoleShell />}>
+        <Route index element={<Navigate to="/borrower" replace />} />
+        <Route path="borrower" element={<BorrowerView />} />
+        <Route path="lender" element={<LenderView />} />
+        <Route path="exit" element={<ExitView />} />
+        <Route path="repo" element={<RepoView />} />
+      </Route>
+    </Routes>
   );
 }

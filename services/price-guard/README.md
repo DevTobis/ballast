@@ -73,3 +73,17 @@ and `__fixtures__`; `src` has no mock mode.
 - Price EUR or GBP share classes, or Franklin NAV.
 - Fill `price_snapshot.ledger`; it always writes `0`. A code comment says the indexer fills it in, but nothing in `services/indexer/src` references `price_snapshot`.
 - Compute the guarded price or decide staleness: that is the contract's.
+
+## Operator Note: Archived State Recovery
+
+`PriceGuard` extends both contract instance TTL and persistent `Source` storage entries upon each publish (`ttl::extend_instance` and `ttl::extend_persistent`). However, if an asset or feed is unpopulated longer than the persistent entry TTL, or if the contract instance goes uncalled past its lifetime, Soroban moves the entry to archived storage.
+
+If an entry is archived, subsequent calls touching that entry fail with a storage error. Operators can restore archived state via Soroban RPC or the Stellar CLI:
+
+1. **Detect archived state**: Soroban RPC returns an error indicating archived ledger entries when simulating transactions.
+2. **Restore via Stellar CLI**:
+   ```bash
+   # Restore contract instance and code
+   stellar contract restore --id <PRICE_GUARD_CONTRACT_ID> --source <OPERATOR_IDENTITY> --network <NETWORK>
+   ```
+3. **Restore persistent keys**: Ensure the restore footprint includes the archived persistent entry (`DataKey::Source(asset, source_name)`) in a restore transaction before resuming publication. Once restored, regular publishing automatically re-extends TTL.
