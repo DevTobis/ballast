@@ -44,6 +44,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   issuers publish unsigned data. The attestor key is the same key that is authorised to publish, so
   on-chain the signature adds no protection against a compromised publisher: it records who relayed
   the value. Do not describe it as issuer attestation.
+- Roles rotate in place: `price_publisher` and the other non-admin roles go through
+  `queue_role_change` / `execute_role_change` (48h), while the admin moves with the two-step
+  `propose_admin` / `accept_admin` pair. A publisher rotation preserves `LastGood`, a `Halted` latch,
+  asset configs and issuer keys; it does not automatically re-register the NAV attestor key, so
+  `configure_issuer_key` must be called too when the publisher is the attestor.
 - `max_staleness_s` is per asset; RedStone's RWA feeds update every 1-2 hours, so values under that
   make the guard refuse to lend.
 
