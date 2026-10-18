@@ -82,6 +82,19 @@ Signing goes through the Freighter extension, which the scripts cannot drive. To
 the deployment's key into Freighter (`stellar keys secret lender`), switch Freighter to the same network,
 and open http://localhost:5173.
 
+## PriceGuard calls fail due to archived state
+
+Symptoms: Transactions trap or RPC simulation fails reporting that a contract data entry or contract instance is archived or missing from the active footprint.
+
+Cause: An asset's price source was not republished for longer than the persistent entry TTL, or the contract instance was inactive past its instance TTL.
+
+Fix:
+1. Run `stellar contract restore` for the contract instance:
+   ```bash
+   stellar contract restore --id <PRICE_GUARD_CONTRACT_ID> --source <OPERATOR_IDENTITY> --network <NETWORK>
+   ```
+2. For specific persistent source keys, include the key in a restore footprint transaction or trigger a re-publish once the instance is restored. Regular publishing automatically keeps active keys extended via `extend_ttl`.
+
 ## Still stuck
 
 Open a bug report with the exact error, your network, commit hash, and Node and `stellar` versions.
