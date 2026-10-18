@@ -590,6 +590,103 @@ fn the_cure_window_has_a_floor_and_only_the_admin_sets_it() {
     assert!(not_admin.is_err(), "only the admin may set it");
 }
 
+#[test]
+fn disabled_asset_blocks_propose_and_accept_and_settle() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    assert!(repo.is_asset_enabled(&h.rwa));
+
+    // Stranger cannot disable asset
+    let stranger = Address::generate(&h.env);
+    let unauthorized = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.disable_asset(&stranger, &h.rwa);
+    }));
+    assert!(unauthorized.is_err(), "only admin can disable asset");
+
+    // Admin disables asset
+    repo.disable_asset(&h.admin, &h.rwa);
+    assert!(!repo.is_asset_enabled(&h.rwa));
+
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    // Proposing on disabled asset panics
+    let propose_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        propose(&h, units, cash_amount, 500, maturity);
+    }));
+    assert!(propose_res.is_err(), "propose on disabled asset must fail");
+
+    // Re-enable asset allows proposing
+    repo.enable_asset(&h.admin, &h.rwa);
+    assert!(repo.is_asset_enabled(&h.rwa));
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    // Disable asset after proposing: accept_and_settle must fail
+    repo.disable_asset(&h.admin, &h.rwa);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+    let settle_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(settle_res.is_err(), "accept_and_settle on disabled asset must fail");
+}
+
+#[test]
+fn existing_trades_can_be_unwound_topped_up_and_defaulted_when_asset_is_disabled() {
+    // 1. Unwind works on disabled asset
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    // Admin disables asset after trade is settled
+    repo.disable_asset(&h.admin, &h.rwa);
+    assert!(!repo.is_asset_enabled(&h.rwa));
+
+    // Fast-forward to maturity and unwind
+    h.env.ledger().set_timestamp(maturity);
+    let interest = accrue_interest(cash_amount, 500, 3_600);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &(cash_amount + interest));
+
+    repo.unwind(&h.cash_borrower, &id);
+    assert_eq!(repo.trade(&id).status, RepoStatus::Unwound);
+
+    // 2. Margin call and top_up work on disabled asset
+    let h2 = setup();
+    let id2 = settled_under_margin(&h2);
+    let repo2 = RepoDvpClient::new(&h2.env, &h2.repo);
+    repo2.disable_asset(&h2.admin, &h2.rwa);
+
+    repo2.call_margin(&h2.keeper, &id2);
+    assert!(repo2.trade(&id2).pending_margin_call);
+
+    repo2.top_up(&h2.cash_borrower, &id2, &(100 * PRICE_SCALE));
+    assert!(!repo2.trade(&id2).pending_margin_call);
+    assert_eq!(repo2.trade(&id2).units, 200 * PRICE_SCALE);
+
+    // 3. Default close works on disabled asset
+    let h3 = setup();
+    let id3 = settled_under_margin(&h3);
+    let repo3 = RepoDvpClient::new(&h3.env, &h3.repo);
+    repo3.disable_asset(&h3.admin, &h3.rwa);
+
+    repo3.call_margin(&h3.keeper, &id3);
+    let deadline = repo3.trade(&id3).cure_deadline.unwrap();
+    h3.env.ledger().set_timestamp(deadline);
+
+    repo3.default_close(&h3.keeper, &id3);
+    assert_eq!(repo3.trade(&id3).status, RepoStatus::Defaulted);
+}
+
 mod sac {
     use super::*;
 

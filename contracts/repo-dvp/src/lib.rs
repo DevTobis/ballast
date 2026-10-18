@@ -164,6 +164,7 @@ pub struct RepoMarginView {
 enum DataKey {
     Usdc,
     AssetConfig(Address),
+    AssetDisabled(Address),
     Trade(u64),
     CureGrace,
 }
@@ -181,6 +182,19 @@ fn read_asset_config(env: &Env, asset: &Address) -> RepoAssetConfig {
         .instance()
         .get(&DataKey::AssetConfig(asset.clone()))
         .expect("repo-dvp: asset not configured")
+}
+
+fn is_asset_disabled(env: &Env, asset: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetDisabled(asset.clone()))
+        .unwrap_or(false)
+}
+
+fn require_asset_enabled(env: &Env, asset: &Address) {
+    if is_asset_disabled(env, asset) {
+        panic!("repo-dvp: asset is disabled");
+    }
 }
 
 fn read_trade(env: &Env, id: u64) -> RepoTrade {
@@ -360,6 +374,34 @@ impl RepoDvp {
         );
     }
 
+    /// Disables an asset so that new proposals and settlements are refused. Admin only.
+    pub fn disable_asset(env: Env, admin: Address, asset: Address) {
+        require_admin_is(&env, &admin);
+        let _ = read_asset_config(&env, &asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetDisabled(asset.clone()), &true);
+        env.events()
+            .publish((symbol_short!("disable"), asset), ());
+    }
+
+    /// Re-enables a disabled asset. Admin only.
+    pub fn enable_asset(env: Env, admin: Address, asset: Address) {
+        require_admin_is(&env, &admin);
+        let _ = read_asset_config(&env, &asset);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AssetDisabled(asset.clone()));
+        env.events()
+            .publish((symbol_short!("enable"), asset), ());
+    }
+
+    /// Checks whether an asset is currently enabled.
+    pub fn is_asset_enabled(env: Env, asset: Address) -> bool {
+        let _ = read_asset_config(&env, &asset);
+        !is_asset_disabled(&env, &asset)
+    }
+
     /// Mints a trade id and stores the proposed terms (PRD §8 `propose(cash_lender, terms) -> id`,
     /// flattened into explicit params here for clarity).
     pub fn propose(
@@ -375,6 +417,7 @@ impl RepoDvp {
         agreement_hash: BytesN<32>,
     ) -> u64 {
         cash_lender.require_auth();
+        require_asset_enabled(&env, &asset);
         if units <= 0 {
             panic!("repo-dvp: units must be positive");
         }
@@ -428,6 +471,7 @@ impl RepoDvp {
         pause::require_not_paused(&env, &PauseScope::Repos);
 
         let mut trade = read_trade(&env, id);
+        require_asset_enabled(&env, &trade.asset);
         if trade.status != RepoStatus::Proposed {
             panic!("repo-dvp: trade is not in proposed status");
         }
