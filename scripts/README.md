@@ -146,6 +146,19 @@ then update `PRICE_PUBLISHER` in `.env.<network>-deploy` and re-run `scripts/con
 so the new key is the registered NAV attestor. See `contracts/README.md` for the full sequence and
 why the issuer-key step is required.
 
+`Registry` exposes the same role-rotation entry points (`propose_admin`, `accept_admin`,
+`queue_role_change`, `execute_role_change`, `roles`). To rotate the pauser on `Registry` without
+redeploying:
+
+```bash
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  queue_role_change --role '"Pauser"' --new_address "$NEW_PAUSER"
+# After the 48h timelock:
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  execute_role_change --id "$CHANGE_ID"
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- roles
+```
+
 To see the real sources without any contract or database (safe against mainnet):
 
 ```

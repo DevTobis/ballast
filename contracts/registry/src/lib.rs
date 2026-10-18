@@ -80,6 +80,48 @@ impl Registry {
         );
     }
 
+    /// Current role addresses. Used by scripts and tests to confirm a rotation landed.
+    pub fn roles(env: Env) -> Roles {
+        access::read_roles(&env)
+    }
+
+    /// Step 1 of a two-step admin transfer: the stored admin names its successor. A later proposal
+    /// replaces an earlier one, so a mistyped address can be corrected without waiting.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        ttl::extend_instance(&env);
+        access::propose_admin(&env, &new_admin);
+    }
+
+    /// Step 2 of a two-step admin transfer: the proposed successor accepts. Consumes the proposal.
+    pub fn accept_admin(env: Env) {
+        ttl::extend_instance(&env);
+        access::accept_admin(&env);
+    }
+
+    /// The proposed successor from `propose_admin`, if a transfer is pending.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        access::pending_admin(&env)
+    }
+
+    /// Queues a timelocked non-admin role rotation and returns the id to pass to
+    /// `execute_role_change` once the 48h delay has elapsed. Only the admin may queue; execution is
+    /// permissionless.
+    pub fn queue_role_change(env: Env, role: access::RoleKind, new_address: Address) -> u64 {
+        ttl::extend_instance(&env);
+        access::queue_role_change(&env, role, &new_address)
+    }
+
+    /// Applies a `queue_role_change` entry once its 48h timelock has elapsed.
+    pub fn execute_role_change(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        access::execute_role_change(&env, id)
+    }
+
+    /// The outstanding queued change for `id`, including its `executes_at` timestamp.
+    pub fn pending_role_change(env: Env, id: u64) -> Option<access::PendingRoleChange> {
+        access::pending_role_change(&env, id)
+    }
+
     /// Onboards a new asset (PRD §5 Phase 1 "Asset onboarding": issuer, contract, yield type,
     /// redemption terms, haircut inputs, custody mode). Not timelocked — registering a *new*
     /// asset carries no funds or existing positions to protect; only changes to an *existing*
@@ -603,13 +645,8 @@ mod test {
         assert_eq!(client.asset(&asset).haircut_base_bps, 400);
     }
 
-    // Test-only helper: there's no public getter for the stored pauser address, so this reaches
-    // into the contract's own storage the same way `access::read_roles` would, purely so this
-    // test can call `pause` with a validly-authorized address under `mock_all_auths`.
-    fn client_pauser(env: &Env, client: &RegistryClient<'static>) -> Address {
-        env.as_contract(&client.address, || {
-            ballast_common::access::read_roles(env).pauser
-        })
+    fn client_pauser(_env: &Env, client: &RegistryClient<'static>) -> Address {
+        client.roles().pauser
     }
 
     #[test]
@@ -755,5 +792,159 @@ mod test {
         assert_ne!(id2, id3);
         assert!(id2 > id1);
         assert!(id3 > id2);
+    }
+
+    #[test]
+    fn queued_pauser_rotation_rejects_the_old_pauser_and_accepts_the_new_one() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, _asset) = setup();
+        let old_pauser = client.roles().pauser;
+        let new_pauser = Address::generate(&env);
+
+        let id = client.queue_role_change(&access::RoleKind::Pauser, &new_pauser);
+        assert_eq!(
+            client.roles().pauser,
+            old_pauser,
+            "queueing must not change the pauser role yet"
+        );
+        assert_eq!(
+            client.pending_role_change(&id).map(|p| p.new_address),
+            Some(new_pauser.clone())
+        );
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_role_change(&id);
+        }));
+        assert!(
+            early.is_err(),
+            "a queued role rotation must wait out the 48h timelock"
+        );
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 34_561;
+        });
+        client.execute_role_change(&id);
+        assert_eq!(client.roles().pauser, new_pauser);
+        assert!(client.pending_role_change(&id).is_none());
+
+        env.mock_auths(&[MockAuth {
+            address: &old_pauser,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "pause",
+                args: (old_pauser.clone(), PauseScope::Draws).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let old_rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.pause(&old_pauser, &PauseScope::Draws);
+        }));
+        assert!(old_rejected.is_err(), "the rotated-out pauser must be rejected");
+        assert!(!client.is_paused(&PauseScope::Draws));
+
+        let new_auth = MockAuth {
+            address: &new_pauser,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "pause",
+                args: (new_pauser.clone(), PauseScope::Draws).into_val(&env),
+                sub_invokes: &[],
+            },
+        };
+        env.mock_auths(&[new_auth.clone(), new_auth]);
+        client.pause(&new_pauser, &PauseScope::Draws);
+        assert!(client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    fn admin_transfer_requires_the_proposed_admin_to_accept() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, _asset) = setup();
+        let current_admin = client.roles().admin;
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.accept_admin();
+        }));
+        assert!(
+            rejected.is_err(),
+            "only the proposed admin may accept the transfer"
+        );
+        assert_eq!(client.roles().admin, current_admin);
+
+        env.mock_auths(&[MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_admin();
+        assert_eq!(client.roles().admin, new_admin);
+        assert_eq!(client.pending_admin(), None);
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_a_role_change_or_propose_admin() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, _asset) = setup();
+        let stranger = Address::generate(&env);
+        let candidate = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_role_change",
+                args: (access::RoleKind::Pauser, candidate.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_role_change(&access::RoleKind::Pauser, &candidate);
+        }));
+        assert!(
+            result.is_err(),
+            "only the stored admin may queue a role change"
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_admin",
+                args: (candidate.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let propose_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.propose_admin(&candidate);
+        }));
+        assert!(
+            propose_result.is_err(),
+            "only the stored admin may propose a new admin"
+        );
     }
 }
