@@ -17,7 +17,8 @@
 #     Use hardware/KMS-backed or multisig accounts for admin and pauser. The price publisher key
 #     is the NAV attestor: keep it in Vault/KMS for the running service (the CLI identity is only
 #     used here to derive its public key; the service signs through packages/operator-signing).
-#   - Override the defaults below with PRICE_BAND_BPS, DAILY_MOVE_BAND_BPS, MAX_STALENESS_S.
+#   - Override the defaults below with PRICE_BAND_BPS, DAILY_MOVE_BAND_BPS, WINDOW_SECONDS,
+#     WINDOW_MOVE_BAND_BPS, MAX_STALENESS_S.
 #
 # Output: .env.mainnet-deploy at the repo root (contract ids and role addresses, no secrets).
 
@@ -29,6 +30,9 @@ OUT_FILE=".env.${NETWORK}-deploy"
 ASSETS_FILE=${ASSETS_FILE:-scripts/shadow-assets.json}
 PRICE_BAND_BPS=${PRICE_BAND_BPS:-50}
 DAILY_MOVE_BAND_BPS=${DAILY_MOVE_BAND_BPS:-100}
+# Rolling reference: a cumulative move beyond WINDOW_MOVE_BAND_BPS within WINDOW_SECONDS halts.
+WINDOW_SECONDS=${WINDOW_SECONDS:-86400}
+WINDOW_MOVE_BAND_BPS=${WINDOW_MOVE_BAND_BPS:-100}
 # RedStone's RWA feeds update every 1-2h; the issuer NAV every few minutes.
 MAX_STALENESS_S=${MAX_STALENESS_S:-21600}
 HAIRCUT_BASE_BPS=${HAIRCUT_BASE_BPS:-500}
@@ -126,6 +130,7 @@ for row in "${ROWS[@]}"; do
 
   run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_asset \
     --admin "$ADMIN" --asset "$SAC" --band_bps "$PRICE_BAND_BPS" --daily_move_band_bps "$DAILY_MOVE_BAND_BPS" \
+    --window_seconds "$WINDOW_SECONDS" --window_move_band_bps "$WINDOW_MOVE_BAND_BPS" \
     --max_staleness_s "$MAX_STALENESS_S" >/dev/null
 
   # No issuer signs NAV; the publisher key signs what the service read from the issuer's API.
