@@ -196,10 +196,10 @@ Decimal strings appear only where routes return raw database rows without going 
 
 | Endpoint | Request Amount(s) | Internal Handling | Response Amount(s) & Format |
 | --- | --- | --- | --- |
-| `GET /v1/assets` | — | Selects all assets and price snapshots; picks latest snapshot per asset; `haircutBps = haircutBaseBps + haircutFxBps`; no conversion | `price.value` (raw DB column `guardedValue`); `price.status` (enum); `price.asOf` (ISO date); `haircutBps` (bps) |
-| `GET /v1/assets/:id/price` | — | Returns latest snapshot and 50 most recent history rows directly from DB; no conversion | `value`, `history[*].guardedValue` (raw DB column `guardedValue`); `status` (enum); `ts` (ISO date) |
+| `GET /v1/assets` | — | Selects all assets and price snapshots; picks latest snapshot per asset; `haircutBps = haircutBaseBps + haircutFxBps`; no conversion | `price.value` (raw DB column `guardedValue`, a decimal string); `price.status` (enum); `price.asOf` (ISO date); `haircutBps` (bps) |
+| `GET /v1/assets/:id/price` | — | Returns latest snapshot and 50 most recent history rows directly from DB; no conversion | `value`, `history[*].guardedValue` (raw DB column `guardedValue`, decimal strings); `status` (enum); `ts` (ISO date) |
 
-> **Note:** `guardedValue` is written by the price-guard service. Confirm its scale from that service's write path before treating it as a `10^7` scaled integer.
+> **Note:** `guardedValue` is a decimal string, not a scaled integer: the price-guard service writes it with `scaledToDecimalString` (`services/price-guard/src/pipeline.ts`), e.g. `"0.0657660"`.
 
 ### Positions endpoint
 
@@ -222,7 +222,7 @@ The management endpoints (`POST|GET /v1/webhooks/subscriptions`, `DELETE /v1/web
 | `liquidation.completed` | Outbound POST | `data` copied verbatim from `liquidation` table; no conversion | `units`, `proceeds`, `shortfall` (**decimal strings**) |
 | `exit.filled` | Outbound POST | `data` copied verbatim from `exit_quote` table; no conversion | `units`, `usdcOut` (**decimal strings**) |
 | `repo.leg1_settled` | Outbound POST | `data` copied verbatim from `repo_trade` table; no conversion | `units`, `cashAmount` (**decimal strings**) |
-| `price.status_changed` | Outbound POST | `data` copied verbatim from `price_snapshot` table; no conversion | `value` (raw DB column; confirm scale) |
+| `price.status_changed` | Outbound POST | `data` copied verbatim from `price_snapshot` table; no conversion | `value` (**decimal string**) |
 | `margin.state_changed`, `.call_issued`, `.cured`, `liquidation.started` | Outbound POST | `data` copied verbatim from `margin_event` table; no conversion | `ltvBps` (basis points — not monetary) |
 
 All monetary fields in webhook `data` are decimal strings copied as-is from the database.
