@@ -1,4 +1,5 @@
-import { Navigate, NavLink, Outlet, useNavigate } from "react-router-dom";
+import { Navigate, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { ErrorBoundary } from "../components/ErrorBoundary.tsx";
 import { useAuth } from "../lib/auth.tsx";
 import { shortAddress } from "../lib/format.ts";
 
@@ -10,6 +11,7 @@ const tabClass = ({ isActive }: { isActive: boolean }) =>
 export function ConsoleShell() {
   const { session, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
 
   if (!session) return <Navigate to="/login" replace />;
 
@@ -48,7 +50,9 @@ export function ConsoleShell() {
         </div>
       </header>
       <main className="p-4">
-        <Outlet />
+        <ErrorBoundary key={location.pathname} onDisconnect={onLogout}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
     </div>
   );

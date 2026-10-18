@@ -140,6 +140,12 @@ is "Ballast's publisher saw this value from the issuer's API", not issuer attest
 `scripts/configure-nav-key.sh [network]` registers the publisher key and turns the requirement on;
 `deploy.sh` runs it, and it is the way to bring an older deployment in line.
 
+Rotating the publisher no longer needs `scripts/redeploy-price-guard.sh`: queue
+`queue_role_change --role '"PricePublisher"' --new_address ...`, execute it after the 48h timelock,
+then update `PRICE_PUBLISHER` in `.env.<network>-deploy` and re-run `scripts/configure-nav-key.sh`
+so the new key is the registered NAV attestor. See `contracts/README.md` for the full sequence and
+why the issuer-key step is required.
+
 To see the real sources without any contract or database (safe against mainnet):
 
 ```

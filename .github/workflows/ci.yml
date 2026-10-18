@@ -39,6 +39,17 @@ jobs:
           workspaces: contracts
       - run: cargo test --workspace
 
+  contract-wasm-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - uses: stellar/stellar-cli@v28.1.0
+      - name: Build contracts and enforce the WASM size budget
+        run: scripts/check-contract-wasm-size.sh
+
   gates:
     runs-on: ubuntu-latest
     steps:
