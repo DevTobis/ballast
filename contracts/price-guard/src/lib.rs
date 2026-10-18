@@ -582,7 +582,6 @@ impl PriceGuard {
         access::require_risk(&env);
         ttl::extend_instance(&env);
 
-
         if let Some(pending) = env
             .storage()
             .instance()
@@ -1038,4 +1037,3 @@ mod test {
         assert_eq!(next_price.value, SCALE);
     }
 }
-

@@ -98,4 +98,3 @@ Fix:
 ## Still stuck
 
 Open a bug report with the exact error, your network, commit hash, and Node and `stellar` versions.
-

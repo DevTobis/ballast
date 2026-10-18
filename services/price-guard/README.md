@@ -87,4 +87,3 @@ If an entry is archived, subsequent calls touching that entry fail with a storag
    stellar contract restore --id <PRICE_GUARD_CONTRACT_ID> --source <OPERATOR_IDENTITY> --network <NETWORK>
    ```
 3. **Restore persistent keys**: Ensure the restore footprint includes the archived persistent entry (`DataKey::Source(asset, source_name)`) in a restore transaction before resuming publication. Once restored, regular publishing automatically re-extends TTL.
-
