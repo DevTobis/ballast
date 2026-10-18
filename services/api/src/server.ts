@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
+import { ZodError } from "zod";
 import type { Database } from "@ballast/db";
 import { loadApiConfig, type ApiConfig } from "./config.js";
 import { registerAuth } from "./auth.js";
@@ -48,6 +49,13 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     logger: false,
     // A hop count (TRUST_PROXY=1) is accepted at runtime by Fastify but missing from its typings.
     trustProxy: (config.trustProxy ?? false) as boolean | string,
+  });
+
+  app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid request", issues: error.issues });
+    }
+    return reply.send(error);
   });
 
   // Registered before auth: this is a pure JSON API (no HTML, so helmet's defaults are fine
