@@ -436,6 +436,49 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "registry: asset already registered")]
+    fn register_asset_rejects_a_duplicate_asset() {
+        let (env, client, admin, _risk, asset) = setup();
+        client.register_asset(&admin, &asset, &valid_config(&env, &asset));
+    }
+
+    #[test]
+    fn a_stranger_cannot_register_an_asset_even_naming_themselves_admin() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, _asset) = setup();
+        let stranger = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let config = valid_config(&env, &asset);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_asset",
+                args: (stranger.clone(), asset.clone(), config.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.register_asset(&stranger, &asset, &config);
+        }));
+        assert!(
+            result.is_err(),
+            "only the stored admin may register an asset"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: asset not registered")]
+    fn asset_rejects_an_unknown_address() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        let unknown = Address::generate(&env);
+        client.asset(&unknown);
+    }
+
+    #[test]
     fn execute_param_reuses_asset_config_validation() {
         let (env, client, admin, _risk, asset) = setup();
         let id = client.queue_param(
