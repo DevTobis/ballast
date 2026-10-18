@@ -1,7 +1,16 @@
 import { z } from "zod";
 
-/** Loose numeric-string -> bigint coercion for request bodies (JSON has no bigint literal). */
-const bigintish = z.union([z.string(), z.number()]).transform((v) => BigInt(v));
+/**
+ * Strict numeric string or safe integer coercion to bigint.
+ * Rejects non-numeric strings, empty strings, floats, null, and non-primitives with Zod issues
+ * rather than throwing unhandled SyntaxError or RangeError exceptions.
+ */
+export const bigintish = z
+  .union([
+    z.string().regex(/^-?\d+$/, { message: "Invalid numeric string for BigInt conversion" }),
+    z.number().int({ message: "Expected integer, received float" }),
+  ])
+  .transform((v) => BigInt(v));
 const hexBuffer = z.string().transform((hex) => Buffer.from(hex.replace(/^0x/, ""), "hex"));
 
 export const openCreditLineSchema = z.object({
