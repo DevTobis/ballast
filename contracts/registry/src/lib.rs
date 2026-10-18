@@ -369,16 +369,9 @@ mod test {
             "only the stored admin may queue a param change"
         );
 
-        // The real admin authorising only themselves succeeds
-        env.mock_auths(&[MockAuth {
-            address: &admin,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "queue_param",
-                args: (admin.clone(), asset.clone(), change.clone()).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
         let id = client.queue_param(&admin, &asset, &change);
         assert_eq!(id, 0);
     }
@@ -405,16 +398,9 @@ mod test {
         }));
         assert!(result.is_err(), "only the stored admin may queue an unpause");
 
-        // The real admin authorising only themselves succeeds
-        env.mock_auths(&[MockAuth {
-            address: &admin,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "queue_unpause",
-                args: (admin.clone(), scope.clone()).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
         let id = client.queue_unpause(&admin, &scope);
         assert_eq!(id, 0);
     }
