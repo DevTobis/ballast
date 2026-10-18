@@ -409,6 +409,9 @@ has a DEX price anyone can move. Ballast never lends against it or liquidates on
 
 The status is part of every price read, so contracts cannot accidentally use a degraded price.
 
+**Median calculation:**
+For an odd count of fresh sources, the median is the middle value of the sorted sources. For an even count, the median is the average of the two middle values rounded down (`(mid_left + mid_right) / 2`). This conservative rounding down prevents valuing collateral favourably for borrowers when independent sources diverge within the permitted band.
+
 **Collateral value:**
 
 ```

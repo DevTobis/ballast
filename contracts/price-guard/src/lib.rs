@@ -344,6 +344,9 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
 /// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
 ///
+/// For an odd source count, the median is the middle value. For an even source count, the median
+/// is the average of the two middle values rounded down (conservative collateral valuation).
+///
 /// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
 /// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
 /// stick and the baseline would never move until some unrelated transaction happened to call it;
@@ -402,7 +405,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         alloc_free_sort::SortBuf::from(&fresh_values);
     plain_values.sort();
     let len = plain_values.len();
-    let median_value = plain_values.get(len / 2);
+    let median_value = if len % 2 == 1 {
+        plain_values.get(len / 2)
+    } else {
+        (plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2
+    };
 
     let mut as_array: [i128; 8] = [0; 8];
     for (i, slot) in as_array.iter_mut().enumerate().take(len) {
@@ -746,6 +753,12 @@ impl PriceGuard {
     /// 3. Otherwise, if the new median moved more than `daily_move_band_bps` against the last
     ///    good value -> `Halted` (sticky, until `confirm_halt_cleared`), value = last good.
     /// 4. Otherwise -> `Ok`, value = the new median, and this becomes the new "last good".
+    ///
+    /// Median rule:
+    /// - For an odd number of fresh sources: middle value after sorting (`len / 2`).
+    /// - For an even number of fresh sources: average of the two middle values rounded down
+    ///   (`(plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2`), providing conservative
+    ///   valuation for collateral.
     pub fn guarded_price(env: Env, asset: Address) -> GuardedPrice {
         evaluate(&env, asset)
     }
@@ -1784,6 +1797,84 @@ mod test {
         let next_price = client.guarded_price(&asset);
         assert_eq!(next_price.status, PriceStatus::Ok);
         assert_eq!(next_price.value, SCALE);
+    }
+
+    #[test]
+    fn median_of_two_sources_averages_middle_rounded_down() {
+        // Band of 100 bps (1%), daily move band 10,000 bps (100%).
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // 1.0000000 and 1.0050000 (diff is 50 bps, within 100 bps band).
+        let val1 = SCALE; // 10_000_000
+        let val2 = SCALE + 50_000; // 10_050_000 (1.005)
+        let expected = (val1 + val2) / 2; // 10_025_000 (1.0025)
+
+        client.publish_nav(&publisher, &asset, &code, &val1, &now, &sig);
+        let feed_name = feed(&env);
+        client.publish_source(&publisher, &asset, &feed_name, &val2, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+    }
+
+    #[test]
+    fn median_of_four_sources_averages_middle_two_rounded_down() {
+        // Band of 100 bps, daily move band 10,000 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Four sorted values: 10_000_000, 10_020_000, 10_040_001, 10_050_000.
+        // Middle two: 10_020_000 and 10_040_001.
+        // Sum = 20_060_001. Average rounded down = 10_030_000.
+        let v1 = SCALE; // 10_000_000
+        let v2 = SCALE + 20_000; // 10_020_000
+        let v3 = SCALE + 40_001; // 10_040_001
+        let v4 = SCALE + 50_000; // 10_050_000
+        let expected = (v2 + v3) / 2;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        let s4 = Symbol::new(&env, "feed_4");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+        client.publish_source(&publisher, &asset, &s4, &v4, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+        assert_eq!(price.value, 10_030_000);
+    }
+
+    #[test]
+    fn median_of_odd_sources_returns_middle_value() {
+        // Band of 100 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Three sorted values: 10_000_000, 10_030_000, 10_060_000.
+        // Middle is 10_030_000.
+        let v1 = SCALE;
+        let v2 = SCALE + 30_000;
+        let v3 = SCALE + 60_000;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, v2);
     }
 
     mod invariants;
