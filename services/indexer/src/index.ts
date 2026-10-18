@@ -40,7 +40,7 @@ async function main() {
 
   while (!stopped) {
     try {
-      const result = await pollOnce(db, rpcServer, contractIds);
+      const result = await pollOnce(db, rpcServer, contractIds, alerter, logger);
       logger.info(result, "indexer: poll complete");
 
       const lagLedgers = result.latestLedger - result.fromLedger;

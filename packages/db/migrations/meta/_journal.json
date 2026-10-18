@@ -64,6 +64,13 @@
       "when": 1791488618339,
       "tag": "0008_payout_forward",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1792337628243,
+      "tag": "0009_lucky_darkstar",
+      "breakpoints": true
     }
   ]
 }

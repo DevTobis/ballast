@@ -4,14 +4,23 @@ import { pollOnce } from "./poller.js";
 import { withRetry, type RpcClient } from "./rpc.js";
 
 /** Minimal fake of the slice of `Database` (drizzle) that `pollOnce` touches. */
-function fakeDb(opts: { lastLedger: number | null; inserted: unknown[] }) {
+function fakeDb(opts: { lastLedger: number | null; gapLedger?: number | null; inserted: unknown[] }) {
+  let selectCount = 0;
   return {
     select: () => ({
-      from: () => Promise.resolve([{ maxLedger: opts.lastLedger }]),
+      from: () => {
+        selectCount++;
+        const val = selectCount % 2 === 1 ? opts.lastLedger : (opts.gapLedger ?? null);
+        return Promise.resolve([{ maxLedger: val }]);
+      },
     }),
     insert: () => ({
-      values: (rows: unknown[]) => {
-        opts.inserted.push(...rows);
+      values: (rows: unknown) => {
+        if (Array.isArray(rows)) {
+          opts.inserted.push(...rows);
+        } else {
+          opts.inserted.push(rows);
+        }
         return Object.assign(Promise.resolve(), { onConflictDoNothing: () => Promise.resolve() });
       },
     }),
@@ -99,6 +108,78 @@ describe("pollOnce", () => {
     JSON.stringify(row.data);
     expect((row.data as { value: string }).value).toBe("1000000");
     expect((row.data as { topics: number[] }).topics).toEqual([42]);
+  });
+
+  it("detects a gap when startLedger is below oldestLedger, clamps, alerts once, and records in chain_event_gap", async () => {
+    const inserted: unknown[] = [];
+    const db = fakeDb({ lastLedger: 1000, inserted });
+    const getEvents = vi.fn().mockResolvedValue({
+      latestLedger: 6000,
+      oldestLedger: 5000,
+      events: [
+        {
+          id: "0000005000-0000000001",
+          ledger: 5000,
+          txHash: "cafebabe",
+          contractId: "CCONTRACT1",
+          topic: [nativeToScVal("pledge", { type: "symbol" })],
+          value: nativeToScVal(100n, { type: "i128" }),
+        },
+      ],
+    });
+    const rpc = fakeRpc({ getEvents });
+    const alerter = { fire: vi.fn() };
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn() } as any;
+
+    const result = await pollOnce(db, rpc, ["CCONTRACT1"], alerter as any, logger);
+
+    // Clamped startLedger
+    expect(result.fromLedger).toBe(5000);
+    expect(result.latestLedger).toBe(6000);
+    expect(result.gap).toEqual({ fromLedger: 1001, toLedger: 4999 });
+
+    // Alert fired once with fromLedger and toLedger
+    expect(alerter.fire).toHaveBeenCalledTimes(1);
+    expect(alerter.fire).toHaveBeenCalledWith(
+      "indexer_gap",
+      expect.objectContaining({ fromLedger: 1001, toLedger: 4999, oldestLedger: 5000 }),
+    );
+
+    // Logger logged the lost range
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ fromLedger: 1001, toLedger: 4999 }),
+      expect.stringContaining("detected gap in indexed ledgers from 1001 to 4999"),
+    );
+
+    // Gap recorded in chain_event_gap table
+    expect(inserted).toContainEqual(
+      expect.objectContaining({
+        fromLedger: 1001,
+        toLedger: 4999,
+        status: "open",
+      }),
+    );
+  });
+
+  it("does not re-alert on the subsequent cycle when the gap was already clamped and recorded", async () => {
+    const inserted: unknown[] = [];
+    // Database now reflects the gap up to 4999, so next startLedger will be 5000
+    const db = fakeDb({ lastLedger: null, gapLedger: 4999, inserted });
+    const getEvents = vi.fn().mockResolvedValue({
+      latestLedger: 6000,
+      oldestLedger: 5000,
+      events: [],
+    });
+    const rpc = fakeRpc({ getEvents });
+    const alerter = { fire: vi.fn() };
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn() } as any;
+
+    const result = await pollOnce(db, rpc, ["CCONTRACT1"], alerter as any, logger);
+
+    expect(result.fromLedger).toBe(5000);
+    expect(result.gap).toBeUndefined();
+    expect(alerter.fire).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 });
 

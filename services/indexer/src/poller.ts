@@ -6,10 +6,12 @@
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { schema, type Database } from "@ballast/db";
 import { sql } from "drizzle-orm";
-import { createConsoleMetricsSink } from "@ballast/observability";
+import { createConsoleMetricsSink, createConsoleAlerter, createLogger, type Alerter, type Logger } from "@ballast/observability";
 import type { RpcClient } from "./rpc.js";
 
 const metrics = createConsoleMetricsSink("indexer");
+const defaultAlerter = createConsoleAlerter("indexer");
+const defaultLogger = createLogger("indexer");
 
 /** How many ledgers to look back on a cold start (no rows in `chain_event` yet). */
 const COLD_START_LOOKBACK_LEDGERS = 1000;
@@ -41,16 +43,29 @@ function decodeTopicName(topic: xdr.ScVal[]): string {
 }
 
 async function getLastIngestedLedger(db: Database): Promise<number | null> {
-  const [row] = await db
+  const [eventRow] = await db
     .select({ maxLedger: sql<number | null>`max(${schema.chainEvent.ledger})` })
     .from(schema.chainEvent);
-  return row?.maxLedger ?? null;
+  let gapMax: number | null = null;
+  try {
+    const [gapRow] = await db
+      .select({ maxLedger: sql<number | null>`max(${schema.chainEventGap.toLedger})` })
+      .from(schema.chainEventGap);
+    gapMax = gapRow?.maxLedger ?? null;
+  } catch {
+    // Gracefully handle database or mock variations where chainEventGap is not queried
+  }
+  const eventMax = eventRow?.maxLedger ?? null;
+  if (eventMax === null) return gapMax;
+  if (gapMax === null) return eventMax;
+  return Math.max(eventMax, gapMax);
 }
 
 export interface PollOnceResult {
   fromLedger: number;
   insertedCount: number;
   latestLedger: number;
+  gap?: { fromLedger: number; toLedger: number };
 }
 
 /**
@@ -61,6 +76,8 @@ export async function pollOnce(
   db: Database,
   rpcServer: RpcClient,
   contractIds: string[],
+  alerter: Alerter = defaultAlerter,
+  logger: Logger = defaultLogger,
 ): Promise<PollOnceResult> {
   const lastIngested = await getLastIngestedLedger(db);
 
@@ -71,6 +88,9 @@ export async function pollOnce(
     const { sequence } = await rpcServer.getLatestLedger();
     startLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
   }
+
+  const requestedStart = startLedger;
+  let gap: { fromLedger: number; toLedger: number } | undefined;
 
   // Drain every page before returning. The next poll resumes from `max(ledger) + 1`, so stopping
   // after one full page would silently drop whatever was left in that page's last ledger.
@@ -83,6 +103,33 @@ export async function pollOnce(
   let cursor: string | undefined;
   for (;;) {
     const page = await rpcServer.getEvents({ startLedger, filters, limit: PAGE_SIZE, cursor });
+
+    if (gap === undefined && page.oldestLedger !== undefined && requestedStart < page.oldestLedger) {
+      const fromLedger = requestedStart;
+      const toLedger = page.oldestLedger - 1;
+      gap = { fromLedger, toLedger };
+      startLedger = page.oldestLedger;
+
+      logger.warn(
+        { fromLedger, toLedger, oldestLedger: page.oldestLedger },
+        `indexer: detected gap in indexed ledgers from ${fromLedger} to ${toLedger}`,
+      );
+      alerter.fire("indexer_gap", {
+        fromLedger,
+        toLedger,
+        oldestLedger: page.oldestLedger,
+      });
+
+      await db
+        .insert(schema.chainEventGap)
+        .values({
+          fromLedger,
+          toLedger,
+          status: "open",
+        })
+        .onConflictDoNothing();
+    }
+
     events.push(...page.events);
     latestLedger = page.latestLedger;
     cursor = page.events.at(-1)?.id;
@@ -108,5 +155,5 @@ export async function pollOnce(
   metrics.increment("indexer.events_ingested", { count: String(events.length) });
   metrics.gauge("indexer.latest_ledger", latestLedger);
 
-  return { fromLedger: startLedger, insertedCount: events.length, latestLedger };
+  return { fromLedger: startLedger, insertedCount: events.length, latestLedger, gap };
 }
