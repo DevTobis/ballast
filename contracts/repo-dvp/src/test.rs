@@ -439,10 +439,7 @@ fn default_close_gives_the_lender_only_what_covers_the_exposure() {
     // lender (rounded up) and the rest of the 100 pledged comes back to the borrower.
     let lender_units = rwa_balance(&h, &h.cash_lender);
     let borrower_back = rwa_balance(&h, &h.cash_borrower) - borrower_before;
-    assert!(
-        lender_units >= 90 * PRICE_SCALE && lender_units < 91 * PRICE_SCALE,
-        "lender got {lender_units}"
-    );
+    assert!(lender_units >= 90 * PRICE_SCALE && lender_units < 91 * PRICE_SCALE, "lender got {lender_units}");
     assert_eq!(lender_units + borrower_back, 100 * PRICE_SCALE);
     assert_eq!(rwa_balance(&h, &h.repo), 0);
     assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
@@ -477,10 +474,7 @@ fn a_price_recovery_cures_the_call_and_blocks_default() {
     set_price(&h, 2 * PRICE_SCALE);
     h.env.ledger().set_timestamp(deadline);
     let refused = panic::catch_unwind(AssertUnwindSafe(|| repo.default_close(&h.keeper, &id)));
-    assert!(
-        refused.is_err(),
-        "default must refuse once the position is healthy again"
-    );
+    assert!(refused.is_err(), "default must refuse once the position is healthy again");
 
     repo.call_margin(&h.keeper, &id); // the keeper's next evaluation clears the call
     let trade = repo.trade(&id);
@@ -524,9 +518,7 @@ fn only_the_cash_borrower_can_top_up() {
     let h = setup();
     let id = settled_under_margin(&h);
     let repo = RepoDvpClient::new(&h.env, &h.repo);
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.top_up(&h.cash_lender, &id, &PRICE_SCALE)
-    }));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| repo.top_up(&h.cash_lender, &id, &PRICE_SCALE)));
     assert!(result.is_err());
 }
 
@@ -539,16 +531,10 @@ fn calling_margin_again_does_not_move_the_cure_deadline() {
     repo.call_margin(&h.keeper, &id);
     let first = repo.trade(&id).cure_deadline.unwrap();
 
-    h.env
-        .ledger()
-        .set_timestamp(h.env.ledger().timestamp() + 3_600);
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 3_600);
     repo.call_margin(&h.keeper, &id);
 
-    assert_eq!(
-        repo.trade(&id).cure_deadline.unwrap(),
-        first,
-        "a keeper must not extend the borrower's window"
-    );
+    assert_eq!(repo.trade(&id).cure_deadline.unwrap(), first, "a keeper must not extend the borrower's window");
 }
 
 #[test]
@@ -571,16 +557,10 @@ fn margin_view_reports_the_position_without_changing_it() {
     assert!(view.price_ok);
     assert_eq!(view.state, MarginState::MarginCall);
     assert!(view.ltv_bps >= 8_000 && view.exposure >= 90 * PRICE_SCALE);
-    assert!(
-        !repo.trade(&id).pending_margin_call,
-        "reading must not open a call"
-    );
+    assert!(!repo.trade(&id).pending_margin_call, "reading must not open a call");
 
     MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
-        &h.rwa,
-        &PRICE_SCALE,
-        &PriceStatus::Degraded,
-        &h.env.ledger().timestamp(),
+        &h.rwa, &PRICE_SCALE, &PriceStatus::Degraded, &h.env.ledger().timestamp(),
     );
     assert!(!repo.margin_view(&id).price_ok);
 }
@@ -606,8 +586,7 @@ fn the_cure_window_has_a_floor_and_only_the_admin_sets_it() {
     let too_short = panic::catch_unwind(AssertUnwindSafe(|| repo.set_cure_grace(&h.admin, &30)));
     assert!(too_short.is_err(), "a 30s window must be refused");
     let stranger = Address::generate(&h.env);
-    let not_admin =
-        panic::catch_unwind(AssertUnwindSafe(|| repo.set_cure_grace(&stranger, &3_600)));
+    let not_admin = panic::catch_unwind(AssertUnwindSafe(|| repo.set_cure_grace(&stranger, &3_600)));
     assert!(not_admin.is_err(), "only the admin may set it");
 }
 
