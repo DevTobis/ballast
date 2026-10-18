@@ -1786,5 +1786,38 @@ mod test {
         assert_eq!(next_price.value, SCALE);
     }
 
+    /// Golden vectors for the canonical NAV message. The same vectors live in
+    /// `services/price-guard/src/__fixtures__/nav-message-vectors.json`, asserted by
+    /// `services/price-guard/src/navSignature.test.ts` against `canonicalNavMessage`. If one side
+    /// changes, both tests have to change in the same commit:
+    ///   ("SPIKO",   1700000000, 10234567)                                -> "SPIKO:1700000000:10234567"
+    ///   ("CETES28", 4102444800, 170141183460469231731687303715884105727) -> "CETES28:4102444800:170141183460469231731687303715884105727"
+    #[test]
+    fn build_nav_message_matches_golden_vectors() {
+        let env = Env::default();
+
+        let message = build_nav_message(
+            &env,
+            &Bytes::from_slice(&env, b"SPIKO"),
+            1_700_000_000,
+            10_234_567,
+        );
+        assert_eq!(message, Bytes::from_slice(&env, b"SPIKO:1700000000:10234567"));
+
+        let message = build_nav_message(
+            &env,
+            &Bytes::from_slice(&env, b"CETES28"),
+            4_102_444_800,
+            i128::MAX,
+        );
+        assert_eq!(
+            message,
+            Bytes::from_slice(
+                &env,
+                b"CETES28:4102444800:170141183460469231731687303715884105727"
+            )
+        );
+    }
+
     mod invariants;
 }
