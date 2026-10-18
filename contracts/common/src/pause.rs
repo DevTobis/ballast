@@ -16,8 +16,9 @@
 //!
 //! ## Deliberately ungated entry points
 //!
-//! Every other state-changing entry point is intentionally left ungated so it keeps working while
-//! any scope is paused:
+//! These risk-reducing or enforcement entry points are intentionally left ungated so they keep
+//! working while any scope is paused (admin setup and bookkeeping calls such as `initialize`,
+//! `configure_*`, `open`, `fund`, `record_lien` and the `sync_*` hooks are not gated either):
 //!
 //! - `credit-line::repay` is repayment, which must always be possible (invariant 5).
 //! - `credit-line::liquidate` and `credit-line::close_liquidated` are liquidation and its
