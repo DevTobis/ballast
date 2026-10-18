@@ -149,4 +149,3 @@ describe("recomputeLine", () => {
     expect(fireSpy).not.toHaveBeenCalled();
   });
 });
-
