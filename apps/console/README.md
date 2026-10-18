@@ -37,6 +37,14 @@ exists for scripted/local testing, but only when `services/api` is started with
 `ENABLE_DEV_LOGIN=true`, and this app's UI no longer exposes it - it's reachable only by calling
 the API directly (curl, a script).
 
+## Render-error recovery
+
+If a page fails during rendering, a fallback panel offers **Reload** and **Disconnect**.
+Console tabs and the header remain available after a page failure; changing tabs resets
+the fallback. A root boundary also covers Login, Markets, and the shell. Disconnect
+clears the saved console session and returns to Login. Errors are logged only to the
+browser console; no remote error reporting is configured.
+
 ## Running
 
 `scripts/dev-setup.sh` (repo root) writes this app's `.env` along with everything else, and

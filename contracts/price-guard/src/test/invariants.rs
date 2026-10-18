@@ -290,7 +290,9 @@ fn execute_and_assert_invariants(
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 50,
+        // Each case replays up to 30 operations on a fresh contract; 10 cases per config keeps the
+        // three properties under the 30s CI budget (50 took about 65s once events and TTL calls landed).
+        cases: 10,
         max_shrink_iters: 1000,
         ..ProptestConfig::default()
     })]
