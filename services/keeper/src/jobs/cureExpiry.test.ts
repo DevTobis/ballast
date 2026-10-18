@@ -205,6 +205,27 @@ describe("runCureExpiryJob", () => {
     expect(c.vault.liquidate).not.toHaveBeenCalled();
     expect(updated).toContainEqual({ table: schema.creditLine, set: { status: "liquidating" } });
     expect(inserted).toHaveLength(1);
+    expect(inserted[0].table).toBe(schema.liquidation);
+    expect(inserted[0].values.units).toBe("150.0000000");
+    expect(inserted[0].values.txHashes).toEqual([]);
+  });
+
+  it("does not book a zero-unit liquidation when a resumed run has no active pledges to recover units from", async () => {
+    const rows = fixtures([{ toState: "Liquidation", createdAt: new Date() }]);
+    rows.set(schema.pledge, []);
+    const { db, inserted, updated } = makeDb(rows);
+    const c = clients(
+      { state: "Liquidation", priceStatus: "Ok" },
+      { status: "Liquidating", breachLedger: 100, asset: "CASSET" },
+      0n,
+    );
+
+    const result = await run(db, c);
+
+    expect(result.processed).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(inserted).toHaveLength(0);
+    expect(updated).toHaveLength(0);
   });
 
   it("records an error and books nothing when a submission fails", async () => {

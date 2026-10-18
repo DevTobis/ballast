@@ -28,7 +28,7 @@
  */
 import { and, desc, eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
-import { scaledToDecimalString } from "@ballast/domain-types";
+import { decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-types";
 import { loadNetworkConfig } from "@ballast/network-config";
 import type { CreditLineClient, PledgeVaultClient } from "@ballast/contract-clients";
 import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
@@ -150,7 +150,16 @@ export async function runCureExpiryJob(
       for (const pledge of pledges) {
         await db.update(schema.pledge).set({ status: "liquidated" }).where(eq(schema.pledge.id, pledge.id));
       }
-      const totalUnits = held;
+
+      // A resumed run finds the vault already emptied, so `held` is 0 even though collateral was
+      // seized. The pledge rows are still `active` (booking never ran), so they carry the quantity.
+      // The earlier run's transaction hashes aren't stored anywhere we can read back, so they stay
+      // empty. Refuse to book a zero-unit liquidation rather than lose the quantity from the books.
+      const totalUnits =
+        alreadyLiquidating && held === 0n
+          ? pledges.reduce((sum, pledge) => sum + decimalStringToScaled(pledge.units), 0n)
+          : held;
+      if (totalUnits === 0n) throw new Error(`no seized units recoverable for line ${line.id}`);
 
       await db.insert(schema.liquidation).values({
         creditLineId: line.id,
