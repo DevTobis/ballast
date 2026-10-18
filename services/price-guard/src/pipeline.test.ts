@@ -164,6 +164,47 @@ describe("runPriceUpdateCycle", () => {
     expect(fireSpy).toHaveBeenCalledWith("price_degraded", expect.objectContaining({ status: "Degraded" }));
   });
 
+  it("still publishes the feed and records a snapshot when the NAV submit fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const db = makeDb();
+    const client = makeClient();
+    const submit = vi.fn(async (xdr: string) => {
+      if (xdr === "signed:unsigned-nav-xdr") throw new Error("tx failed on-chain");
+      return { hash: "h", status: "SUCCESS" };
+    });
+
+    await runPriceUpdateCycle(db as any, client as any, sendSigner as any, [makeAsset()], submit as any, TEST_ENV);
+
+    expect(client.publishFeed).toHaveBeenCalledTimes(1);
+    expect(submit).toHaveBeenCalledWith("signed:unsigned-feed-xdr");
+    expect(client.guardedPrice).toHaveBeenCalledTimes(1);
+    expect(db.values).toHaveBeenLastCalledWith(expect.objectContaining({ assetId: "asset-1", status: "Ok" }));
+    expect(fireSpy).toHaveBeenCalledWith(
+      "price_degraded",
+      expect.objectContaining({ code: "CETES", source: "issuer NAV", reason: expect.stringContaining("tx failed on-chain") }),
+    );
+  });
+
+  it("still publishes the NAV and alerts naming the feed when the feed submit fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const db = makeDb();
+    const client = makeClient();
+    const submit = vi.fn(async (xdr: string) => {
+      if (xdr === "signed:unsigned-feed-xdr") throw new Error("simulation reverted");
+      return { hash: "h", status: "SUCCESS" };
+    });
+
+    await runPriceUpdateCycle(db as any, client as any, sendSigner as any, [makeAsset()], submit as any, TEST_ENV);
+
+    expect(client.publishNav).toHaveBeenCalledTimes(1);
+    expect(submit).toHaveBeenCalledWith("signed:unsigned-nav-xdr");
+    expect(db.values).toHaveBeenLastCalledWith(expect.objectContaining({ assetId: "asset-1", status: "Ok" }));
+    expect(fireSpy).toHaveBeenCalledWith(
+      "price_degraded",
+      expect.objectContaining({ code: "CETES", source: "RedStone feed", reason: expect.stringContaining("simulation reverted") }),
+    );
+  });
+
   it("publishes only the feed for an issuer with no NAV API (franklin)", async () => {
     const db = makeDb();
     const client = makeClient({ status: "Degraded" });
