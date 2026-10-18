@@ -878,6 +878,9 @@ mod test {
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &random_sig);
     }
 
+    /// Records current behaviour (issue #16), not a guarantee: a signature over an older
+    /// (ts, value) pair still verifies, so a captured signed reading can be replayed. Nothing
+    /// ties the message to a deployment or orders readings; see #90 for the message binding.
     #[test]
     fn valid_historical_issuer_signature_is_accepted() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
