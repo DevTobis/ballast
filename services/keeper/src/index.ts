@@ -1,9 +1,10 @@
 import cron from "node-cron";
-import { createDatabase } from "@ballast/db";
+import { createDatabase, createRawClient } from "@ballast/db";
 import { loadNetworkConfig, requireContractId } from "@ballast/network-config";
 import { checkOperatorBalance, createConsoleAlerter, createLogger } from "@ballast/observability";
 import { CreditLineClient, PledgeVaultClient, RepoDvpClient } from "@ballast/contract-clients";
 import { createOperatorSigner } from "@ballast/operator-signing";
+import { executeJobWithLock, PostgresLockProvider, type LockProvider } from "./lock.js";
 import { runRepoUnwindJob } from "./jobs/repoUnwind.js";
 import { runRepoMarginJob } from "./jobs/repoMargin.js";
 import { runCureExpiryJob } from "./jobs/cureExpiry.js";
@@ -33,27 +34,29 @@ const repoDvpClient = new RepoDvpClient({
 // Every job signs with the one keeper account, and a Stellar account's transactions must land in
 // sequence-number order — two jobs building transactions at the same moment would both take the
 // same number and one would be rejected. So jobs queue up behind each other.
+// Across multiple keeper instances or rolling restarts, a Postgres session-level advisory lock
+// prevents duplicate job execution and sequence conflicts.
 let queue: Promise<void> = Promise.resolve();
+const rawSql = createRawClient();
+const defaultLockProvider = new PostgresLockProvider(rawSql);
 
-function runJob(name: string, fn: () => Promise<JobResult>): Promise<void> {
-  queue = queue.then(() => execute(name, fn));
+export function runJob(
+  name: string,
+  fn: () => Promise<JobResult>,
+  lockProvider: LockProvider = defaultLockProvider,
+): Promise<void> {
+  queue = queue.then(async () => {
+    await execute(name, fn, lockProvider);
+  });
   return queue;
 }
 
-async function execute(name: string, fn: () => Promise<JobResult>): Promise<void> {
-  logger.info({ job: name }, "keeper: job starting");
-  try {
-    const result = await fn();
-    logger.info(
-      { job: name, processed: result.processed, skipped: result.skipped, errors: result.errors.length },
-      "keeper: job finished",
-    );
-    for (const e of result.errors) {
-      logger.error({ job: name, id: e.id, message: e.message }, "keeper: row failed within job");
-    }
-  } catch (err) {
-    logger.error({ job: name, err }, "keeper: job crashed");
-  }
+export function execute(
+  name: string,
+  fn: () => Promise<JobResult>,
+  lockProvider: LockProvider = defaultLockProvider,
+): Promise<boolean> {
+  return executeJobWithLock(name, fn, lockProvider, logger);
 }
 
 // PRD §6.5 defaults: repo leg 2 and cure-window expiries every 5 minutes; interest accrual

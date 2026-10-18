@@ -23,6 +23,17 @@ Jobs run one at a time through a shared queue, because they share one account an
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
 Liquidation and margin steps are written to be safe to repeat after a crash.
 
+## Replica Behaviour and Advisory Locking
+
+All keeper jobs sign with a single operator account and need sequential transaction sequence numbers. To prevent duplicate submissions, race conditions, or `tx_bad_seq` errors across multiple replicas (e.g. `--scale keeper=2` or during rolling restarts):
+
+- Each tick acquires a session-level Postgres advisory lock (`pg_try_advisory_lock`) on a dedicated connection.
+- If another keeper instance holds the lock, the tick is logged and skipped.
+- When the job finishes, the lock is released. If an instance crashes or disconnects, Postgres automatically releases the advisory lock.
+- `KEEPER_LOCK_SCOPE`: controls locking granularity:
+  - `job` (default): lock key is `hashtext('keeper:' || name)`, allowing different jobs to run while locking out duplicates of the same job.
+  - `global`: lock key is `hashtext('keeper:global')`, ensuring strict single-job execution across the entire cluster.
+
 ## Run
 
 ```
