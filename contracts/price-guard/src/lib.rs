@@ -48,6 +48,7 @@
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
+    ttl,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -172,8 +173,9 @@ fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
 }
 
 fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed_at: u64) {
+    let key = DataKey::Source(asset.clone(), name.clone());
     env.storage().persistent().set(
-        &DataKey::Source(asset.clone(), name.clone()),
+        &key,
         &PriceSource {
             name: name.clone(),
             value,
@@ -181,6 +183,7 @@ fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed
             stale: false,
         },
     );
+    ttl::extend_persistent(env, &key);
 }
 
 /// Every source name ever published for `asset`. Soroban has no native "list keys matching a
@@ -304,14 +307,8 @@ fn within_band(values: &[i128], band_bps: u32) -> bool {
     deviation_bps <= band_bps as i128
 }
 
-/// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
-/// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
-///
-/// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
-/// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
-/// stick and the baseline would never move until some unrelated transaction happened to call it;
-/// the daily-move check would then compare against a baseline days old and halt on ordinary yield
-/// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
+/// Records `to` as `asset`'s latest status and emits `status_changed` when it differs from the
+/// previous one (an asset with no recorded status counts as coming from `Degraded`).
 fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, value: i128) {
     let key = DataKey::LastStatus(asset.clone());
     let prev: Option<PriceStatus> = env.storage().instance().get(&key);
@@ -462,6 +459,7 @@ impl PriceGuard {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("price-guard: already initialized");
         }
@@ -490,6 +488,7 @@ impl PriceGuard {
     ) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage().instance().set(
             &DataKey::Config(asset.clone()),
             &AssetGuardConfig {
@@ -519,6 +518,7 @@ impl PriceGuard {
     ) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
@@ -533,6 +533,7 @@ impl PriceGuard {
     pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
         admin.require_auth();
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .set(&DataKey::RequireNavSignature, &required);
@@ -556,6 +557,7 @@ impl PriceGuard {
     ) {
         publisher.require_auth();
         access::require_price_publisher(&env);
+        ttl::extend_instance(&env);
         read_config(&env, &asset); // asserts the asset is configured
         require_sane_reading(&env, value, ts);
 
@@ -601,6 +603,7 @@ impl PriceGuard {
     ) {
         publisher.require_auth();
         access::require_price_publisher(&env);
+        ttl::extend_instance(&env);
         read_config(&env, &asset);
         require_sane_reading(&env, value, ts);
 
@@ -639,6 +642,7 @@ impl PriceGuard {
     pub fn confirm_halt_cleared(env: Env, risk: Address, asset: Address) {
         risk.require_auth();
         access::require_risk(&env);
+        ttl::extend_instance(&env);
 
         let mut new_last_good = 0i128;
         if let Some(pending) = env
@@ -666,10 +670,7 @@ impl PriceGuard {
             (Symbol::new(&env, "halt_cleared"), asset.clone()),
             new_last_good,
         );
-
-        evaluate(&env, asset);
     }
-
 }
 
 #[cfg(test)]
@@ -677,11 +678,11 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
-    fn setup(
+    fn setup_with_admin(
         band_bps: u32,
         daily_move_band_bps: u32,
         max_staleness_s: u64,
-    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address) {
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -709,6 +710,16 @@ mod test {
         // doesn't panic every call here.
         client.configure_signature_requirement(&admin, &false);
 
+        (env, client, admin, price_publisher, risk, asset)
+    }
+
+    fn setup(
+        band_bps: u32,
+        daily_move_band_bps: u32,
+        max_staleness_s: u64,
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address) {
+        let (env, client, _admin, price_publisher, risk, asset) =
+            setup_with_admin(band_bps, daily_move_band_bps, max_staleness_s);
         (env, client, price_publisher, risk, asset)
     }
 
@@ -878,6 +889,87 @@ mod test {
         // Signed over a DIFFERENT value than what's actually published -> verification must fail.
         let sig = sign_nav(&env, &signing_key, &code, now, SCALE + 1);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn issuer_signature_for_another_asset_code_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
+        let other_code = Bytes::from_slice(&env, b"OTHERASSET");
+        client.publish_nav(&publisher, &asset, &other_code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn issuer_signature_for_another_timestamp_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &signing_key, &code, now + 1, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn issuer_signature_from_another_key_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, _signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let other_signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let now = env.ledger().timestamp();
+        let sig = sign_nav(&env, &other_signing_key, &code, now, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn random_issuer_signature_bytes_panics() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, _signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let random_sig = BytesN::from_array(&env, &[0x5au8; 64]);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &random_sig);
+    }
+
+    /// Records current behaviour (issue #16), not a guarantee: a signature over an older
+    /// (ts, value) pair still verifies, so a captured signed reading can be replayed. Nothing
+    /// ties the message to a deployment or orders readings; see #90 for the message binding.
+    #[test]
+    fn valid_historical_issuer_signature_is_accepted() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let admin = Address::generate(&env);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        env.ledger().set_timestamp(1_000);
+        let now = env.ledger().timestamp();
+        let historical_ts = now - 1;
+        let sig = sign_nav(&env, &signing_key, &code, historical_ts, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &historical_ts, &sig);
     }
 
     // --- adversarial cases -------------------------------------------------------------------
@@ -1153,5 +1245,118 @@ mod test {
         assert!(has_event(&events, "halt_cleared"), "halt_cleared event must be emitted");
     }
 
-}
+    #[test]
+    fn a_stranger_cannot_configure_an_asset() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let new_asset = Address::generate(&env);
 
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_asset",
+                args: (stranger.clone(), new_asset.clone(), 60u32, 120u32, 1800u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(&stranger, &new_asset, &60, &120, &1800);
+        }));
+        assert!(result.is_err(), "only the stored admin may configure an asset");
+
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
+        client.configure_asset(&admin, &new_asset, &60, &120, &1800);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_issuer_key() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let (pubkey, _) = test_issuer_keypair(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_issuer_key",
+                args: (stranger.clone(), asset.clone(), pubkey.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_issuer_key(&stranger, &asset, &pubkey);
+        }));
+        assert!(result.is_err(), "only the stored admin may configure issuer key");
+
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_signature_requirement() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "configure_signature_requirement",
+                args: (stranger.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_signature_requirement(&stranger, &true);
+        }));
+        assert!(result.is_err(), "only the stored admin may configure signature requirement");
+
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
+        client.configure_signature_requirement(&admin, &true);
+    }
+
+    #[test]
+    fn publish_extends_ttl_and_survives_ledger_advancement() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        // Initial publish establishes the persistent source entries and instance state.
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+
+        let initial_price = client.guarded_price(&asset);
+        assert_eq!(initial_price.status, PriceStatus::Ok);
+        assert_eq!(initial_price.value, SCALE);
+
+        // Advance sequence number past initial TTL (10,000 ledgers).
+        let current_seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(current_seq + 10_000);
+        env.ledger().set_timestamp(now + 60);
+
+        // State remains accessible because publish extended instance and persistent TTL.
+        // A subsequent publish and read both succeed.
+        let next_now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &next_now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &next_now);
+
+        let next_price = client.guarded_price(&asset);
+        assert_eq!(next_price.status, PriceStatus::Ok);
+        assert_eq!(next_price.value, SCALE);
+    }
+}

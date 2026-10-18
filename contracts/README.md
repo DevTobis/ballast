@@ -12,7 +12,7 @@ in this skeleton pass.
 | `price-guard` | [Median/band/staleness/halt price logic (PRD §6.4)](price-guard/README.md) |
 | `pledge-vault` | Escrow/lien collateral positions |
 | `credit-line` | Credit lines, draws, repayments, the margin state machine |
-| `exit-desk` | RWA → USDC instant exit |
+| `exit-desk` | [RWA → USDC instant exit](exit-desk/README.md) |
 | `repo-dvp` | Bilateral repo, atomic DvP |
 
 ## Building

@@ -38,4 +38,4 @@ To support real-time monitoring (PRD §11 alerts for `Degraded` and `Halted` sta
   3. Emits `status_changed(asset)` with `(from: Ok, to: Halted, value: last_good)`.
   4. Operator verifies off-chain and calls `confirm_halt_cleared(risk, asset)`.
   5. Emits `halt_cleared(asset)` with `new_last_good`.
-  6. Re-evaluates and emits `status_changed(asset)` with `(from: Halted, to: Ok, value: new_last_good)`.
+  6. `confirm_halt_cleared` only clears the latch; the next publish re-evaluates and emits `status_changed(asset)` with `(from: Halted, to: Ok, ...)`.
