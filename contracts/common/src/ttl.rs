@@ -6,18 +6,17 @@
 //! across contracts.
 //!
 //! # Constants Reasoning
-//! Thresholds trigger an extension when remaining lifetime falls below ~1 day of ledgers (17,280 ledgers).
-//! Targets (~30 days of ledgers = 518,400 ledgers) guarantee that live state outlives any protocol timelock
-//! (48 hours = 34,560 ledgers) plus grace periods (~7 days = 120,960 ledgers), satisfying
-//! `target >= timelock + grace` (155,520 ledgers), while staying comfortably under the
-//! network's maximum entry TTL (~6 months).
+//! Thresholds trigger an extension when remaining lifetime falls below ~1 day of ledgers.
+//! Targets (~30 days of ledgers) guarantee that live state outlives any protocol timelock
+//! (48 hours = 34,560 ledgers) plus grace periods (~7 days = 120,960 ledgers), while
+//! staying comfortably under the network's maximum entry TTL (~6 months).
 
 use soroban_sdk::{Env, IntoVal, Val};
 
 /// ~1 day of ledgers assuming ~5s block time (17,280 ledgers).
 pub const INSTANCE_LIFETIME_THRESHOLD_LEDGERS: u32 = 17_280;
 
-/// ~30 days of ledgers (518,400 ledgers). Satisfies target >= timelock + grace (155,520 ledgers).
+/// ~30 days of ledgers (518,400 ledgers). Exceeds timelock + grace (155,520 ledgers).
 pub const INSTANCE_EXTEND_TO_LEDGERS: u32 = 518_400;
 
 /// ~1 day of ledgers for persistent entries (17,280 ledgers).
