@@ -1240,6 +1240,84 @@ mod test {
         }
     }
 
+    /// Replay of the 2026-02-22 YieldBlox / USTRY manipulation path (PRD §11, Backlog B-0082).
+    /// NAV remains fixed at 1.0, while an independent feed steps up +0.1% per publish to +5%, then
+    /// drops back down. With a 50 bps band, no step beyond +0.5% may be Ok, the published value
+    /// must never exceed the NAV by more than the band, and the guard must not Halt on the way back down.
+    #[test]
+    fn scripted_replay_ustry_manipulation_2026_02_22() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let mut now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+
+        struct Step {
+            step: u32,
+            feed_value: i128,
+            expected_status: PriceStatus,
+            expected_value: i128,
+        }
+
+        let max_allowed = SCALE + (SCALE * 50) / 10_000;
+
+        let steps = [
+            Step { step: 0, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 30_000 },
+            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
+            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
+            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
+            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
+            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 19, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+        ];
+
+        assert!(steps.len() >= 15, "table must cover at least 15 steps");
+
+        for s in steps.iter() {
+            now += 10;
+            env.ledger().set_timestamp(now);
+            client.publish_source(&publisher, &asset, &feed_name, &s.feed_value, &now);
+
+            let price = client.guarded_price(&asset);
+            assert_eq!(
+                price.status, s.expected_status,
+                "step {}: feed {} expected status {:?}, got {:?}",
+                s.step, s.feed_value, s.expected_status, price.status
+            );
+            assert_eq!(
+                price.value, s.expected_value,
+                "step {}: feed {} expected value {}, got {}",
+                s.step, s.feed_value, s.expected_value, price.value
+            );
+            assert!(
+                price.value <= max_allowed,
+                "step {}: price {} must never exceed NAV by more than band ({})",
+                s.step, price.value, max_allowed
+            );
+            assert_ne!(
+                price.status,
+                PriceStatus::Halted,
+                "step {}: guard must not Halt on the way back down",
+                s.step
+            );
+        }
+    }
+
     #[test]
     fn one_fresh_source_can_never_set_a_price_however_large_the_move() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
