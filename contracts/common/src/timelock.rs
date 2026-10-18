@@ -7,6 +7,24 @@ use soroban_sdk::{contracttype, Env};
 
 pub const TIMELOCK_DELAY_SECONDS: u64 = 48 * 60 * 60;
 
+/// Average ledger close time on Stellar is ~5 seconds.
+pub const LEDGER_CLOSE_TIME_SECONDS: u64 = 5;
+
+/// The minimum timelock delay in ledgers (~34,560 ledgers for 48 hours).
+pub const TIMELOCK_DELAY_LEDGERS: u32 = (TIMELOCK_DELAY_SECONDS / LEDGER_CLOSE_TIME_SECONDS) as u32;
+
+/// A 7-day execution grace window after the 48h timelock elapses before persistent storage TTL expires.
+pub const GRACE_PERIOD_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Grace window in ledgers (~120,960 ledgers for 7 days).
+pub const GRACE_PERIOD_LEDGERS: u32 = (GRACE_PERIOD_SECONDS / LEDGER_CLOSE_TIME_SECONDS) as u32;
+
+/// Storage TTL extension target: 48h timelock + 7-day grace window (~155,520 ledgers).
+pub const TIMELOCK_EXTEND_TTL_LEDGERS: u32 = TIMELOCK_DELAY_LEDGERS + GRACE_PERIOD_LEDGERS;
+
+/// Storage TTL threshold: ensure TTL never falls below the 48h delay requirement.
+pub const TIMELOCK_THRESHOLD_TTL_LEDGERS: u32 = TIMELOCK_DELAY_LEDGERS;
+
 #[contracttype]
 enum TimelockDataKey {
     NextId,
@@ -28,4 +46,17 @@ pub fn executes_at(env: &Env) -> u64 {
 /// Whether a change queued for `executes_at` may run yet.
 pub fn is_ready(env: &Env, executes_at: u64) -> bool {
     env.ledger().timestamp() >= executes_at
+}
+
+/// Extends the persistent storage TTL of a queued timelock entry so it survives
+/// at least 48h plus the 7-day grace period on the network.
+pub fn extend_entry_ttl<K>(env: &Env, key: &K)
+where
+    K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+{
+    env.storage().persistent().extend_ttl(
+        key,
+        TIMELOCK_THRESHOLD_TTL_LEDGERS,
+        TIMELOCK_EXTEND_TTL_LEDGERS,
+    );
 }

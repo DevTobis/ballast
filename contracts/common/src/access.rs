@@ -80,3 +80,87 @@ pub fn require_admin_or_keeper(env: &Env, caller: &Address) -> Address {
     }
     caller.clone()
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _};
+
+    /// Exposes each helper as an entry point so its auth check runs inside a real invocation.
+    #[contract]
+    struct Probe;
+
+    #[contractimpl]
+    impl Probe {
+        pub fn set(env: Env, roles: Roles) {
+            write_roles(&env, &roles);
+        }
+        pub fn req_admin(env: Env) -> Address {
+            require_admin(&env)
+        }
+        pub fn req_pauser(env: Env) -> Address {
+            require_pauser(&env)
+        }
+        pub fn req_keeper(env: Env) -> Address {
+            require_keeper(&env)
+        }
+        pub fn req_price_publisher(env: Env) -> Address {
+            require_price_publisher(&env)
+        }
+        pub fn req_risk(env: Env) -> Address {
+            require_risk(&env)
+        }
+    }
+
+    /// Runs `call` against five distinct stored roles and asserts the helper returned the role
+    /// picked by `pick` and demanded authorisation from that address and no other. Under
+    /// `mock_all_auths` a helper reading the wrong field (say `require_keeper` reading
+    /// `roles.admin`) would still succeed, but the recorded authorisation would name the wrong
+    /// address, so any signer other than the stored role could not satisfy the check.
+    fn requires_only(pick: impl Fn(&Roles) -> Address, call: impl Fn(&ProbeClient) -> Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = ProbeClient::new(&env, &env.register(Probe, ()));
+        let roles = Roles {
+            admin: Address::generate(&env),
+            pauser: Address::generate(&env),
+            keeper: Address::generate(&env),
+            price_publisher: Address::generate(&env),
+            risk: Address::generate(&env),
+        };
+        client.set(&roles);
+
+        let returned = call(&client);
+
+        let expected = pick(&roles);
+        assert_eq!(returned, expected, "must return the stored role address");
+        let signers: std::vec::Vec<Address> =
+            env.auths().into_iter().map(|(address, _)| address).collect();
+        assert_eq!(signers, [expected], "must require auth from the stored role only");
+    }
+
+    #[test]
+    fn require_admin_requires_only_the_admin() {
+        requires_only(|r| r.admin.clone(), |c| c.req_admin());
+    }
+
+    #[test]
+    fn require_pauser_requires_only_the_pauser() {
+        requires_only(|r| r.pauser.clone(), |c| c.req_pauser());
+    }
+
+    #[test]
+    fn require_keeper_requires_only_the_keeper() {
+        requires_only(|r| r.keeper.clone(), |c| c.req_keeper());
+    }
+
+    #[test]
+    fn require_price_publisher_requires_only_the_price_publisher() {
+        requires_only(|r| r.price_publisher.clone(), |c| c.req_price_publisher());
+    }
+
+    #[test]
+    fn require_risk_requires_only_the_risk_role() {
+        requires_only(|r| r.risk.clone(), |c| c.req_risk());
+    }
+}
