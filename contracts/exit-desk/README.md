@@ -182,7 +182,7 @@ pub fn exit(
 * **Authentication**: Requires `holder.require_auth()`.
 * **Slippage Protection**: Panics if recomputed `quote.usdc_out < min_usdc_out`.
 * **Flexible Destination (`to`)**: Allows routing the USDC proceeds to any address (e.g., an anchor operator account for fiat offramping).
-* **Eligibility**: Enforced via Stellar Asset Contract (SAC) authorization. If the holder is not authorized under SEP-57 / SAC rules, the underlying transfer reverts.
+* **Eligibility**: Enforced via Stellar Asset Contract (SAC) authorization. If the issuer's own controls (SAC authorization or the SEP-57 token's rules) reject the holder, the underlying transfer reverts.
 
 ---
 
@@ -205,11 +205,11 @@ All events are emitted during the transaction that executes the state transition
 | Initialization | `"exit-desk: already initialized"` | Roles have already been set up. |
 | Authorization | `"exit-desk: admin argument mismatch"` | Invoked with admin address differing from stored admin. |
 | Authorization | Auth check failures | `holder.require_auth()` or `require_admin_or_keeper()` failed. |
-| Pause | `"common: paused for scope"` | Contract is paused under `PauseScope::Exits`. |
+| Pause | `"ballast-common: paused"` | Contract is paused under `PauseScope::Exits`. |
 | Zero/Negative units | `"exit-desk: units must be positive"` | Requested quote or exit with `units <= 0`. |
 | Zero/Negative amount | `"exit-desk: amount must be positive"` | `fund` or `withdraw` called with `amount <= 0`. |
 | Unconfigured asset | `"exit-desk: asset not configured"` | Asset was not initialized via `configure_asset`. |
-| Bad Price Status | `"exit-desk: price is not Ok, refusing to quote"` | PriceGuard returned `Degraded`, `Halted`, or `Stale`. |
+| Bad Price Status | `"exit-desk: price is not Ok, refusing to quote"` | PriceGuard returned `Degraded` or `Halted`. |
 | Excessive Spread | `"exit-desk: spread exceeds 100%"` | Configured `spread_bps > 10_000`. |
 | Cap validation | `"...cap must be positive"` | Daily or inventory cap configured with value `0`. |
 | Token mismatch | `"exit-desk: usdc address mismatch"` | Subsequent `fund` calls used a different USDC token. |
@@ -225,5 +225,5 @@ All events are emitted during the transaction that executes the state transition
 `ExitDesk` integrates `ballast_common::pause`:
 
 * The pauser role can pause exits via the common pause mechanism under `PauseScope::Exits`.
-* When paused, all calls to `exit(...)` revert immediately with `"common: paused for scope"`.
+* When paused, all calls to `exit(...)` revert immediately with `"ballast-common: paused"`.
 * `quote(...)` remains operational for informational reads.
