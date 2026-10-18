@@ -343,4 +343,85 @@ mod test {
             ballast_common::access::read_roles(env).pauser
         })
     }
+
+    #[test]
+    fn a_stranger_cannot_queue_param() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _risk, asset) = setup();
+        let stranger = Address::generate(&env);
+        let change = ParamChange::HaircutBaseBps(700);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_param",
+                args: (stranger.clone(), asset.clone(), change.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_param(&stranger, &asset, &change);
+        }));
+        assert!(
+            result.is_err(),
+            "only the stored admin may queue a param change"
+        );
+
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
+        let id = client.queue_param(&admin, &asset, &change);
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_unpause() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _risk, _asset) = setup();
+        let stranger = Address::generate(&env);
+        let scope = PauseScope::Draws;
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_unpause",
+                args: (stranger.clone(), scope.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_unpause(&stranger, &scope);
+        }));
+        assert!(result.is_err(), "only the stored admin may queue an unpause");
+
+        // Scoped auths cannot be built for generated contract addresses, so the real admin's
+        // success path runs under mock_all_auths like the rest of this module.
+        env.mock_all_auths();
+        let id = client.queue_unpause(&admin, &scope);
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: asset not registered")]
+    fn queue_param_rejects_unknown_asset() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let unknown = Address::generate(&env);
+        client.queue_param(&admin, &unknown, &ParamChange::HaircutBaseBps(700));
+    }
+
+    #[test]
+    fn consecutive_queues_return_increasing_and_different_ids() {
+        let (_env, client, admin, _risk, asset) = setup();
+        let id1 = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(500));
+        let id2 = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(600));
+        let id3 = client.queue_unpause(&admin, &PauseScope::Draws);
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
 }
