@@ -1,4 +1,4 @@
-/*
+/**
  * PRD §6.5: "Pulls issuer NAV and feeds, signs and pushes updates to `PriceGuard`."
  *
  * For each configured asset: fetch issuer NAV (where the issuer has an API) + independent feed, record both as
@@ -14,7 +14,7 @@ import { loadNetworkConfig } from "@ballast/network-config";
 import type { AssetConfig } from "@ballast/domain-types";
 import type { PriceGuardClient } from "@ballast/contract-clients";
 import { getIndependentFeedAdapter, getIssuerNavAdapter } from "./adapters/registry.js";
-import { attestNav } from "./navSttestor.js";
+import { attestNav } from "./navAttestor.js";
 import { scaledToDecimalString } from "./scaled.js";
 import { submitSignedTx, type KmsSigner, type SubmitResult } from "@ballast/operator-signing";
 
