@@ -100,6 +100,86 @@ describe("pollOnce", () => {
     expect((row.data as { value: string }).value).toBe("1000000");
     expect((row.data as { topics: number[] }).topics).toEqual([42]);
   });
+
+  it("stores an undecodable event with raw XDR, logs a warning with event id and ledger, and does not block later events", async () => {
+    const inserted: Array<{ eventId: string; ledger: number; txHash: string; contract: string; topic: string; data: any }> = [];
+    const db = fakeDb({ lastLedger: 5000, inserted });
+
+    const goodTopic = [nativeToScVal("draw", { type: "symbol" })];
+    const goodValue = nativeToScVal(500_000n, { type: "i128" });
+
+    // Poison event with value that makes scValToNative throw
+    const badValue = {
+      toXDR: () => "cG9pc29uLXhkcg==",
+      get type(): never {
+        throw new Error("unsupported ScVal type");
+      },
+    } as any;
+
+    const warnSpy = vi.fn();
+    const mockLogger = {
+      warn: warnSpy,
+      info: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const getEvents = vi.fn().mockResolvedValue({
+      latestLedger: 5010,
+      events: [
+        {
+          id: "0000005001-0000000001",
+          ledger: 5001,
+          txHash: "hash-bad",
+          contractId: "CCONTRACT1",
+          topic: [nativeToScVal("unknown_type", { type: "symbol" })],
+          value: badValue,
+        },
+        {
+          id: "0000005001-0000000002",
+          ledger: 5001,
+          txHash: "hash-good",
+          contractId: "CCONTRACT1",
+          topic: goodTopic,
+          value: goodValue,
+        },
+      ],
+    });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["CCONTRACT1"], mockLogger);
+
+    expect(result.insertedCount).toBe(2);
+    expect(inserted).toHaveLength(2);
+
+    // First event is stored as undecodable
+    const badRow = inserted[0];
+    expect(badRow.eventId).toBe("0000005001-0000000001");
+    expect(badRow.ledger).toBe(5001);
+    expect(badRow.topic).toBe("undecodable");
+    expect(badRow.data).toMatchObject({
+      raw: "cG9pc29uLXhkcg==",
+    });
+    expect(badRow.data.error).toBeDefined();
+
+    // Logger warned with eventId and ledger
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: "0000005001-0000000001",
+        ledger: 5001,
+      }),
+      expect.stringContaining("undecodable event"),
+    );
+
+    // Second event was NOT blocked and decoded properly
+    const goodRow = inserted[1];
+    expect(goodRow.eventId).toBe("0000005001-0000000002");
+    expect(goodRow.ledger).toBe(5001);
+    expect(goodRow.topic).toBe("draw");
+    expect(goodRow.data).toMatchObject({
+      value: "500000",
+    });
+  });
 });
 
 describe("withRetry", () => {

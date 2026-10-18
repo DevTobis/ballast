@@ -6,9 +6,17 @@
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { schema, type Database } from "@ballast/db";
 import { sql } from "drizzle-orm";
-import { createConsoleMetricsSink } from "@ballast/observability";
+import { createLogger, createConsoleMetricsSink } from "@ballast/observability";
 import type { RpcClient } from "./rpc.js";
 
+export interface IndexerLogger {
+  warn(obj: Record<string, unknown>, msg?: string): void;
+  info?(obj: Record<string, unknown>, msg?: string): void;
+  error?(obj: Record<string, unknown>, msg?: string): void;
+  debug?(obj: Record<string, unknown>, msg?: string): void;
+}
+
+const defaultLogger = createLogger("indexer");
 const metrics = createConsoleMetricsSink("indexer");
 
 /** How many ledgers to look back on a cold start (no rows in `chain_event` yet). */
@@ -61,6 +69,7 @@ export async function pollOnce(
   db: Database,
   rpcServer: RpcClient,
   contractIds: string[],
+  logger: IndexerLogger = defaultLogger,
 ): Promise<PollOnceResult> {
   const lastIngested = await getLastIngestedLedger(db);
 
@@ -90,19 +99,56 @@ export async function pollOnce(
   }
 
   if (events.length > 0) {
-    await db.insert(schema.chainEvent).values(
-      events.map((event) => ({
-        eventId: event.id ?? null,
-        ledger: event.ledger,
-        txHash: event.txHash,
-        contract: event.contractId,
-        topic: decodeTopicName(event.topic),
-        data: toJsonSafe({
-          topics: event.topic.slice(1).map((t) => scValToNative(t)),
-          value: scValToNative(event.value),
-        }),
-      })),
-    ).onConflictDoNothing();
+    const rows = events.map((event) => {
+      try {
+        return {
+          eventId: event.id ?? null,
+          ledger: event.ledger,
+          txHash: event.txHash,
+          contract: event.contractId,
+          topic: decodeTopicName(event.topic),
+          data: toJsonSafe({
+            topics: event.topic.slice(1).map((t) => scValToNative(t)),
+            value: scValToNative(event.value),
+          }),
+        };
+      } catch (err) {
+        let raw = "";
+        try {
+          if (typeof (event as any).rawXdr === "string") {
+            raw = (event as any).rawXdr;
+          } else if (typeof (event.value as any)?.toXDR === "function") {
+            raw = (event.value as any).toXDR("base64");
+          } else if (typeof (event as any).raw === "string") {
+            raw = (event as any).raw;
+          } else {
+            raw = String(event.value);
+          }
+        } catch {
+          raw = String(event.value);
+        }
+
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          { eventId: event.id, ledger: event.ledger, err },
+          `indexer: undecodable event at ledger ${event.ledger} (id ${event.id}): ${errorMessage}`,
+        );
+
+        return {
+          eventId: event.id ?? null,
+          ledger: event.ledger,
+          txHash: event.txHash,
+          contract: event.contractId,
+          topic: "undecodable",
+          data: {
+            error: errorMessage,
+            raw,
+          },
+        };
+      }
+    });
+
+    await db.insert(schema.chainEvent).values(rows).onConflictDoNothing();
   }
 
   metrics.increment("indexer.events_ingested", { count: String(events.length) });
