@@ -84,13 +84,43 @@ pub fn require_admin_or_keeper(env: &Env, caller: &Address) -> Address {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{
-        testutils::{Address as _, MockAuth, MockAuthInvoke},
-        IntoVal,
-    };
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _};
 
-    fn setup() -> (Env, Roles) {
+    /// Exposes each helper as an entry point so its auth check runs inside a real invocation.
+    #[contract]
+    struct Probe;
+
+    #[contractimpl]
+    impl Probe {
+        pub fn set(env: Env, roles: Roles) {
+            write_roles(&env, &roles);
+        }
+        pub fn req_admin(env: Env) -> Address {
+            require_admin(&env)
+        }
+        pub fn req_pauser(env: Env) -> Address {
+            require_pauser(&env)
+        }
+        pub fn req_keeper(env: Env) -> Address {
+            require_keeper(&env)
+        }
+        pub fn req_price_publisher(env: Env) -> Address {
+            require_price_publisher(&env)
+        }
+        pub fn req_risk(env: Env) -> Address {
+            require_risk(&env)
+        }
+    }
+
+    /// Runs `call` against five distinct stored roles and asserts the helper returned the role
+    /// picked by `pick` and demanded authorisation from that address and no other. Under
+    /// `mock_all_auths` a helper reading the wrong field (say `require_keeper` reading
+    /// `roles.admin`) would still succeed, but the recorded authorisation would name the wrong
+    /// address, so any signer other than the stored role could not satisfy the check.
+    fn requires_only(pick: impl Fn(&Roles) -> Address, call: impl Fn(&ProbeClient) -> Address) {
         let env = Env::default();
+        env.mock_all_auths();
+        let client = ProbeClient::new(&env, &env.register(Probe, ()));
         let roles = Roles {
             admin: Address::generate(&env),
             pauser: Address::generate(&env),
@@ -98,254 +128,39 @@ mod test {
             price_publisher: Address::generate(&env),
             risk: Address::generate(&env),
         };
-        write_roles(&env, &roles);
-        (env, roles)
-    }
+        client.set(&roles);
 
-    fn mock_only(env: &Env, signer: &Address, fname: &str) {
-        env.mock_auths(&[MockAuth {
-            address: signer,
-            invoke: &MockAuthInvoke {
-                contract: &env.current_contract_address(),
-                fn_name: fname,
-                args: ().into_val(env),
-                sub_invokes: &[],
-            },
-        }]);
+        let returned = call(&client);
+
+        let expected = pick(&roles);
+        assert_eq!(returned, expected, "must return the stored role address");
+        let signers: std::vec::Vec<Address> =
+            env.auths().into_iter().map(|(address, _)| address).collect();
+        assert_eq!(signers, [expected], "must require auth from the stored role only");
     }
 
     #[test]
-    fn require_admin_succeeds_for_admin() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.admin, "require_admin");
-        assert_eq!(require_admin(&env), roles.admin);
+    fn require_admin_requires_only_the_admin() {
+        requires_only(|r| r.admin.clone(), |c| c.req_admin());
     }
 
     #[test]
-    fn require_admin_rejects_pauser() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.pauser, "require_admin");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_admin(&env)
-        }))
-        .is_err());
+    fn require_pauser_requires_only_the_pauser() {
+        requires_only(|r| r.pauser.clone(), |c| c.req_pauser());
     }
 
     #[test]
-    fn require_admin_rejects_keeper() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.keeper, "require_admin");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_admin(&env)
-        }))
-        .is_err());
+    fn require_keeper_requires_only_the_keeper() {
+        requires_only(|r| r.keeper.clone(), |c| c.req_keeper());
     }
 
     #[test]
-    fn require_admin_rejects_price_publisher() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.price_publisher, "require_admin");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_admin(&env)
-        }))
-        .is_err());
+    fn require_price_publisher_requires_only_the_price_publisher() {
+        requires_only(|r| r.price_publisher.clone(), |c| c.req_price_publisher());
     }
 
     #[test]
-    fn require_admin_rejects_risk() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.risk, "require_admin");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_admin(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_pauser_succeeds_for_pauser() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.pauser, "require_pauser");
-        assert_eq!(require_pauser(&env), roles.pauser);
-    }
-
-    #[test]
-    fn require_pauser_rejects_admin() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.admin, "require_pauser");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_pauser(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_pauser_rejects_keeper() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.keeper, "require_pauser");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_pauser(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_pauser_rejects_price_publisher() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.price_publisher, "require_pauser");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_pauser(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_pauser_rejects_risk() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.risk, "require_pauser");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_pauser(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_keeper_succeeds_for_keeper() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.keeper, "require_keeper");
-        assert_eq!(require_keeper(&env), roles.keeper);
-    }
-
-    #[test]
-    fn require_keeper_rejects_admin() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.admin, "require_keeper");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_keeper(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_keeper_rejects_pauser() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.pauser, "require_keeper");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_keeper(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_keeper_rejects_price_publisher() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.price_publisher, "require_keeper");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_keeper(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_keeper_rejects_risk() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.risk, "require_keeper");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_keeper(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_price_publisher_succeeds_for_price_publisher() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.price_publisher, "require_price_publisher");
-        assert_eq!(require_price_publisher(&env), roles.price_publisher);
-    }
-
-    #[test]
-    fn require_price_publisher_rejects_admin() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.admin, "require_price_publisher");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_price_publisher(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_price_publisher_rejects_pauser() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.pauser, "require_price_publisher");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_price_publisher(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_price_publisher_rejects_keeper() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.keeper, "require_price_publisher");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_price_publisher(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_price_publisher_rejects_risk() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.risk, "require_price_publisher");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_price_publisher(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_risk_succeeds_for_risk() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.risk, "require_risk");
-        assert_eq!(require_risk(&env), roles.risk);
-    }
-
-    #[test]
-    fn require_risk_rejects_admin() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.admin, "require_risk");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_risk(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_risk_rejects_pauser() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.pauser, "require_risk");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_risk(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_risk_rejects_keeper() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.keeper, "require_risk");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_risk(&env)
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn require_risk_rejects_price_publisher() {
-        let (env, roles) = setup();
-        mock_only(&env, &roles.price_publisher, "require_risk");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            require_risk(&env)
-        }))
-        .is_err());
+    fn require_risk_requires_only_the_risk_role() {
+        requires_only(|r| r.risk.clone(), |c| c.req_risk());
     }
 }
