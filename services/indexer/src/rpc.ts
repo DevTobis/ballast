@@ -26,6 +26,7 @@ export interface RawChainEvent {
 export interface GetEventsResult {
   events: RawChainEvent[];
   latestLedger: number;
+  oldestLedger?: number;
 }
 
 export interface RpcClient {
@@ -84,6 +85,7 @@ export function createRpcClient(rpcUrl: string): RpcClient {
 
       return {
         latestLedger: response.latestLedger,
+        oldestLedger: response.oldestLedger,
         events: response.events.map((e) => ({
           id: e.id,
           ledger: e.ledger,

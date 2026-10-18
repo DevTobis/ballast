@@ -32,7 +32,8 @@ export type AlertKind =
   | "keeper_balance_low"
   | "operator_balance_low"
   | "reconciliation_break"
-  | "rpc_lag_high";
+  | "rpc_lag_high"
+  | "indexer_gap";
 
 export interface Alerter {
   fire(kind: AlertKind, context: Record<string, unknown>): void;
@@ -71,7 +72,13 @@ export function createAlerter(service: string, options: AlerterOptions = {}): Al
 
       // The subject is whichever identifier the alert names; alerts about different assets or
       // lines must not suppress each other.
-      const subject = String(context.assetId ?? context.code ?? context.creditLineId ?? context.line ?? "");
+      const subject = String(
+        context.assetId ??
+          context.code ??
+          context.creditLineId ??
+          context.line ??
+          (context.fromLedger !== undefined && context.toLedger !== undefined ? `${context.fromLedger}-${context.toLedger}` : "")
+      );
       const key = `${kind}:${subject}`;
       const at = now();
       const previous = lastSent.get(key);
