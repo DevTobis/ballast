@@ -144,6 +144,10 @@ pub struct Line {
     /// `#[contracttype]` derive doesn't play well with `Option<CustomStruct>` fields.
     pub breach_ledger: Option<u32>,
     pub breach_ltv_bps: u32,
+    /// The ledger timestamp (seconds) when the line first entered an unhealthy margin state
+    /// (`MarginCall` or `Liquidation`). Recorded on first unhealthy observation and unchanged while
+    /// remaining unhealthy; cleared when the line recovers to `Healthy` or `Warning`.
+    pub unhealthy_since: Option<u64>,
 }
 
 #[contracttype]
@@ -322,6 +326,7 @@ impl CreditLine {
                 margin_state: MarginState::Healthy,
                 breach_ledger: None,
                 breach_ltv_bps: 0,
+                unhealthy_since: None,
             },
         );
         id
@@ -514,6 +519,14 @@ impl CreditLine {
         let view = compute_ltv(&env, &state);
         state.margin_state = view.state.clone();
 
+        if matches!(view.state, MarginState::MarginCall | MarginState::Liquidation) {
+            if state.unhealthy_since.is_none() {
+                state.unhealthy_since = Some(env.ledger().timestamp());
+            }
+        } else {
+            state.unhealthy_since = None;
+        }
+
         if matches!(view.state, MarginState::Liquidation)
             && matches!(view.price_status, PriceStatus::Ok)
         {
@@ -628,6 +641,7 @@ impl CreditLine {
         state.margin_state = MarginState::Healthy;
         state.breach_ledger = None;
         state.breach_ltv_bps = 0;
+        state.unhealthy_since = None;
         state.status = LineStatus::Closed;
         write_line(&env, line, &state);
 
@@ -1113,6 +1127,70 @@ mod test {
         h.env.ledger().set_sequence_number(h.env.ledger().sequence() + 2);
         h.credit_line.liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
         assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
+    }
+
+    #[test]
+    fn unhealthy_since_records_timestamp_on_unhealthy_and_clears_on_recovery() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        // Debt = 600 against 1,000 collateral -> 6,000 bps (Healthy: <7000).
+        h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        // At t=1000, price drops to $0.80 -> Debt = 600 against 800 collateral -> 7,500 bps (Warning: 7000-8000).
+        // unhealthy_since remains None.
+        h.env.ledger().set_timestamp(1_000);
+        h.price_guard.set_price(&(80 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::Warning);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, None);
+
+        // Price drops to $0.72 -> Debt = 600 against 720 collateral -> 8,333 bps (MarginCall: 8000-9000).
+        // At t=2000, first time unhealthy -> unhealthy_since set to Some(2000).
+        h.env.ledger().set_timestamp(2_000);
+        h.price_guard.set_price(&(72 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::MarginCall);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, Some(2_000));
+
+        // At t=3000, still in MarginCall -> unhealthy_since stays unchanged at 2000.
+        h.env.ledger().set_timestamp(3_000);
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::MarginCall);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, Some(2_000));
+
+        // Price drops further to $0.64 -> 600 / 640 = 9,375 bps (Liquidation: >=9000).
+        // At t=4000, in Liquidation -> unhealthy_since still anchored at original 2000.
+        h.env.ledger().set_timestamp(4_000);
+        h.price_guard.set_price(&(64 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::Liquidation);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, Some(2_000));
+
+        // Partial repayment brings debt down to 400 against 640 collateral -> 6,250 bps (Healthy: <7000).
+        // At t=5000, healthy recovery -> unhealthy_since cleared to None.
+        h.env.ledger().set_timestamp(5_000);
+        h.token.mint(&h.borrower, &(200 * PRICE_SCALE));
+        h.credit_line.repay(&h.borrower, &id, &(200 * PRICE_SCALE));
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::Healthy);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, None);
+
+        // Price drops again to $0.40 -> 400 / 400 = 10,000 bps (Liquidation).
+        // At t=6000, new breach -> unhealthy_since recorded anew as Some(6000).
+        h.env.ledger().set_timestamp(6_000);
+        h.price_guard.set_price(&(40 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::Liquidation);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, Some(6_000));
+
+        // Price recovers to $0.55 -> 400 / 550 = 7,272 bps (Warning).
+        // Warning is also healthy enough to clear the cure clock.
+        h.env.ledger().set_timestamp(7_000);
+        h.price_guard.set_price(&(55 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        let state = h.credit_line.poke(&id);
+        assert_eq!(state, MarginState::Warning);
+        assert_eq!(h.credit_line.line(&id).unhealthy_since, None);
     }
 
     #[test]
