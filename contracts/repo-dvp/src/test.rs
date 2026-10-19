@@ -796,4 +796,122 @@ mod sac {
         h.env.ledger().set_sequence_number(expected_expiry + 1);
         assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
     }
+
+    // ── #29: the borrower's leg-2 allowance must survive a second settle ────
+
+    fn settle_new_trade(h: &Harness, cash_amount: i128, maturity: u64) -> u64 {
+        let units = 100 * PRICE_SCALE;
+        let id = propose(h, units, cash_amount, 500, maturity);
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+        id
+    }
+
+    /// The reproduction from the issue: before the additive allowance, trade 2's
+    /// settle replaced the borrower's allowance with its own smaller due, and the
+    /// keeper's `unwind(1)` failed on `transfer_from`.
+    #[test]
+    fn two_settled_trades_by_one_borrower_both_unwind_by_the_keeper() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let first = settle_new_trade(&h, 90 * PRICE_SCALE, maturity);
+        let second = settle_new_trade(&h, 50 * PRICE_SCALE, maturity);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let due_first = total_due(&repo.trade(&first), repo.trade(&first).settled_at.unwrap());
+        let due_second = total_due(&repo.trade(&second), repo.trade(&second).settled_at.unwrap());
+        // Both settles happened in the same ledger as their proposals, so the
+        // approved ceilings equal the actual dues and the sum is exact.
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_borrower, &h.repo),
+            due_first + due_second
+        );
+
+        // Fund the interest the borrower owes on top of the returned principal.
+        MockTokenClient::new(&h.env, &h.usdc).mint(
+            &h.cash_borrower,
+            &(due_first + due_second - 90 * PRICE_SCALE - 50 * PRICE_SCALE),
+        );
+        h.env.ledger().set_timestamp(maturity);
+
+        // The keeper, not the borrower, unwinds both — each spends its own share
+        // of the summed allowance.
+        repo.unwind(&h.keeper, &first);
+        repo.unwind(&h.keeper, &second);
+        assert_eq!(repo.trade(&first).status, RepoStatus::Unwound);
+        assert_eq!(repo.trade(&second).status, RepoStatus::Unwound);
+
+        // Residual allowance after the last close is zero.
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_borrower, &h.repo),
+            0
+        );
+    }
+
+    #[test]
+    fn later_unwind_order_also_works_when_the_later_trade_has_the_smaller_due() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        // Reverse sizes relative to the test above, and unwind in reverse order.
+        let big = settle_new_trade(&h, 50 * PRICE_SCALE, maturity);
+        let small = settle_new_trade(&h, 90 * PRICE_SCALE, maturity);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let due_total = total_due(&repo.trade(&big), repo.trade(&big).settled_at.unwrap())
+            + total_due(&repo.trade(&small), repo.trade(&small).settled_at.unwrap());
+        MockTokenClient::new(&h.env, &h.usdc)
+            .mint(&h.cash_borrower, &(due_total - 140 * PRICE_SCALE));
+        h.env.ledger().set_timestamp(maturity);
+
+        repo.unwind(&h.keeper, &small);
+        repo.unwind(&h.keeper, &big);
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_borrower, &h.repo),
+            0
+        );
+    }
+
+    #[test]
+    fn a_default_releases_its_share_so_the_next_settle_approves_the_accurate_sum() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 7 * 86_400;
+        let defaulted = settle_new_trade(&h, 90 * PRICE_SCALE, maturity);
+
+        // Crash the price, open the call, let the cure window lapse, default.
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        repo.call_margin(&h.keeper, &defaulted);
+        let deadline = repo.trade(&defaulted).cure_deadline.unwrap();
+        h.env.ledger().set_timestamp(deadline + 1);
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        repo.default_close(&h.keeper, &defaulted);
+        assert_eq!(repo.trade(&defaulted).status, RepoStatus::Defaulted);
+
+        // The defaulted trade's share left the tracked sum, so the next settle
+        // approves exactly its own due — not the stale sum.
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &PRICE_SCALE,
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        let next_maturity = h.env.ledger().timestamp() + 3_600;
+        let next = settle_new_trade(&h, 40 * PRICE_SCALE, next_maturity);
+        let next_trade = repo.trade(&next);
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_borrower, &h.repo),
+            total_due(&next_trade, next_trade.settled_at.unwrap())
+        );
+    }
 }

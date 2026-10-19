@@ -105,6 +105,15 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
   `propose` replaces the first one's allowance.
+- **Borrower leg-2 allowance is additive.** A SEP-41 `approve` replaces the (owner, spender)
+  allowance, and a borrower may hold several settled trades, so `accept_and_settle` approves the
+  sum of the borrower's outstanding leg-2 due ceilings (tracked in contract storage, added on
+  settle, released on `unwind`/`default_close`), with the expiry never shortened below what an
+  earlier trade still needs. Consequences an auditor should know: each ceiling is sized at
+  `proposed_at`, so a trade settled later than proposed leaves a small unconsumed residue in the
+  live allowance until the next settle re-approves the accurate sum or the allowance expires; a
+  defaulted trade's whole unconsumed share behaves the same way, because shrinking the live
+  allowance would need the borrower's own signature.
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not

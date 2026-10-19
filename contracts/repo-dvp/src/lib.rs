@@ -41,6 +41,15 @@
 //! One live proposal per (lender, token) at a time: an allowance is a single number per
 //! owner/spender pair, so a lender's second `propose` replaces the first one's allowance.
 //!
+//! The borrower side has the same replace semantics but a different answer: a borrower may have
+//! several settled trades at once, and each one's keeper/lender `unwind` must stay collectable.
+//! `accept_and_settle` therefore approves the **sum** of the borrower's outstanding leg-2 due
+//! ceilings (tracked per borrower in contract storage, added on settle, released on
+//! `unwind`/`default_close`), with the allowance expiry never shortened below what an
+//! earlier-settled trade still needs. A non-borrower `unwind` consumes its own trade's share of
+//! that sum via `transfer_from`; a defaulted trade's unconsumed share stays in the live
+//! allowance only until the next settle re-approves the accurate sum or the allowance expires.
+//!
 //! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
 //! `default_close` gives the cash lender full title to the pledged RWA units and closes the
 //! trade. It does **not** attempt to net the collateral's current market value against the
@@ -166,6 +175,16 @@ enum DataKey {
     AssetConfig(Address),
     Trade(u64),
     CureGrace,
+    /// Sum of the leg-2 due ceilings of a borrower's live settled trades. A
+    /// SEP-41 `approve` replaces the (owner, spender) allowance, so each settle
+    /// approves this sum rather than its own trade's figure — otherwise a
+    /// second settled trade would overwrite the first one's allowance and break
+    /// every non-borrower `unwind` of it.
+    BorrowerDue(Address),
+    /// The furthest allowance expiry granted for [`DataKey::BorrowerDue`], so a
+    /// later-settling, earlier-maturing trade can never shorten the window an
+    /// earlier trade's keeper unwind still needs.
+    BorrowerDueExpiry(Address),
 }
 
 /// The cure window a margin call opens with: the admin's setting, else the 24h default.
@@ -227,6 +246,50 @@ fn total_due(trade: &RepoTrade, settled_at: u64) -> i128 {
 /// straight from the current ledger would come out different when the transaction actually
 /// executes a ledger or two later, and the host would reject the `approve` as unauthorized.
 /// Bucketing makes simulation and execution agree unless a bucket boundary falls between them.
+fn read_borrower_due(env: &Env, borrower: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BorrowerDue(borrower.clone()))
+        .unwrap_or(0)
+}
+
+fn read_borrower_due_expiry(env: &Env, borrower: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BorrowerDueExpiry(borrower.clone()))
+        .unwrap_or(0)
+}
+
+fn write_borrower_due(env: &Env, borrower: &Address, due: i128, expiry: u32) {
+    if due > 0 {
+        env.storage()
+            .persistent()
+            .set(&DataKey::BorrowerDue(borrower.clone()), &due);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BorrowerDueExpiry(borrower.clone()), &expiry);
+    } else {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BorrowerDue(borrower.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BorrowerDueExpiry(borrower.clone()));
+    }
+}
+
+/// Takes a closed trade's ceiling back out of the borrower's outstanding leg-2
+/// sum. The live token allowance is untouched — shrinking it would need the
+/// borrower's own signature — but a non-borrower `unwind` has already consumed
+/// this trade's share via `transfer_from`, and a default's unconsumed share is
+/// simply replaced by the next settle's accurate sum (or dies at expiry).
+fn release_borrower_due(env: &Env, trade: &RepoTrade) {
+    let ceiling = total_due(trade, trade.proposed_at);
+    let remaining = (read_borrower_due(env, &trade.cash_borrower) - ceiling).max(0);
+    let expiry = read_borrower_due_expiry(env, &trade.cash_borrower);
+    write_borrower_due(env, &trade.cash_borrower, remaining, expiry);
+}
+
 fn allowance_expiry(env: &Env, seconds_ahead: u64, grace_ledgers: u32) -> u32 {
     let ledgers_ahead = (seconds_ahead / SECONDS_PER_LEDGER).min(u32::MAX as u64) as u32;
     let sequence = env.ledger().sequence();
@@ -463,17 +526,29 @@ impl RepoDvp {
         // doesn't depend on which ledger this call executes in. It's an argument to a nested
         // authorized call, so it has to come out the same at simulation and at execution — see
         // `allowance_expiry`.
+        // Additive across the borrower's settled trades: `approve` replaces the
+        // (owner, spender) allowance, so approving only this trade's ceiling
+        // would strand every earlier settled trade's keeper/lender `unwind`
+        // behind an allowance that is now too small. The sum is tracked in
+        // [`DataKey::BorrowerDue`]; each non-borrower `unwind` consumes its own
+        // trade's share out of it via `transfer_from`.
         let now = env.ledger().timestamp();
+        let outstanding = read_borrower_due(&env, &cash_borrower)
+            .checked_add(total_due(&trade, trade.proposed_at))
+            .expect("repo-dvp: overflow summing the borrower's leg-2 due");
+        let expiry = allowance_expiry(
+            &env,
+            trade.maturity_at.saturating_sub(now),
+            UNWIND_ALLOWANCE_GRACE_LEDGERS,
+        )
+        .max(read_borrower_due_expiry(&env, &cash_borrower));
         usdc_client.approve(
             &cash_borrower,
             &env.current_contract_address(),
-            &total_due(&trade, trade.proposed_at),
-            &allowance_expiry(
-                &env,
-                trade.maturity_at.saturating_sub(now),
-                UNWIND_ALLOWANCE_GRACE_LEDGERS,
-            ),
+            &outstanding,
+            &expiry,
         );
+        write_borrower_due(&env, &cash_borrower, outstanding, expiry);
 
         trade.status = RepoStatus::Settled;
         trade.leg1_ledger = Some(env.ledger().sequence());
@@ -535,6 +610,7 @@ impl RepoDvp {
 
         trade.status = RepoStatus::Unwound;
         write_trade(&env, &trade);
+        release_borrower_due(&env, &trade);
 
         env.events()
             .publish((symbol_short!("unwind"), id), total_due);
@@ -699,6 +775,7 @@ impl RepoDvp {
 
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
+        release_borrower_due(&env, &trade);
 
         env.events()
             .publish((symbol_short!("default"), id), (lender_units, borrower_units));
