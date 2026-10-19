@@ -11,6 +11,7 @@ build/
 
 # Rust
 /target/
+temp_auto_push.bat
 contracts/**/target/
 contracts/**/test_snapshots/
 
@@ -19,9 +20,10 @@ contracts/**/test_snapshots/
 !vendor/**/*.wasm
 
 # Editors / OS
-.vscode/
 .idea/
 .DS_Store
 
 # Local data
 .pgdata/
+.gitignore
+branch_structure.json
