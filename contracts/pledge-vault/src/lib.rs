@@ -48,7 +48,7 @@ use ballast_common::{
     margin::{self, MarginState, MarginThresholds},
     pause::{self, PauseScope},
     price::{GuardedPrice, PriceStatus},
-    risk,
+    risk, ttl,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, token, Address, Bytes, Env, MuxedAddress,
@@ -139,10 +139,25 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
         .expect("pledge-vault: asset not configured")
 }
 
+/// Archival behaviour, confirmed against this soroban-sdk's test host in
+/// `an_expired_position_is_auto_restored_on_access` below: an entry aged past
+/// its `live_until` is transparently **auto-restored on access** (protocol 23
+/// semantics) and reads its original value — it does NOT fall into this
+/// `unwrap_or`, so the `units: 0` default genuinely means "never written".
+/// The TTL extensions on every read and write below still matter: on the
+/// network an auto-restore silently inflates the touching transaction's fee
+/// and write footprint, and an entry evicted off the live bucket list needs
+/// an explicit restore a wallet flow may not provide — a kept-alive position
+/// never puts a `release` behind either surprise.
 fn read_position(env: &Env, line: u64, asset: &Address) -> Position {
+    let key = DataKey::Position(line, asset.clone());
+    if env.storage().persistent().has(&key) {
+        // Reading is a liveness signal: every touch pushes archival ~30 days out.
+        ttl::extend_persistent(env, &key);
+    }
     env.storage()
         .persistent()
-        .get(&DataKey::Position(line, asset.clone()))
+        .get(&key)
         .unwrap_or(Position {
             units: 0,
             pending_lien_units: 0,
@@ -152,9 +167,10 @@ fn read_position(env: &Env, line: u64, asset: &Address) -> Position {
 }
 
 fn write_position(env: &Env, line: u64, asset: &Address, position: &Position) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::Position(line, asset.clone()), position);
+    let key = DataKey::Position(line, asset.clone());
+    env.storage().persistent().set(&key, position);
+    // `set()` does not move the expiration ledger; extend explicitly on every write.
+    ttl::extend_persistent(env, &key);
 }
 
 /// Reports the position's counted units to the line in the same transaction, so `CreditLine`'s
@@ -182,6 +198,7 @@ impl PledgeVault {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("pledge-vault: already initialized");
         }
@@ -215,6 +232,7 @@ impl PledgeVault {
     ) {
         let _ = admin;
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
             &AssetConfig {
@@ -231,6 +249,7 @@ impl PledgeVault {
     pub fn set_gateway(env: Env, admin: Address, gateway: Address) {
         let _ = admin;
         access::require_admin(&env);
+        ttl::extend_instance(&env);
         env.storage().instance().set(&DataKey::Gateway, &gateway);
     }
 
@@ -251,6 +270,7 @@ impl PledgeVault {
     /// a per-call choice).
     pub fn pledge(env: Env, borrower: Address, line: u64, asset: Address, units: i128) {
         borrower.require_auth();
+        ttl::extend_instance(&env);
         pause::require_not_paused(&env, &PauseScope::Pledges);
         assert!(units > 0, "pledge-vault: units must be positive");
 
@@ -307,6 +327,7 @@ impl PledgeVault {
     /// since the health check that follows validates the *line's* LTV, not who's asking.
     pub fn release(env: Env, borrower: Address, line: u64, asset: Address, units: i128) {
         borrower.require_auth();
+        ttl::extend_instance(&env);
         assert!(units > 0, "pledge-vault: units must be positive");
 
         let config = read_asset_config(&env, &asset);
@@ -371,6 +392,7 @@ impl PledgeVault {
         lien_ref: Bytes,
     ) {
         gateway.require_auth();
+        ttl::extend_instance(&env);
         let stored: Address = env
             .storage()
             .instance()
@@ -410,6 +432,7 @@ impl PledgeVault {
     ) {
         let _ = keeper;
         access::require_keeper(&env);
+        ttl::extend_instance(&env);
         assert!(units > 0, "pledge-vault: units must be positive");
 
         let mut position = read_position(&env, line, &asset);
@@ -433,7 +456,21 @@ impl PledgeVault {
 
     /// Read-only helper for consoles/tests: current pledged units for `(line, asset)`.
     pub fn position_units(env: Env, line: u64, asset: Address) -> i128 {
+        ttl::extend_instance(&env);
         read_position(&env, line, &asset).units
+    }
+
+    /// Permissionless keep-alive: anyone may pay to extend a live position's
+    /// TTL (and the instance's), so escrowed collateral can never be archived
+    /// out from under its owner by mere inactivity.
+    pub fn extend_ttl(env: Env, line: u64, asset: Address) {
+        ttl::extend_instance(&env);
+        let key = DataKey::Position(line, asset.clone());
+        assert!(
+            env.storage().persistent().has(&key),
+            "pledge-vault: no position to extend"
+        );
+        ttl::extend_persistent(&env, &key);
     }
 }
 
@@ -441,7 +478,7 @@ impl PledgeVault {
 mod test {
     use super::*;
     use ballast_common::{margin::MarginThresholds, price::PRICE_SCALE};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     // A minimal in-crate mock token implementing just `transfer`/`balance`/`mint`. Deploying a
     // real Stellar Asset Contract in a unit test (`Env::register_stellar_asset_contract_v2`)
@@ -837,5 +874,70 @@ mod test {
             &CustodyMode::IssuerLien,
         );
         h.vault.pledge(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+    }
+
+    // ── #24: positions must survive ledger aging ────────────────────────────
+
+    /// Ages the ledger past the default persistent TTL granted at write time.
+    /// Without the extensions on every write and read, the position entry (and
+    /// the instance) would be archived here, and the escrowed tokens would sit
+    /// behind a `release` that can no longer read how many units it may move.
+    #[test]
+    fn an_aged_position_still_reads_and_releases_correctly() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        // Advance well past the environment's default minimum persistent TTL
+        // (but inside the ~30-day extension the write granted).
+        let min_ttl = h.env.ledger().get().min_persistent_entry_ttl;
+        let aged = h.env.ledger().sequence() + min_ttl + 10;
+        h.env.ledger().set_sequence_number(aged);
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        h.vault.release(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 900 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 100 * PRICE_SCALE);
+    }
+
+    /// The public keep-alive, plus the archival behaviour documented on
+    /// `read_position`: a position aged past even its extended lifetime is
+    /// auto-restored on access and reads its original units, not the
+    /// `units: 0` default. Asserted so an SDK upgrade that changes these
+    /// semantics fails loudly instead of silently zeroing escrowed collateral.
+    #[test]
+    fn an_expired_position_is_auto_restored_on_access() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+
+        // Repeated keep-alives: age close to the extension target, extend, repeat.
+        for _ in 0..3 {
+            let near_target =
+                h.env.ledger().sequence() + ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS - 100;
+            h.env.ledger().set_sequence_number(near_target);
+            h.vault.extend_ttl(&1, &h.asset);
+        }
+        assert_eq!(h.vault.position_units(&1, &h.asset), 10 * PRICE_SCALE);
+
+        // Now let it lapse: past the last extension's target with no touch.
+        let lapsed =
+            h.env.ledger().sequence() + ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS + 10;
+        h.env.ledger().set_sequence_number(lapsed);
+        assert_eq!(
+            h.vault.position_units(&1, &h.asset),
+            10 * PRICE_SCALE,
+            "protocol-23 auto-restore must hand back the original position,              never the units:0 default"
+        );
+        // And a release still works against the restored position.
+        h.vault.release(&h.borrower, &1, &h.asset, &(1 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 9 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: no position to extend")]
+    fn extend_ttl_refuses_a_position_that_was_never_written() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.vault.extend_ttl(&42, &h.asset);
     }
 }
