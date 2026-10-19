@@ -99,6 +99,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   contract between transactions.
 - Quotes are the guarded price less the spread, rounded down (in the desk's favour), and refuse any
   price that is not `Ok`.
+- **Pause.** `pause(pauser, scope)` lets the pauser halt `PauseScope::Exits` or `PauseScope::All` immediately.
+  `exit` is the only gated path; `quote` and `withdraw` remain active while paused (invariant 5).
+  Unpausing requires a 48-hour timelock (`queue_unpause` / `execute_unpause`) by the admin.
+  Note for maintainers: `CreditLine` and `PledgeVault` follow this same localized instance-storage pause pattern
+  for `Draws` and `Pledges`.
 
 ## RepoDvP
 
