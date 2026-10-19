@@ -796,4 +796,59 @@ mod sac {
         h.env.ledger().set_sequence_number(expected_expiry + 1);
         assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
     }
+
+    // ── #31: no trade for an asset without margin parameters ────────────────
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: asset not configured")]
+    fn propose_panics_for_an_unconfigured_asset() {
+        let h = setup();
+        let unconfigured = h.env.register(MockToken, ());
+        RepoDvpClient::new(&h.env, &h.repo).propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &unconfigured,
+            &100,
+            &1_000,
+            &500u32,
+            &RepoKind::Intraday,
+            &(h.env.ledger().timestamp() + 3_600),
+            &hash(&h, 9),
+        );
+    }
+
+    #[test]
+    fn a_failed_propose_grants_no_leg1_allowance() {
+        let h = setup();
+        let unconfigured = h.env.register(MockToken, ());
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            RepoDvpClient::new(&h.env, &h.repo).propose(
+                &h.cash_lender,
+                &h.cash_borrower,
+                &unconfigured,
+                &100,
+                &1_000,
+                &500u32,
+                &RepoKind::Intraday,
+                &maturity,
+                &hash(&h, 9),
+            );
+        }));
+        assert!(result.is_err(), "propose must refuse the unconfigured asset");
+        // The config check runs before the leg-1 approve, so the lender's USDC
+        // allowance to the contract must still be zero.
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_lender, &h.repo),
+            0
+        );
+    }
+
+    #[test]
+    fn propose_still_works_for_a_configured_asset() {
+        let h = setup();
+        let id = propose(&h, 100, 1_000, 500, h.env.ledger().timestamp() + 3_600);
+        assert!(MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_lender, &h.repo) >= 1_000);
+        assert_eq!(RepoDvpClient::new(&h.env, &h.repo).trade(&id).status, RepoStatus::Proposed);
+    }
 }

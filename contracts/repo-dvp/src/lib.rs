@@ -384,6 +384,11 @@ impl RepoDvp {
         if maturity_at <= env.ledger().timestamp() {
             panic!("repo-dvp: maturity_at must be in the future");
         }
+        // Refuse before any allowance is granted: a trade in an asset that was never
+        // passed to `configure_asset` would settle leg 1 and then strand the lender
+        // with no margin protection — `call_margin` and `default_close` read this
+        // config and would revert until maturity.
+        read_asset_config(&env, &asset);
 
         // Pre-authorize leg 1 (see the module docs): the lender signs this call, not the
         // borrower's later `accept_and_settle`.
@@ -439,6 +444,9 @@ impl RepoDvp {
         if env.ledger().timestamp() >= trade.maturity_at {
             panic!("repo-dvp: proposal is past its maturity");
         }
+        // Belt and braces for proposals that predate the check in `propose`: never
+        // move either leg for an asset with no margin parameters.
+        read_asset_config(&env, &trade.asset);
 
         let asset_client = token::Client::new(&env, &trade.asset);
         asset_client.transfer(
