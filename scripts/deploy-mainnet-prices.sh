@@ -37,8 +37,36 @@ WINDOW_MOVE_BAND_BPS=${WINDOW_MOVE_BAND_BPS:-100}
 MAX_STALENESS_S=${MAX_STALENESS_S:-21600}
 HAIRCUT_BASE_BPS=${HAIRCUT_BASE_BPS:-500}
 
+usage() {
+  cat <<'EOT'
+Usage:
+  scripts/deploy-mainnet-prices.sh [--dry-run]
+  scripts/deploy-mainnet-prices.sh -h | --help
+
+Options:
+  --dry-run    Print every command and simulate execution without sending live transactions
+  -h, --help   Show this help message and exit
+EOT
+}
+
 DRY_RUN=false
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "!!! Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 log() { echo ">>> $*"; }
 
