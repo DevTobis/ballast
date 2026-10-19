@@ -93,6 +93,13 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
         .expect("exit-desk: asset not configured")
 }
 
+fn read_usdc(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::Usdc)
+        .expect("exit-desk: usdc not configured")
+}
+
 fn require_admin_is(env: &Env, admin: &Address) {
     let stored_admin = access::require_admin(env);
     assert_eq!(&stored_admin, admin, "exit-desk: admin argument mismatch");
@@ -198,19 +205,30 @@ impl ExitDesk {
         );
     }
 
+    /// Admin-set once; exit swaps pay out this token. See module docs for why this isn't
+    /// read from `Registry`.
+    pub fn set_usdc(env: Env, admin: Address, usdc: Address) {
+        require_admin_is(&env, &admin);
+        env.storage().instance().set(&DataKey::Usdc, &usdc);
+        env.events()
+            .publish((symbol_short!("set_usdc"), admin), usdc);
+    }
+
+    pub fn usdc(env: Env) -> Address {
+        read_usdc(&env)
+    }
+
     /// Simulates the Exit Facility topping up the desk: pulls `amount` of `usdc` from the caller
-    /// (admin or keeper) into this contract's float. Stores `usdc`'s address the first time it is
-    /// called; later calls must agree on the same token.
+    /// (admin or keeper) into this contract's float. Requires `set_usdc` to have been called first,
+    /// and the token argument must match the configured USDC token address.
     pub fn fund(env: Env, admin_or_keeper: Address, usdc: Address, amount: i128) {
         access::require_admin_or_keeper(&env, &admin_or_keeper);
         if amount <= 0 {
             panic!("exit-desk: amount must be positive");
         }
 
-        match env.storage().instance().get::<_, Address>(&DataKey::Usdc) {
-            Some(existing) => assert_eq!(existing, usdc, "exit-desk: usdc address mismatch"),
-            None => env.storage().instance().set(&DataKey::Usdc, &usdc),
-        }
+        let configured = read_usdc(&env);
+        assert_eq!(configured, usdc, "exit-desk: usdc address mismatch");
 
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(
@@ -313,11 +331,7 @@ impl ExitDesk {
         let rwa_client = token::Client::new(&env, &asset);
         rwa_client.transfer(&holder, to_muxed(&env.current_contract_address()), &units);
 
-        let usdc: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Usdc)
-            .expect("exit-desk: usdc not funded/configured yet");
+        let usdc = read_usdc(&env);
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(
             &env.current_contract_address(),

@@ -23,6 +23,10 @@ export class ExitDeskClient extends BaseContractClient {
     return this.read<OnChainExitQuote>("quote", [scAddress(assetAddress), scI128(units)]);
   }
 
+  setUsdc(admin: string, usdc: string): Promise<string> {
+    return this.invoke(admin, "set_usdc", [scAddress(admin), scAddress(usdc)]);
+  }
+
   exit(
     source: string,
     assetAddress: string,
