@@ -151,6 +151,7 @@ struct Harness {
     env: Env,
     repo: Address,
     admin: Address,
+    pauser: Address,
     keeper: Address,
     price_guard: Address,
     rwa: Address,
@@ -206,6 +207,7 @@ fn setup() -> Harness {
         env,
         repo,
         admin,
+        pauser,
         keeper,
         price_guard,
         rwa,
@@ -647,6 +649,7 @@ mod sac {
             env,
             repo,
             admin,
+            pauser,
             keeper,
             price_guard,
             rwa,
@@ -795,5 +798,149 @@ mod sac {
         // One ledger past expiry, SAC treats it as 0.
         h.env.ledger().set_sequence_number(expected_expiry + 1);
         assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
+    }
+
+    // ── #32: the Repos pause scope has a writer and a timelocked unpause ────
+
+    fn settled_trade(h: &Harness) -> u64 {
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 90 * PRICE_SCALE;
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let id = propose(h, units, cash_amount, 500, maturity);
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+        id
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pausing_repos_stops_accept_and_settle() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let id = propose(&h, 100, 1_000, 500, maturity);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        assert!(RepoDvpClient::new(&h.env, &h.repo).is_paused(&PauseScope::Repos));
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pausing_all_stops_accept_and_settle_too() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let id = propose(&h, 100, 1_000, 500, maturity);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+    }
+
+    #[test]
+    fn unwind_still_works_while_paused() {
+        let h = setup();
+        let id = settled_trade(&h);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let due = total_due(&trade, trade.settled_at.unwrap());
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &(due - trade.cash_amount));
+        h.env.ledger().set_timestamp(trade.maturity_at);
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_lender, &id);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Unwound
+        );
+    }
+
+    #[test]
+    fn margin_cure_and_default_paths_still_work_while_paused() {
+        let h = setup();
+        let id = settled_trade(&h);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+
+        // Drop the price so the trade is in margin-call territory, then walk the
+        // whole enforcement path under a full pause: call, top up, and - after
+        // letting a second call's cure window lapse - default-close.
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        RepoDvpClient::new(&h.env, &h.repo).call_margin(&h.keeper, &id);
+        let called = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        assert!(called.pending_margin_call);
+
+        let extra_units = 500 * PRICE_SCALE;
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &extra_units);
+        RepoDvpClient::new(&h.env, &h.repo).top_up(&h.cash_borrower, &id, &extra_units);
+        assert!(!RepoDvpClient::new(&h.env, &h.repo).trade(&id).pending_margin_call);
+    }
+
+    #[test]
+    fn default_close_still_works_while_paused() {
+        let h = setup();
+        let id = settled_trade(&h);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        RepoDvpClient::new(&h.env, &h.repo).call_margin(&h.keeper, &id);
+        let called = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let deadline = called.cure_deadline.expect("margin call opens a cure window");
+
+        h.env.ledger().set_timestamp(deadline + 1);
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        RepoDvpClient::new(&h.env, &h.repo).default_close(&h.keeper, &id);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Defaulted
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: timelock has not elapsed")]
+    fn unpause_cannot_execute_before_the_timelock() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        let id = RepoDvpClient::new(&h.env, &h.repo).queue_unpause(&h.admin, &PauseScope::Repos);
+        RepoDvpClient::new(&h.env, &h.repo).execute_unpause(&id);
+    }
+
+    #[test]
+    fn executed_unpause_reopens_accept_and_settle_after_48h() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        let unpause = RepoDvpClient::new(&h.env, &h.repo).queue_unpause(&h.admin, &PauseScope::Repos);
+
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
+        RepoDvpClient::new(&h.env, &h.repo).execute_unpause(&unpause);
+        assert!(!RepoDvpClient::new(&h.env, &h.repo).is_paused(&PauseScope::Repos));
+
+        let id = settled_trade(&h);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Settled
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: no such pending unpause")]
+    fn a_cancelled_unpause_cannot_execute() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        let id = RepoDvpClient::new(&h.env, &h.repo).queue_unpause(&h.admin, &PauseScope::Repos);
+        RepoDvpClient::new(&h.env, &h.repo).cancel_unpause(&h.admin, &id);
+        RepoDvpClient::new(&h.env, &h.repo).execute_unpause(&id);
     }
 }
