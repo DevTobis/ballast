@@ -48,11 +48,15 @@ describe("runRepoUnwindJob", () => {
   it("unwinds a due repo trade, submits it, and updates status/leg2Tx on success", async () => {
     const trade = { id: "trade-uuid-1", contractTradeId: "123456789", status: "settled", maturityAt: new Date(Date.now() - 1000) };
     const db = makeDb([trade]);
-    const repoDvpClient = { unwind: vi.fn().mockResolvedValue("unsigned-xdr") };
+    const repoDvpClient = {
+      trade: vi.fn().mockResolvedValue({ status: "Settled" }),
+      unwind: vi.fn().mockResolvedValue("unsigned-xdr"),
+    };
     submitMock.mockResolvedValue({ hash: "hash-1", status: "SUCCESS" });
 
     const result = await runRepoUnwindJob(db, repoDvpClient as any, signer as any);
 
+    expect(repoDvpClient.trade).toHaveBeenCalledWith(123456789n);
     expect(repoDvpClient.unwind).toHaveBeenCalledWith("GKEEPER", 123456789n);
     expect(signer.sign).toHaveBeenCalledWith("unsigned-xdr");
     expect(submitMock).toHaveBeenCalledWith(
@@ -68,18 +72,55 @@ describe("runRepoUnwindJob", () => {
   it("skips (without erroring) a trade that has no on-chain trade id yet", async () => {
     const trade = { id: "trade-uuid-2", contractTradeId: null, status: "settled", maturityAt: new Date(Date.now() - 1000) };
     const db = makeDb([trade]);
-    const repoDvpClient = { unwind: vi.fn() };
+    const repoDvpClient = { trade: vi.fn(), unwind: vi.fn() };
 
     const result = await runRepoUnwindJob(db, repoDvpClient as any, signer as any);
 
+    expect(repoDvpClient.trade).not.toHaveBeenCalled();
     expect(repoDvpClient.unwind).not.toHaveBeenCalled();
+    expect(result).toEqual({ processed: 0, skipped: 1, errors: [] });
+  });
+
+  it("reconciles a settled trade that is Unwound on-chain to unwound without sending a transaction", async () => {
+    const trade = { id: "trade-uuid-3", contractTradeId: "987654321", status: "settled", maturityAt: new Date(Date.now() - 1000) };
+    const db = makeDb([trade]);
+    const repoDvpClient = {
+      trade: vi.fn().mockResolvedValue({ status: "Unwound" }),
+      unwind: vi.fn(),
+    };
+
+    const result = await runRepoUnwindJob(db, repoDvpClient as any, signer as any);
+
+    expect(repoDvpClient.trade).toHaveBeenCalledWith(987654321n);
+    expect(repoDvpClient.unwind).not.toHaveBeenCalled();
+    expect(submitMock).not.toHaveBeenCalled();
+    expect(db.update).toHaveBeenCalled();
+    expect(db.set).toHaveBeenCalledWith({ status: "unwound" });
+    expect(result).toEqual({ processed: 1, skipped: 0, errors: [] });
+  });
+
+  it("reconciles a settled trade that is Defaulted on-chain to defaulted without sending a transaction", async () => {
+    const trade = { id: "trade-uuid-4", contractTradeId: "555555", status: "settled", maturityAt: new Date(Date.now() - 1000) };
+    const db = makeDb([trade]);
+    const repoDvpClient = {
+      trade: vi.fn().mockResolvedValue({ status: "Defaulted" }),
+      unwind: vi.fn(),
+    };
+
+    const result = await runRepoUnwindJob(db, repoDvpClient as any, signer as any);
+
+    expect(repoDvpClient.trade).toHaveBeenCalledWith(555555n);
+    expect(repoDvpClient.unwind).not.toHaveBeenCalled();
+    expect(submitMock).not.toHaveBeenCalled();
+    expect(db.update).toHaveBeenCalled();
+    expect(db.set).toHaveBeenCalledWith({ status: "defaulted" });
     expect(result).toEqual({ processed: 0, skipped: 1, errors: [] });
   });
 
   it("records an error and keeps going when the client call fails", async () => {
     const trade = { id: "42", contractTradeId: "42", status: "settled", maturityAt: new Date(Date.now() - 1000) };
     const db = makeDb([trade]);
-    const repoDvpClient = { unwind: vi.fn().mockRejectedValue(new Error("rpc down")) };
+    const repoDvpClient = { trade: vi.fn().mockRejectedValue(new Error("rpc down")), unwind: vi.fn() };
 
     const result = await runRepoUnwindJob(db, repoDvpClient as any, signer as any);
 

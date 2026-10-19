@@ -36,6 +36,24 @@ export async function runRepoUnwindJob(
     }
 
     try {
+      const onChain = await repoDvpClient.trade(contractId);
+      if (onChain.status === "Unwound") {
+        await db
+          .update(schema.repoTrade)
+          .set({ status: "unwound" })
+          .where(eq(schema.repoTrade.id, trade.id));
+        result.processed++;
+        continue;
+      }
+      if (onChain.status === "Defaulted") {
+        await db
+          .update(schema.repoTrade)
+          .set({ status: "defaulted" })
+          .where(eq(schema.repoTrade.id, trade.id));
+        result.skipped++;
+        continue;
+      }
+
       const unsignedXdr = await repoDvpClient.unwind(signer.publicKey(), contractId);
       const signedXdr = await signer.sign(unsignedXdr);
       const network = loadNetworkConfig();
