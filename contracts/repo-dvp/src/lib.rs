@@ -350,6 +350,7 @@ impl RepoDvp {
             haircut_bps as i128 <= BPS_DENOMINATOR,
             "repo-dvp: haircut exceeds 100%"
         );
+        thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
             &RepoAssetConfig {

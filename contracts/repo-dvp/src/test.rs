@@ -590,6 +590,122 @@ fn the_cure_window_has_a_floor_and_only_the_admin_sets_it() {
     assert!(not_admin.is_err(), "only the admin may set it");
 }
 
+#[test]
+fn configure_asset_accepts_valid_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // Standard thresholds from configure-desks.sh
+    repo.configure_asset(
+        &h.admin,
+        &new_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+    );
+
+    // Equal boundaries are valid
+    repo.configure_asset(
+        &h.admin,
+        &new_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 8_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 8_000,
+        },
+    );
+}
+
+#[test]
+fn configure_asset_rejects_zero_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    let res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 0,
+                margin_call_bps: 0,
+                liquidation_bps: 0,
+            },
+        );
+    }));
+    assert!(res.is_err(), "zero thresholds must be rejected");
+}
+
+#[test]
+fn configure_asset_rejects_out_of_order_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // warning > margin_call
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 9_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_500,
+            },
+        );
+    }));
+    assert!(res1.is_err(), "warning > margin_call must be rejected");
+
+    // margin_call > liquidation
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_500,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "margin_call > liquidation must be rejected");
+}
+
+#[test]
+fn configure_asset_rejects_liquidation_exceeding_10000() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    let res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 10_001,
+            },
+        );
+    }));
+    assert!(res.is_err(), "liquidation > 10000 must be rejected");
+}
+
 mod sac {
     use super::*;
 
