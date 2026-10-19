@@ -95,6 +95,8 @@ pnpm --filter @ballast/db compliance kyb <partyId> approved <provider> <referenc
 pnpm --filter @ballast/db compliance clear <partyId> <reviewer> "reviewed: different entity, same name"
 ```
 
+A manual clear is persistent for the reviewed entity matches (`entNum`s). When screening re-runs after the 24-hour TTL (`SCREENING_TTL_MS`), previously reviewed and cleared matches do not re-hold the party, preventing false positives from recurring daily. If OFAC lists a new match under a different `entNum`, the party is held again for review.
+
 ## Amount and unit conventions
 
 Request amounts go through `bigintish` (string or number parsed to `BigInt`). Responses that touch
