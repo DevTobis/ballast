@@ -377,6 +377,135 @@ fn accept_and_settle_refuses_a_proposal_past_its_maturity() {
     );
 }
 
+#[test]
+fn lender_can_cancel_proposal_and_zeroes_allowance() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), cash_amount);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_lender, &id);
+
+    let trade = repo.trade(&id);
+    assert_eq!(trade.status, RepoStatus::Cancelled);
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), 0);
+
+    // Cancelled proposal cannot be accepted
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    let accept_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(accept_res.is_err(), "cancelled proposal cannot be accepted");
+}
+
+#[test]
+fn borrower_can_cancel_proposal() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_borrower, &id);
+
+    let trade = repo.trade(&id);
+    assert_eq!(trade.status, RepoStatus::Cancelled);
+
+    // Cancelled proposal cannot be accepted
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    let accept_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(accept_res.is_err(), "cancelled proposal cannot be accepted");
+}
+
+#[test]
+fn stranger_cannot_cancel_proposal() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let stranger = Address::generate(&h.env);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_proposal(&stranger, &id);
+    }));
+    assert!(result.is_err(), "stranger cannot cancel proposal");
+}
+
+#[test]
+fn double_cancel_is_rejected() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_lender, &id);
+
+    let second_cancel = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_proposal(&h.cash_lender, &id);
+    }));
+    assert!(second_cancel.is_err(), "cannot cancel already cancelled proposal");
+}
+
+#[test]
+fn cancel_after_settle_is_rejected() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    let cancel_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_proposal(&h.cash_lender, &id);
+    }));
+    assert!(cancel_res.is_err(), "cannot cancel settled trade");
+}
+
+#[test]
+fn cancelling_older_proposal_does_not_zero_latest_allowance() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_1 = 50 * PRICE_SCALE;
+    let cash_2 = 100 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    let id1 = propose(&h, units, cash_1, 500, maturity);
+    let id2 = propose(&h, units, cash_2, 500, maturity);
+
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), cash_2);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_lender, &id1);
+
+    assert_eq!(repo.trade(&id1).status, RepoStatus::Cancelled);
+    // Since id1 was not the latest proposal, the allowance for id2 was NOT zeroed
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), cash_2);
+
+    // Trade 2 can still be settled
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_2);
+    repo.accept_and_settle(&h.cash_borrower, &id2);
+    assert_eq!(repo.trade(&id2).status, RepoStatus::Settled);
+}
+
 /// The expiry handed to `approve` must not depend on which ledger the call lands in, or a
 /// transaction simulated in one ledger and executed in the next would fail authorization.
 #[test]

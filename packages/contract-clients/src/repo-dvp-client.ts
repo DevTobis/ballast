@@ -39,7 +39,7 @@ export interface OnChainRepoMargin {
 /** The parts of the on-chain `RepoTrade` the keeper reads. */
 export interface OnChainRepoTrade {
   units: bigint;
-  status: "Proposed" | "Settled" | "Unwound" | "Defaulted";
+  status: "Proposed" | "Settled" | "Unwound" | "Defaulted" | "Cancelled";
   pendingMarginCall: boolean;
   marginCallAmount: bigint;
   /** Unix seconds; unset while no call is open. */
@@ -59,6 +59,10 @@ export class RepoDvpClient extends BaseContractClient {
       scU64(terms.maturityAt),
       scBytes(terms.agreementHash),
     ]);
+  }
+
+  cancelProposal(source: string, id: bigint): Promise<string> {
+    return this.invoke(source, "cancel_proposal", [scAddress(source), scU64(id)]);
   }
 
   acceptAndSettle(source: string, id: bigint): Promise<string> {
