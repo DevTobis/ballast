@@ -22,24 +22,42 @@ function makeDb(rows: Map<unknown, unknown[]>, claimRows: unknown[] = [{}]) {
     promise.limit = () => chain(data);
     return promise;
   };
-  const db = {
-    select: () => ({ from: (table: unknown) => chain(rows.get(table) ?? []) }),
-    insert: (table: unknown) => ({
-      values: async (values: unknown) => {
-        inserted.push({ table, values });
-      },
-    }),
-    update: (table: unknown) => ({
-      set: (set: unknown) => ({
-        where: () => {
-          updated.push({ table, set });
-          const done: any = Promise.resolve([]);
-          done.returning = async () => claimRows;
-          return done;
+  const makeDbInstance = (insertLog: typeof inserted, updateLog: typeof updated): Database =>
+    ({
+      select: () => ({ from: (table: unknown) => chain(rows.get(table) ?? []) }),
+      insert: (table: unknown) => ({
+        values: async (values: unknown) => {
+          insertLog.push({ table, values });
         },
       }),
-    }),
-  } as unknown as Database;
+      update: (table: unknown) => ({
+        set: (set: unknown) => ({
+          where: () => {
+            updateLog.push({ table, set });
+            const done: any = Promise.resolve([]);
+            done.returning = async () => claimRows;
+            return done;
+          },
+        }),
+      }),
+      transaction: async (fn: (tx: any) => Promise<any>) => {
+        // Run with transaction-scoped logs so that if an error is thrown, updates/inserts rollback
+        const txInserted: typeof inserted = [];
+        const txUpdated: typeof updated = [];
+        const txDb = makeDbInstance(txInserted, txUpdated);
+        try {
+          const res = await fn(txDb);
+          inserted.push(...txInserted);
+          updated.push(...txUpdated);
+          return res;
+        } catch (err) {
+          // Transaction aborts on error; txInserted and txUpdated are discarded (rolled back)
+          throw err;
+        }
+      },
+    }) as unknown as Database;
+
+  const db = makeDbInstance(inserted, updated);
   return { db, inserted, updated };
 }
 
@@ -149,6 +167,40 @@ describe("settleIntent", () => {
 
     expect(result).toMatchObject({ status: "failed", ledger: 9 });
     expect(chain.outcome).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the claim if book updates fail so the intent is not left settled-without-effect", async () => {
+    const intentRow = intent({ kind: "credit_line.open", refId: "line-crash" });
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [intentRow]]]));
+    const chain = chainWith({ status: "SUCCESS", ledger: 888, returnValue: 12n });
+
+    // Mock an update error during applySuccess (e.g. database crash or constraint violation on creditLine)
+    const originalTransaction = (db as any).transaction;
+    (db as any).transaction = async (fn: any) => {
+      return originalTransaction(async (tx: any) => {
+        const origUpdate = tx.update;
+        tx.update = (table: unknown) => {
+          if (table === schema.creditLine) {
+            return {
+              set: () => ({
+                where: () => Promise.reject(new Error("simulated crash during book update")),
+              }),
+            };
+          }
+          return origUpdate(table);
+        };
+        return fn(tx);
+      });
+    };
+
+    await expect(settleIntent(db, chain, noContracts, intentRow)).rejects.toThrow("simulated crash during book update");
+
+    // Because the transaction rolled back, tx_intent was NOT committed as settled
+    const intentUpdates = updated.filter((u) => u.table === schema.txIntent);
+    expect(intentUpdates).toHaveLength(0);
+    // And books were not updated
+    const lineUpdates = updated.filter((u) => u.table === schema.creditLine);
+    expect(lineUpdates).toHaveLength(0);
   });
 });
 

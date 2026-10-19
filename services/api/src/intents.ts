@@ -3,6 +3,13 @@
  * the `tx_intent` table's doc comment in `@ballast/db` for why this exists. `recordIntent` runs
  * when a route builds a transaction; `settleIntent` runs once the network has a final status for
  * it and applies that intent's effect to Postgres exactly once.
+ *
+ * Settle atomicity: Any external RPC or contract data needed for book effects is fetched first,
+ * outside the database transaction. Then the conditional status claim (`status = 'pending' -> 'settled'|'failed'`)
+ * and the bookkeeping writes (`applySuccess` / `applyFailure`) are executed together within a single
+ * `db.transaction`. If the process crashes or an error is raised during book application, the entire
+ * transaction rolls back, leaving the intent `pending` so it can be retried rather than permanently settled
+ * without effects.
  */
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
@@ -67,13 +74,25 @@ function result(intent: IntentRow, status: SettleResult["status"], ledger: numbe
   return { txHash: intent.txHash, kind: intent.kind, refId: intent.refId, status, ledger };
 }
 
+/**
+ * Extra data fetched outside the DB transaction (e.g. from contract RPCs or pre-transaction queries)
+ * needed to update the books.
+ */
+interface SettleContext {
+  liquidationRecord?: { recovered: bigint; shortfall: bigint };
+  outstandingDebt?: bigint;
+  contractLineDrawn?: bigint;
+  repoTradeUnits?: bigint;
+  repoMarginCallPending?: boolean;
+}
+
 /** What a transaction that closed successfully means for the books. */
 async function applySuccess(
   db: Database,
-  contracts: ContractClients,
   intent: IntentRow,
   ledger: number,
   returnValue: unknown,
+  ctx?: SettleContext,
 ): Promise<void> {
   const refId = intent.refId!;
   const payload = (intent.payload ?? {}) as Record<string, string>;
@@ -96,20 +115,19 @@ async function applySuccess(
     case "credit_line.close_liquidated": {
       // The contract values the collateral at the price frozen when the liquidation was confirmed;
       // the books take its recorded outcome rather than recomputing it.
-      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
-      const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId!));
+      const record = ctx?.liquidationRecord;
       const [liquidation] = await db
         .select()
         .from(schema.liquidation)
         .where(eq(schema.liquidation.creditLineId, refId))
         .orderBy(desc(schema.liquidation.startedAt))
         .limit(1);
-      if (liquidation) {
+      if (liquidation && record) {
         await db
           .update(schema.liquidation)
           .set({
-            proceeds: scaledToDecimalString(BigInt(record.recovered)),
-            shortfall: scaledToDecimalString(BigInt(record.shortfall)),
+            proceeds: scaledToDecimalString(record.recovered),
+            shortfall: scaledToDecimalString(record.shortfall),
             txHashes: [...(liquidation.txHashes ?? []), intent.txHash],
             completedAt: new Date(),
           })
@@ -133,10 +151,9 @@ async function applySuccess(
       // is read back from the contract: whatever principal the line no longer owes is what this
       // repayment retired, and the rest of the amount was interest.
       const amount = BigInt(payload.amount);
-      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
-      const before = await outstandingDebt(db, refId);
-      const onChain = await contracts.creditLine.line(BigInt(line.contractLineId!));
-      let principal = before - BigInt(onChain.drawn);
+      const before = ctx?.outstandingDebt ?? 0n;
+      const drawn = ctx?.contractLineDrawn ?? 0n;
+      let principal = before - drawn;
       if (principal < 0n) principal = 0n;
       if (principal > amount) principal = amount;
       await db.insert(schema.repayment).values({
@@ -185,13 +202,13 @@ async function applySuccess(
 
     case "repo.top_up": {
       // The contract decides whether the top-up was enough to cure; the books follow it.
-      const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, refId)).limit(1);
-      const onChain = await contracts.repoDvp.trade(BigInt(trade.contractTradeId!));
-      await db
-        .update(schema.repoTrade)
-        .set({ units: scaledToDecimalString(BigInt(onChain.units)) })
-        .where(eq(schema.repoTrade.id, refId));
-      if (!onChain.pendingMarginCall) {
+      if (ctx?.repoTradeUnits !== undefined) {
+        await db
+          .update(schema.repoTrade)
+          .set({ units: scaledToDecimalString(ctx.repoTradeUnits) })
+          .where(eq(schema.repoTrade.id, refId));
+      }
+      if (ctx && !ctx.repoMarginCallPending) {
         await db
           .update(schema.repoMarginCall)
           .set({ curedAt: new Date() })
@@ -225,8 +242,9 @@ async function applyFailure(db: Database, intent: IntentRow): Promise<void> {
 
 /**
  * Asks the network how `intent`'s transaction ended and, the first time it has a final answer,
- * applies it. Safe to call repeatedly and concurrently: the `pending -> settled|failed` flip is
- * a conditional update, and only the caller that wins it applies the effect.
+ * applies it. Safe to call repeatedly and concurrently: claiming the intent and writing its
+ * book effects happen in an atomic `db.transaction`. If a crash occurs or an error is thrown
+ * during book updates, the transaction rolls back, leaving the intent pending so it is retried.
  */
 export async function settleIntent(
   db: Database,
@@ -243,31 +261,61 @@ export async function settleIntent(
     return result(intent, "pending", null);
   }
 
-  const next = outcome.status === "SUCCESS" ? "settled" : "failed";
-  const claimed = await db
-    .update(schema.txIntent)
-    .set({ status: next, ledger: outcome.ledger, settledAt: new Date() })
-    .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
-    .returning();
-  if (claimed.length === 0) {
-    const current = (await findIntent(db, intent.txHash)) ?? intent;
-    return result(current, current.status as SettleResult["status"], current.ledger);
+  // Pre-fetch any external RPC or contract data needed for book updates before opening the DB transaction.
+  const ctx: SettleContext = {};
+  if (outcome.status === "SUCCESS" && intent.refId) {
+    if (intent.kind === "credit_line.close_liquidated") {
+      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, intent.refId)).limit(1);
+      if (line?.contractLineId) {
+        const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId));
+        ctx.liquidationRecord = { recovered: BigInt(record.recovered), shortfall: BigInt(record.shortfall) };
+      }
+    } else if (intent.kind === "credit_line.repay") {
+      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, intent.refId)).limit(1);
+      ctx.outstandingDebt = await outstandingDebt(db, intent.refId);
+      if (line?.contractLineId) {
+        const onChain = await contracts.creditLine.line(BigInt(line.contractLineId));
+        ctx.contractLineDrawn = BigInt(onChain.drawn);
+      }
+    } else if (intent.kind === "repo.top_up") {
+      const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, intent.refId)).limit(1);
+      if (trade?.contractTradeId) {
+        const onChain = await contracts.repoDvp.trade(BigInt(trade.contractTradeId));
+        ctx.repoTradeUnits = BigInt(onChain.units);
+        ctx.repoMarginCallPending = Boolean(onChain.pendingMarginCall);
+      }
+    }
   }
 
-  try {
-    if (outcome.status === "SUCCESS") {
-      await applySuccess(db, contracts, intent, outcome.ledger, outcome.returnValue);
-    } else {
-      await applyFailure(db, intent);
-    }
-  } catch (err) {
-    // The transaction's on-chain outcome stands either way; hand the intent back so the next
-    // settle call retries the bookkeeping instead of losing it.
-    await db
+  const next = outcome.status === "SUCCESS" ? "settled" : "failed";
+
+  // Atomically claim the intent and write book changes. If an error is thrown or process crashes,
+  // the transaction rolls back so tx_intent remains pending.
+  const runInTx = typeof db.transaction === "function" ? db.transaction.bind(db) : (fn: (tx: any) => Promise<any>) => fn(db);
+
+  const claimedWinner = await runInTx(async (tx: any) => {
+    const claimed = await tx
       .update(schema.txIntent)
-      .set({ status: "pending", error: err instanceof Error ? err.message : String(err) })
-      .where(eq(schema.txIntent.txHash, intent.txHash));
-    throw err;
+      .set({ status: next, ledger: outcome.ledger, settledAt: new Date() })
+      .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
+      .returning();
+
+    if (claimed.length === 0) {
+      return false;
+    }
+
+    if (outcome.status === "SUCCESS") {
+      await applySuccess(tx as unknown as Database, intent, outcome.ledger, outcome.returnValue, ctx);
+    } else {
+      await applyFailure(tx as unknown as Database, intent);
+    }
+
+    return true;
+  });
+
+  if (!claimedWinner) {
+    const current = (await findIntent(db, intent.txHash)) ?? intent;
+    return result(current, current.status as SettleResult["status"], current.ledger);
   }
 
   return result(intent, next, outcome.ledger);
@@ -306,13 +354,18 @@ export async function sweepPendingIntents(
     if (status === "settled") tally.settled++;
     else if (status === "failed") tally.failed++;
     else if (status === "pending" && now - intent.createdAt.getTime() > INTENT_EXPIRY_MS) {
-      const claimed = await db
-        .update(schema.txIntent)
-        .set({ status: "expired", settledAt: new Date(now) })
-        .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
-        .returning();
-      if (claimed.length > 0) {
-        await applyFailure(db, intent);
+      const runInTx = typeof db.transaction === "function" ? db.transaction.bind(db) : (fn: (tx: any) => Promise<any>) => fn(db);
+      const expiredWinner = await runInTx(async (tx: any) => {
+        const claimed = await tx
+          .update(schema.txIntent)
+          .set({ status: "expired", settledAt: new Date(now) })
+          .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
+          .returning();
+        if (claimed.length === 0) return false;
+        await applyFailure(tx as unknown as Database, intent);
+        return true;
+      });
+      if (expiredWinner) {
         tally.expired++;
       }
     }
