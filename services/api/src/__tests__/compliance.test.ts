@@ -176,6 +176,96 @@ describe("checkParty", () => {
     expect(screen).toHaveBeenCalledTimes(1);
   });
 
+  it("does not hold a manually cleared party after SCREENING_TTL_MS (25 hours) for the same match", async () => {
+    const now = new Date("2026-10-08T12:00:00Z");
+    const initialTime = new Date(now.getTime() - 25 * 3600 * 1000);
+    const clearTime = new Date(initialTime.getTime() + 1000);
+
+    const hit: SanctionsScreener = {
+      screen: async () => ({
+        matches: [{ type: "name", listed: "ACME CORP", entNum: "999" }],
+        listSource: "OFAC SDN",
+        listLoadedAt: now,
+      }),
+    };
+
+    // The party had a match at initialTime, then was manually cleared at clearTime
+    const { db, checks, audits } = gateDb(approved, [
+      {
+        partyId: "p1",
+        kind: "sanctions",
+        result: "clear",
+        matches: [],
+        listSource: "manual review by compliance_officer: false positive entity",
+        checkedAt: clearTime,
+      },
+      {
+        partyId: "p1",
+        kind: "sanctions",
+        result: "match",
+        matches: [{ type: "name", listed: "ACME CORP", entNum: "999" }],
+        listSource: "OFAC SDN",
+        checkedAt: initialTime,
+      },
+    ]);
+
+    // 25 hours later (> SCREENING_TTL_MS), checkParty runs. Screener matches same entNum 999.
+    const hold = await checkParty(db, hit, "p1", now);
+    expect(hold).toBeNull();
+    // The newly recorded check is clear because entNum 999 was reviewed
+    expect(checks[0]).toMatchObject({ result: "clear" });
+  });
+
+  it("holds a manually cleared party if a new match against a different entNum appears", async () => {
+    const now = new Date("2026-10-08T12:00:00Z");
+    const initialTime = new Date(now.getTime() - 25 * 3600 * 1000);
+    const clearTime = new Date(initialTime.getTime() + 1000);
+
+    const hitWithNewMatch: SanctionsScreener = {
+      screen: async () => ({
+        matches: [
+          { type: "name", listed: "ACME CORP", entNum: "999" },
+          { type: "name", listed: "ACME NEW SUSPECT", entNum: "1001" },
+        ],
+        listSource: "OFAC SDN",
+        listLoadedAt: now,
+      }),
+    };
+
+    const { db, checks, audits } = gateDb(approved, [
+      {
+        partyId: "p1",
+        kind: "sanctions",
+        result: "clear",
+        matches: [],
+        listSource: "manual review by compliance_officer: false positive entity",
+        checkedAt: clearTime,
+      },
+      {
+        partyId: "p1",
+        kind: "sanctions",
+        result: "match",
+        matches: [{ type: "name", listed: "ACME CORP", entNum: "999" }],
+        listSource: "OFAC SDN",
+        checkedAt: initialTime,
+      },
+    ]);
+
+    // 25 hours later, screener returns both reviewed entNum 999 and new entNum 1001
+    const hold = await checkParty(db, hitWithNewMatch, "p1", now);
+    expect(hold).toMatchObject({ status: 403, error: expect.stringContaining("needs review") });
+    expect(checks[0]).toMatchObject({ result: "match" });
+    expect(audits).toContainEqual(
+      expect.objectContaining({
+        action: "sanctions.match",
+        payload: {
+          partyId: "p1",
+          matches: [{ type: "name", listed: "ACME NEW SUSPECT", entNum: "1001" }],
+        },
+      }),
+    );
+  });
+
   it("answers 503, not a pass, when the sanctions list cannot be loaded", async () => {
     const { db } = gateDb(approved);
     const broken: SanctionsScreener = { screen: async () => { throw new ScreeningUnavailableError("sanctions list unavailable: down"); } };

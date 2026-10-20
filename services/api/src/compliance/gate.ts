@@ -52,7 +52,36 @@ export async function checkParty(
     throw err;
   }
 
-  const hit = result.matches.length > 0;
+  // Find all previous compliance checks to see if this party has any manually reviewed clear records
+  const allChecks = await db
+    .select()
+    .from(schema.complianceCheck)
+    .where(and(eq(schema.complianceCheck.partyId, partyId), eq(schema.complianceCheck.kind, "sanctions")))
+    .orderBy(desc(schema.complianceCheck.checkedAt));
+
+  const manualClearIndex = allChecks.findIndex(
+    (c) => c.result === "clear" && c.listSource?.startsWith("manual review"),
+  );
+
+  let reviewedEntNums = new Set<string>();
+  if (manualClearIndex !== -1) {
+    // If the latest check prior to the manual clear (or earlier matches) was a match, collect its reviewed entNums
+    const matchPriorToClear = allChecks
+      .slice(manualClearIndex + 1)
+      .find((c) => c.result === "match");
+    if (matchPriorToClear && Array.isArray(matchPriorToClear.matches)) {
+      for (const m of matchPriorToClear.matches as Array<{ entNum?: string }>) {
+        if (m.entNum) reviewedEntNums.add(m.entNum);
+      }
+    }
+  }
+
+  // Only consider matches with entNums that have not been manually reviewed
+  const unreviewedMatches = result.matches.filter(
+    (m) => !reviewedEntNums.has(m.entNum),
+  );
+
+  const hit = unreviewedMatches.length > 0;
   await db.insert(schema.complianceCheck).values({
     partyId,
     kind: "sanctions",
@@ -66,7 +95,7 @@ export async function checkParty(
     await db.insert(schema.auditLog).values({
       actor: "compliance",
       action: "sanctions.match",
-      payload: { partyId, matches: result.matches },
+      payload: { partyId, matches: unreviewedMatches },
     });
     return { status: 403, error: "compliance hold: sanctions screening needs review" };
   }

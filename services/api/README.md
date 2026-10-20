@@ -95,6 +95,8 @@ pnpm --filter @ballast/db compliance kyb <partyId> approved <provider> <referenc
 pnpm --filter @ballast/db compliance clear <partyId> <reviewer> "reviewed: different entity, same name"
 ```
 
+A manual clear recorded by an operator persists across periodic screenings (`SCREENING_TTL_MS`, 24 hours): the reviewed entity IDs (`entNum`s) remain cleared so the party is not held again by the same false positive match. If a later screening produces a new match against a different entity ID, the party is held again for review.
+
 ## Amount and unit conventions
 
 Request amounts go through `bigintish` (string or number parsed to `BigInt`). Responses that touch
