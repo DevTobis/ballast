@@ -397,6 +397,79 @@ mod test {
     }
 
     #[test]
+    fn raise_haircut_now_rejects_a_stranger_authorising_only_themselves() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, asset) = setup();
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "raise_haircut_now",
+                args: (&stranger, asset.clone(), 200_u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        assert!(client
+            .try_raise_haircut_now(&stranger, &asset, &200)
+            .is_err());
+        assert_eq!(client.asset(&asset).haircut_base_bps, 300);
+    }
+
+    #[test]
+    fn raise_haircut_now_with_zero_is_a_no_op() {
+        let (_env, client, _admin, risk, asset) = setup();
+
+        // Adding zero basis points is a no-op and leaves the base haircut unchanged.
+        client.raise_haircut_now(&risk, &asset, &0);
+
+        assert_eq!(client.asset(&asset).haircut_base_bps, 300);
+    }
+
+    #[test]
+    fn raise_haircut_now_accumulates_multiple_increases() {
+        let (_env, client, _admin, risk, asset) = setup();
+
+        client.raise_haircut_now(&risk, &asset, &200);
+        client.raise_haircut_now(&risk, &asset, &150);
+
+        assert_eq!(client.asset(&asset).haircut_base_bps, 650);
+    }
+
+    #[test]
+    fn raise_haircut_now_accepts_100_percent_and_rejects_more() {
+        let (_env, client, _admin, risk, asset) = setup();
+
+        client.raise_haircut_now(&risk, &asset, &9_700);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 10_000);
+
+        assert!(client
+            .try_raise_haircut_now(&risk, &asset, &1)
+            .is_err());
+        assert_eq!(client.asset(&asset).haircut_base_bps, 10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: asset not registered")]
+    fn raise_haircut_now_rejects_an_unknown_asset() {
+        let (env, client, _admin, risk, _asset) = setup();
+        let unknown = Address::generate(&env);
+
+        client.raise_haircut_now(&risk, &unknown, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: haircut overflow")]
+    fn raise_haircut_now_rejects_u32_overflow() {
+        let (_env, client, _admin, risk, asset) = setup();
+
+        client.raise_haircut_now(&risk, &asset, &u32::MAX);
+    }
+
+    #[test]
     #[should_panic(expected = "registry: haircut cannot exceed 100%")]
     fn raise_haircut_now_rejects_overflow_past_100_percent() {
         let (_env, client, _admin, risk, asset) = setup();
