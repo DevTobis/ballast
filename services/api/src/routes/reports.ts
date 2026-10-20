@@ -8,9 +8,28 @@ const querySchema = z.object({
   format: z.enum(["json", "csv"]).default("json"),
 });
 
-function toCsv(rows: Record<string, unknown>[]): string {
-  if (rows.length === 0) return "";
-  const headers = Object.keys(rows[0]);
+export function toCsv(rows: Record<string, unknown>[]): string {
+  const keySet = new Set<string>();
+  for (const row of rows) {
+    for (const k of Object.keys(row)) {
+      keySet.add(k);
+    }
+  }
+
+  // Ensure "kind" is first if present, followed by all other keys in order of appearance
+  const headers: string[] = [];
+  if (keySet.has("kind")) {
+    headers.push("kind");
+    keySet.delete("kind");
+  }
+  for (const k of keySet) {
+    headers.push(k);
+  }
+
+  if (headers.length === 0) {
+    return "kind";
+  }
+
   const lines = [headers.join(",")];
   for (const row of rows) {
     lines.push(headers.map((h) => JSON.stringify(row[h] ?? "")).join(","));
