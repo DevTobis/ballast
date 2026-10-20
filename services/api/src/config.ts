@@ -85,6 +85,24 @@ export function parseTrustProxy(value: string | undefined): boolean | number | s
   return v;
 }
 
+/** `COMPLIANCE_ENFORCED`: `true`/`1` (enforced), `false`/`0` (disabled), or unset (defaults to production ? true : false). */
+export function parseComplianceEnforced(value: string | undefined, nodeEnv: string | undefined): boolean {
+  if (value === undefined || value.trim() === "") {
+    return nodeEnv === "production";
+  }
+  const v = value.trim().toLowerCase();
+  if (v === "true" || v === "1") {
+    return true;
+  }
+  if (v === "false" || v === "0") {
+    if (nodeEnv === "production") {
+      console.warn("services/api: WARNING: COMPLIANCE_ENFORCED is explicitly disabled in production; sanctions and KYB gates will not run!");
+    }
+    return false;
+  }
+  throw new Error(`services/api: invalid COMPLIANCE_ENFORCED value '${value}': expected 'true', 'false', '1', or '0'`);
+}
+
 export function loadApiConfig(rawEnv: NodeJS.ProcessEnv = process.env): ApiConfig {
   // Secrets may come from NAME_FILE; resolve them once and let the rest of this function read `env`.
   const env: NodeJS.ProcessEnv = { ...rawEnv };
@@ -116,7 +134,7 @@ export function loadApiConfig(rawEnv: NodeJS.ProcessEnv = process.env): ApiConfi
     webhookSecretKey: env.WEBHOOK_SECRET_KEY ?? "",
     apiKeySecretKey: env.API_KEY_SECRET_KEY ?? "",
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
-    complianceEnforced: env.COMPLIANCE_ENFORCED ? env.COMPLIANCE_ENFORCED === "true" : env.NODE_ENV === "production",
+    complianceEnforced: parseComplianceEnforced(env.COMPLIANCE_ENFORCED, env.NODE_ENV),
     consoleOrigin: env.CONSOLE_ORIGIN ?? "http://localhost:5173",
   };
 }

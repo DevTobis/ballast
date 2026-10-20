@@ -71,7 +71,7 @@ describe("loadApiConfig", () => {
   });
 });
 
-import { parseTrustProxy } from "../config.js";
+import { parseComplianceEnforced, parseTrustProxy } from "../config.js";
 
 describe("parseTrustProxy", () => {
   it("is off unless asked for, and understands true, a hop count and a list", () => {
@@ -83,3 +83,40 @@ describe("parseTrustProxy", () => {
     expect(parseTrustProxy("10.0.0.0/8,172.16.0.0/12")).toBe("10.0.0.0/8,172.16.0.0/12");
   });
 });
+
+describe("parseComplianceEnforced", () => {
+  it("defaults to on in production and off elsewhere when unset", () => {
+    expect(parseComplianceEnforced(undefined, "production")).toBe(true);
+    expect(parseComplianceEnforced("", "production")).toBe(true);
+    expect(parseComplianceEnforced("  ", "production")).toBe(true);
+
+    expect(parseComplianceEnforced(undefined, "development")).toBe(false);
+    expect(parseComplianceEnforced(undefined, "test")).toBe(false);
+    expect(parseComplianceEnforced(undefined, undefined)).toBe(false);
+  });
+
+  it("enables enforcement on true (case-insensitive) or 1", () => {
+    expect(parseComplianceEnforced("true", "development")).toBe(true);
+    expect(parseComplianceEnforced("TRUE", "development")).toBe(true);
+    expect(parseComplianceEnforced("True", "development")).toBe(true);
+    expect(parseComplianceEnforced("1", "development")).toBe(true);
+  });
+
+  it("disables enforcement on false (case-insensitive) or 0", () => {
+    expect(parseComplianceEnforced("false", "development")).toBe(false);
+    expect(parseComplianceEnforced("FALSE", "development")).toBe(false);
+    expect(parseComplianceEnforced("0", "development")).toBe(false);
+
+    // In production, also logs warning
+    expect(parseComplianceEnforced("false", "production")).toBe(false);
+    expect(parseComplianceEnforced("0", "production")).toBe(false);
+  });
+
+  it("throws a clear error for unrecognised boolean values", () => {
+    expect(() => parseComplianceEnforced("yes", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED value/);
+    expect(() => parseComplianceEnforced("ture", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED value/);
+    expect(() => parseComplianceEnforced("2", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED value/);
+    expect(() => parseComplianceEnforced("enabled", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED value/);
+  });
+});
+
