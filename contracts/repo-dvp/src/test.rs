@@ -796,4 +796,66 @@ mod sac {
         h.env.ledger().set_sequence_number(expected_expiry + 1);
         assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
     }
+
+    #[test]
+    #[should_panic(expected = "margin: invalid thresholds")]
+    fn configure_asset_rejects_zero_margin_call_bps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+
+        let repo = env.register(RepoDvp, ());
+        RepoDvpClient::new(&env, &repo).initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        let price_guard = env.register(MockPriceGuard, ());
+        let rwa = env.register(MockToken, ());
+
+        RepoDvpClient::new(&env, &repo).configure_asset(
+            &admin,
+            &rwa,
+            &price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 0,
+                margin_call_bps: 0,
+                liquidation_bps: 9_500,
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: invalid thresholds")]
+    fn configure_asset_rejects_out_of_order_thresholds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+
+        let repo = env.register(RepoDvp, ());
+        RepoDvpClient::new(&env, &repo).initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        let price_guard = env.register(MockPriceGuard, ());
+        let rwa = env.register(MockToken, ());
+
+        RepoDvpClient::new(&env, &repo).configure_asset(
+            &admin,
+            &rwa,
+            &price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 8_500,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_500,
+            },
+        );
+    }
 }
+
+

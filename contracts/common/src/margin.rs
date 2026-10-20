@@ -30,6 +30,16 @@ pub enum LiquidationRoute {
     Rfq,
 }
 
+pub fn validate_thresholds(thresholds: &MarginThresholds) {
+    assert!(
+        thresholds.warning_bps > 0
+            && thresholds.warning_bps <= thresholds.margin_call_bps
+            && thresholds.margin_call_bps <= thresholds.liquidation_bps
+            && thresholds.liquidation_bps <= 10_000,
+        "margin: invalid thresholds (must satisfy 0 < warning <= margin_call <= liquidation <= 10000)"
+    );
+}
+
 pub fn classify(ltv_bps: u32, thresholds: &MarginThresholds) -> MarginState {
     if ltv_bps >= thresholds.liquidation_bps {
         MarginState::Liquidation
@@ -61,5 +71,65 @@ mod test {
         assert_eq!(classify(7_500, &t), MarginState::Warning);
         assert_eq!(classify(8_500, &t), MarginState::MarginCall);
         assert_eq!(classify(9_500, &t), MarginState::Liquidation);
+    }
+
+    #[test]
+    fn validates_valid_thresholds() {
+        let t = thresholds();
+        validate_thresholds(&t);
+
+        // Equal thresholds are valid
+        validate_thresholds(&MarginThresholds {
+            warning_bps: 8_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 8_000,
+        });
+
+        // Max liquidation 10_000
+        validate_thresholds(&MarginThresholds {
+            warning_bps: 1,
+            margin_call_bps: 5_000,
+            liquidation_bps: 10_000,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: invalid thresholds")]
+    fn validates_zero_warning_panics() {
+        validate_thresholds(&MarginThresholds {
+            warning_bps: 0,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: invalid thresholds")]
+    fn validates_warning_greater_than_margin_call_panics() {
+        validate_thresholds(&MarginThresholds {
+            warning_bps: 8_500,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: invalid thresholds")]
+    fn validates_margin_call_greater_than_liquidation_panics() {
+        validate_thresholds(&MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 9_500,
+            liquidation_bps: 9_000,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: invalid thresholds")]
+    fn validates_liquidation_greater_than_10000_panics() {
+        validate_thresholds(&MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 10_001,
+        });
     }
 }

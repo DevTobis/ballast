@@ -273,6 +273,7 @@ impl CreditLine {
     ) {
         let _ = admin;
         access::require_admin(&env);
+        margin::validate_thresholds(&thresholds);
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
             &AssetConfig {
