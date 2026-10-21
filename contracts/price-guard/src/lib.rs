@@ -309,6 +309,9 @@ mod alloc_free_sort {
     }
 }
 
+/// True when the spread between the lowest and highest value, in bps of the lowest, is at most
+/// `band_bps` (inclusive). Fewer than two values are trivially within band; a non-positive
+/// minimum never is.
 fn within_band(values: &[i128], band_bps: u32) -> bool {
     if values.len() < 2 {
         return true;
@@ -1953,6 +1956,43 @@ mod test {
         let price = client.guarded_price(&asset);
         assert_eq!(price.status, PriceStatus::Ok);
         assert_eq!(price.value, v2);
+    }
+
+    // `within_band` boundaries. The band is inclusive: a spread of exactly `band_bps` is still
+    // within band, one bp more is not.
+
+    #[test]
+    fn within_band_spread_equal_to_band_is_inside() {
+        // (10_050 - 10_000) * 10_000 / 10_000 = 50 bps.
+        assert!(within_band(&[10_000, 10_050], 50));
+    }
+
+    #[test]
+    fn within_band_spread_one_over_band_is_outside() {
+        // 51 bps against a 50 bp band.
+        assert!(!within_band(&[10_000, 10_051], 50));
+    }
+
+    #[test]
+    fn within_band_non_positive_minimum_is_outside() {
+        assert!(!within_band(&[0, 5], 50));
+    }
+
+    #[test]
+    fn within_band_single_value_is_inside() {
+        assert!(within_band(&[10_000], 50));
+    }
+
+    #[test]
+    fn within_band_empty_slice_is_inside() {
+        assert!(within_band(&[], 50));
+    }
+
+    #[test]
+    fn within_band_only_extremes_decide() {
+        // The middle value never matters; only min and max, wherever they sit in the slice.
+        assert!(within_band(&[10_025, 10_050, 10_000], 50));
+        assert!(!within_band(&[10_051, 10_025, 10_000], 50));
     }
 
     mod invariants;
