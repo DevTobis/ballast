@@ -1526,6 +1526,49 @@ mod test {
         assert_eq!(price.value, SCALE * 1_009 / 1_000);
     }
 
+    /// Establishes an `Ok` baseline of 1.0000000 under a 100 bp daily band, then moves both sources
+    /// to `moved` and returns what the guard reports. The window band is opened to 100% so only the
+    /// daily check can fire. While the NAV has moved but the feed hasn't yet, the pair is >= 100 bp
+    /// apart, outside the 50 bp source band, so that in-between publish is `Degraded` and leaves the
+    /// baseline alone.
+    fn daily_move_to(moved: i128) -> GuardedPrice {
+        let (env, client, _admin, publisher, _risk, asset) =
+            setup_with_admin_and_window(50, 100, DEFAULT_WINDOW_SECONDS, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        client.publish_nav(&publisher, &asset, &code, &moved, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &moved, &now);
+        client.guarded_price(&asset)
+    }
+
+    #[test]
+    fn a_daily_move_equal_to_the_band_is_ok() {
+        let moved = SCALE + 100_000; // 1.0100000: exactly 100 bp
+        let price = daily_move_to(moved);
+        assert_eq!((price.status, price.value), (PriceStatus::Ok, moved));
+    }
+
+    #[test]
+    fn a_daily_move_one_bp_beyond_the_band_halts_at_the_baseline() {
+        let price = daily_move_to(SCALE + 101_000); // 1.0101000: 101 bp
+        assert_eq!((price.status, price.value), (PriceStatus::Halted, SCALE));
+    }
+
+    #[test]
+    fn a_downward_daily_move_hits_the_same_boundary() {
+        let moved = SCALE - 100_000; // 0.9900000: exactly 100 bp down
+        let price = daily_move_to(moved);
+        assert_eq!((price.status, price.value), (PriceStatus::Ok, moved));
+
+        let price = daily_move_to(SCALE - 101_000); // 0.9899000: 101 bp down
+        assert_eq!((price.status, price.value), (PriceStatus::Halted, SCALE));
+    }
+
     #[test]
     fn a_future_dated_reading_is_rejected_and_never_counts_as_fresh() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
