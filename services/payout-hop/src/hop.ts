@@ -10,8 +10,9 @@ import { Asset, Memo, Operation, TransactionBuilder, BASE_FEE, type Transaction 
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { StrKey } from "@stellar/stellar-sdk";
-import { schema, recordJournalEntry, type Database } from "@ballast/db";
+import { schema, recordJournalEntry, type Database, type DbOrTx } from "@ballast/db";
 import { scaledToDecimalString } from "@ballast/domain-types";
+import { createAlerter, type Alerter } from "@ballast/observability";
 import type { PayoutSigner } from "./signer.js";
 
 
@@ -104,6 +105,22 @@ export interface ForwardPayoutArgs {
 export interface ForwardPayoutResult {
   hash: string;
   status: string;
+  /**
+   * False when the payment was accepted but recording it failed: the row is left
+   * `bookkeeping_pending` for `bookPendingPayouts` and `payout_unbooked` is alerted. The payout
+   * itself happened either way, so the caller must not treat `false` as a failure.
+   */
+  booked: boolean;
+}
+
+/** What a sent payout is booked from: everything is on the `payout_forward` row, so a repair can redo it. */
+export interface PayoutBooking {
+  fromTxHash: string;
+  txHash: string;
+  refId: string;
+  quoteId: string | null;
+  amount: bigint;
+  memo: string;
 }
 
 /**
@@ -116,8 +133,14 @@ export async function forwardPayout(
   signer: PayoutSigner,
   args: ForwardPayoutArgs,
   policy: PayoutPolicy,
+  alerter: Alerter = createAlerter("payout-hop"),
 ): Promise<ForwardPayoutResult> {
   checkPolicy(args, policy);
+
+  // Fixed before any money moves and stored on the claim, so the journal pair is booked under the
+  // same id whether it is written right after sending or later by `bookPendingPayouts`.
+  const refId = args.quoteId ?? randomUUID();
+  const quoteId = args.quoteId ?? null;
 
   // Claim the first-leg transaction before any money moves. The primary key means the same payout
   // can be requested any number of times (a retry, a replay, a duplicate caller) and be paid once;
@@ -129,13 +152,15 @@ export async function forwardPayout(
       toAccount: args.toAnchorAccount,
       amount: scaledToDecimalString(args.amount),
       memo: args.memo,
+      refId,
+      quoteId,
     })
     .onConflictDoNothing()
     .returning({ fromTxHash: schema.payoutForward.fromTxHash });
   if (claimed.length === 0) {
     const reclaimed = await db
       .update(schema.payoutForward)
-      .set({ status: "claimed", toAccount: args.toAnchorAccount, amount: scaledToDecimalString(args.amount), memo: args.memo })
+      .set({ status: "claimed", toAccount: args.toAnchorAccount, amount: scaledToDecimalString(args.amount), memo: args.memo, refId, quoteId })
       .where(
         and(
           eq(schema.payoutForward.fromTxHash, args.fromContractPayoutTxHash),
@@ -179,47 +204,95 @@ export async function forwardPayout(
     throw err;
   }
 
-  await db
-    .update(schema.payoutForward)
-    .set({ status: "sent", txHash: hash })
-    .where(eq(schema.payoutForward.fromTxHash, args.fromContractPayoutTxHash));
-
-  await db.transaction(async (trx) => {
-    // `exit_fill.quote_id` is NOT NULL in the current schema and there's no generic "payout" table
-    // for non-exit flows (a credit-line draw routed to an anchor). When there's a real exit_quote
-    // to point at, record the exit_fill row; otherwise rely on the journal_entry rows below plus
-    // `payout_forward` for traceability.
-    if (args.quoteId) {
-      await trx.insert(schema.exitFill).values({
-        quoteId: args.quoteId,
-        txHash: hash,
-        payoutRoute: "anchor_hop",
-        payoutMemo: args.memo,
-      });
-    }
-
-    // A balanced pair, not a lone credit row: cash leaving Ballast's operator account (debit)
-    // funds the payout booked against the payout-hop account (credit). Both legs go through
-    // `recordJournalEntry` directly (not `recordDoubleEntry`, which opens its own transaction)
-    // since this is already inside one.
-    const refId = args.quoteId ?? randomUUID();
-    await recordJournalEntry(trx, {
-      refType: "payout_hop",
-      refId,
-      account: "usdc_cash",
-      debit: args.amount,
-      credit: 0n,
-      ccy: "USDC",
+  // The anchor has been paid from here on, so nothing below may turn this into an error: a caller
+  // that saw one would retry, get 409, and the payout would be paid but never booked. Marking the
+  // row `sent` and booking it share one transaction, so `sent` always means booked.
+  const booking: PayoutBooking = {
+    fromTxHash: args.fromContractPayoutTxHash,
+    txHash: hash,
+    refId,
+    quoteId,
+    amount: args.amount,
+    memo: args.memo,
+  };
+  try {
+    await db.transaction(async (trx) => {
+      await trx
+        .update(schema.payoutForward)
+        .set({ status: "sent", txHash: hash })
+        .where(eq(schema.payoutForward.fromTxHash, args.fromContractPayoutTxHash));
+      await bookPayout(trx, booking);
     });
-    await recordJournalEntry(trx, {
-      refType: "payout_hop",
-      refId,
-      account: "operator:payout_hop",
-      debit: 0n,
-      credit: args.amount,
-      ccy: "USDC",
+    return { hash, status, booked: true };
+  } catch (err) {
+    await markUnbooked(db, alerter, booking, err);
+    return { hash, status, booked: false };
+  }
+}
+
+/**
+ * Writes the bookkeeping for a sent payout: the `exit_fill` row when there is a quote, and the
+ * balanced journal pair under `refId`. Call inside a transaction.
+ */
+export async function bookPayout(trx: DbOrTx, booking: PayoutBooking): Promise<void> {
+  // `exit_fill.quote_id` is NOT NULL in the current schema and there's no generic "payout" table
+  // for non-exit flows (a credit-line draw routed to an anchor). When there's a real exit_quote
+  // to point at, record the exit_fill row; otherwise rely on the journal_entry rows below plus
+  // `payout_forward` for traceability.
+  if (booking.quoteId) {
+    await trx.insert(schema.exitFill).values({
+      quoteId: booking.quoteId,
+      txHash: booking.txHash,
+      payoutRoute: "anchor_hop",
+      payoutMemo: booking.memo,
     });
+  }
+
+  // A balanced pair, not a lone credit row: cash leaving Ballast's operator account (debit)
+  // funds the payout booked against the payout-hop account (credit). Both legs go through
+  // `recordJournalEntry` directly (not `recordDoubleEntry`, which opens its own transaction)
+  // since this is already inside one.
+  await recordJournalEntry(trx, {
+    refType: "payout_hop",
+    refId: booking.refId,
+    account: "usdc_cash",
+    debit: booking.amount,
+    credit: 0n,
+    ccy: "USDC",
   });
+  await recordJournalEntry(trx, {
+    refType: "payout_hop",
+    refId: booking.refId,
+    account: "operator:payout_hop",
+    debit: 0n,
+    credit: booking.amount,
+    ccy: "USDC",
+  });
+}
 
-  return { hash, status };
+/**
+ * Flags a sent-but-unbooked payout for `bookPendingPayouts` and alerts. If even the flag cannot be
+ * written (the database is down), the row stays `claimed` with no tx hash; the alert carries the
+ * hash so someone can finish it by hand.
+ */
+async function markUnbooked(db: Database, alerter: Alerter, booking: PayoutBooking, cause: unknown): Promise<void> {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  let flagged = true;
+  try {
+    await db
+      .update(schema.payoutForward)
+      .set({ status: "bookkeeping_pending", txHash: booking.txHash })
+      .where(eq(schema.payoutForward.fromTxHash, booking.fromTxHash));
+  } catch {
+    flagged = false;
+  }
+  alerter.fire("payout_unbooked", {
+    subject: booking.fromTxHash,
+    txHash: booking.txHash,
+    refId: booking.refId,
+    flagged,
+    reason: flagged
+      ? `anchor paid (tx ${booking.txHash}) but booking failed: ${reason}; left bookkeeping_pending for repair`
+      : `anchor paid (tx ${booking.txHash}) but booking failed: ${reason}; could not flag the row either, it is still claimed`,
+  });
 }

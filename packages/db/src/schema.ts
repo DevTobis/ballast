@@ -386,10 +386,16 @@ export const payoutForward = pgTable("payout_forward", {
   toAccount: text("to_account").notNull(),
   amount: money("amount").notNull(),
   memo: text("memo").notNull(),
-  /** `claimed` while in flight, `sent` once the network accepted it, `failed` if it did not (a
-   * failed forward may be retried). */
+  /** `claimed` while in flight, `sent` once the network accepted it and the journal pair is booked,
+   * `bookkeeping_pending` if it was accepted but the bookkeeping writes failed (the repair books
+   * those), `failed` if the network did not accept it (a failed forward may be retried). */
   status: text("status").notNull().default("claimed"),
   txHash: text("tx_hash"),
+  /** The `journal_entry.ref_id` the payout is booked under, fixed at claim time so a repair books
+   * under the same id the original attempt would have. */
+  refId: uuid("ref_id").notNull().defaultRandom(),
+  /** The `exit_quote` this payout fulfils, if any; kept so a repair can write the `exit_fill` row. */
+  quoteId: uuid("quote_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
