@@ -139,7 +139,7 @@ async function shutdown(signal: string): Promise<void> {
   // 3. Close the database pool.
   logger.info("keeper: closing database pool");
   try {
-    await db.end();
+    await db.$client.end();
     logger.info("keeper: database pool closed");
   } catch (err) {
     logger.error({ err }, "keeper: error closing database pool");
