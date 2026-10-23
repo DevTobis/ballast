@@ -42,6 +42,7 @@ export function requireLiveConfig(
  * (`Authorization: Bearer {apiKey}`, `Content-Type: application/json`). Throws an `Error` with the
  * response status and body text included in the message on any non-2xx response.
  * `operation` names the issuer and adapter method for timeout errors. No automatic retries.
+ * `idempotencyKey`, when given, is sent as an `Idempotency-Key` header.
  */
 export async function issuerApiRequest<T>(
   operation: string,
@@ -49,6 +50,7 @@ export async function issuerApiRequest<T>(
   url: string,
   apiKey: string,
   body?: unknown,
+  idempotencyKey?: string,
 ): Promise<T> {
   const timeoutMs = requestTimeoutMs();
   const signal = AbortSignal.timeout(timeoutMs);
@@ -58,6 +60,7 @@ export async function issuerApiRequest<T>(
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
+        ...(idempotencyKey === undefined ? {} : { "Idempotency-Key": idempotencyKey }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,

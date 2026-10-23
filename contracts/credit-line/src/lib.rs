@@ -396,6 +396,11 @@ impl CreditLine {
     }
 
     /// Names the `PledgeVault` allowed to report collateral through `sync_from_vault`. Admin only.
+    ///
+    /// The `admin` argument is intentionally unused: authorization is enforced against the *stored*
+    /// admin via `access::require_admin`, so passing a different address (or an address with no
+    /// stored role) cannot bypass or substitute for the real admin's signature. This mirrors the
+    /// `let _ = admin;` pattern used by the other admin-gated setters in this contract.
     pub fn set_vault(env: Env, admin: Address, vault: Address) {
         ttl::extend_instance(&env);
         let _ = admin;
