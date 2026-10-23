@@ -210,6 +210,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ballast-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "ballast-common",
+ "ballast-credit-line",
+ "ballast-pledge-vault",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "ballast-pledge-vault"
 version = "0.1.0"
 dependencies = [

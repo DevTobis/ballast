@@ -1,0 +1,1 @@
+ALTER TABLE "liquidation" ADD CONSTRAINT "liquidation_credit_line_id_unique" UNIQUE("credit_line_id");
