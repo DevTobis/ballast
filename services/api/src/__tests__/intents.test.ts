@@ -236,6 +236,39 @@ describe("sweepPendingIntents", () => {
     expect(second).toEqual({ settled: 1, failed: 0, expired: 0, errors: 0 });
   });
 
+  it("rolls the expiry claim back when the book update fails, so a later sweep retries it", async () => {
+    const stale = intent({ createdAt: new Date(Date.now() - INTENT_EXPIRY_MS - 1000) });
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [stale]]]));
+    const update = db.update as any;
+    let linesDown = true;
+    db.update = ((table: unknown) => {
+      if (table === schema.creditLine && linesDown) throw new Error("DB connection lost during line update");
+      return update(table);
+    }) as any;
+    // Discard what a throwing transaction wrote, as Postgres would.
+    (db as any).transaction = async (cb: (trx: any) => Promise<any>) => {
+      const before = updated.length;
+      try {
+        return await cb(db);
+      } catch (err) {
+        updated.length = before;
+        throw err;
+      }
+    };
+    const chain = chainWith({ status: "NOT_FOUND" });
+
+    const first = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(first).toEqual({ settled: 0, failed: 0, expired: 0, errors: 1 });
+    expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(false);
+
+    linesDown = false;
+    const second = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(second).toEqual({ settled: 0, failed: 0, expired: 1, errors: 0 });
+    expect(updated).toContainEqual({ table: schema.creditLine, set: { status: "failed" } });
+  });
+
   it("leaves a recent unsubmitted transaction pending", async () => {
     const { db, updated } = makeDb(new Map([[schema.txIntent, [intent()]]]));
 
