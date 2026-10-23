@@ -70,9 +70,12 @@ export function createAlerter(service: string, options: AlerterOptions = {}): Al
       if (!webhookUrl) return;
 
       // The subject is whichever identifier the alert names; alerts about different assets or
-      // lines must not suppress each other.
-      const subject = String(context.assetId ?? context.code ?? context.creditLineId ?? context.line ?? "");
-      const key = `${kind}:${subject}`;
+      // lines must not suppress each other. State is included when present so state escalations
+      // (e.g. MarginCall -> Liquidation) are not swallowed by the cooldown.
+      const baseSubject = String(context.subject ?? context.assetId ?? context.code ?? context.creditLineId ?? context.line ?? "");
+      const stateSuffix = typeof context.state === "string" ? `:${context.state}` : "";
+      const subject = baseSubject;
+      const key = `${kind}:${subject}${stateSuffix}`;
       const at = now();
       const previous = lastSent.get(key);
       if (previous !== undefined && at - previous < cooldownMs) return;
