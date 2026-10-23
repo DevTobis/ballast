@@ -34,6 +34,10 @@ All keeper jobs sign with a single operator account and need sequential transact
   - `job` (default): lock key is `hashtext('keeper:' || name)`, allowing different jobs to run while locking out duplicates of the same job.
   - `global`: lock key is `hashtext('keeper:global')`, ensuring strict single-job execution across the entire cluster.
 
+### Storage TTL Maintenance
+
+Soroban persistent storage entries archive if not extended. `CreditLine::extend_ttl(line)` is an unauthenticated contract entry point that extends instance and persistent entry TTLs (`Line`, `Claimable`, `Liquidation`). Keepers or periodic tasks can call this for dormant lines to ensure they remain accessible without requiring restoration.
+
 ## Run
 
 ```

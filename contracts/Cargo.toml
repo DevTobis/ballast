@@ -8,6 +8,7 @@ members = [
     "credit-line",
     "exit-desk",
     "repo-dvp",
+    "integration-tests",
 ]
 
 [workspace.package]

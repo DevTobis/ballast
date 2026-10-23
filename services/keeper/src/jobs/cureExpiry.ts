@@ -143,23 +143,44 @@ export async function runCureExpiryJob(
         );
       }
 
-      const pledges = await db
-        .select()
-        .from(schema.pledge)
-        .where(and(eq(schema.pledge.creditLineId, line.id), eq(schema.pledge.status, "active")));
-      for (const pledge of pledges) {
-        await db.update(schema.pledge).set({ status: "liquidated" }).where(eq(schema.pledge.id, pledge.id));
-      }
       const totalUnits = held;
 
-      await db.insert(schema.liquidation).values({
-        creditLineId: line.id,
-        route: "transfer",
-        units: scaledToDecimalString(totalUnits),
-        txHashes,
-        completedAt: new Date(),
+      await db.transaction(async (tx) => {
+        const pledges = await tx
+          .select()
+          .from(schema.pledge)
+          .where(and(eq(schema.pledge.creditLineId, line.id), eq(schema.pledge.status, "active")));
+        for (const pledge of pledges) {
+          await tx.update(schema.pledge).set({ status: "liquidated" }).where(eq(schema.pledge.id, pledge.id));
+        }
+
+        const existingLiquidation = await tx
+          .select()
+          .from(schema.liquidation)
+          .where(eq(schema.liquidation.creditLineId, line.id))
+          .limit(1);
+
+        if (existingLiquidation.length === 0) {
+          await tx.insert(schema.liquidation).values({
+            creditLineId: line.id,
+            route: "transfer",
+            units: scaledToDecimalString(totalUnits),
+            txHashes,
+            completedAt: new Date(),
+          });
+        } else if (txHashes.length > 0) {
+          const mergedHashes = Array.from(new Set([...(existingLiquidation[0].txHashes ?? []), ...txHashes]));
+          await tx
+            .update(schema.liquidation)
+            .set({
+              txHashes: mergedHashes,
+              completedAt: existingLiquidation[0].completedAt ?? new Date(),
+            })
+            .where(eq(schema.liquidation.id, existingLiquidation[0].id));
+        }
+
+        await tx.update(schema.creditLine).set({ status: "liquidating" }).where(eq(schema.creditLine.id, line.id));
       });
-      await db.update(schema.creditLine).set({ status: "liquidating" }).where(eq(schema.creditLine.id, line.id));
 
       result.processed++;
     } catch (err) {

@@ -9,7 +9,7 @@
  * draw/exit/repo would actually see.
  */
 import { schema, type Database } from "@ballast/db";
-import { createConsoleAlerter } from "@ballast/observability";
+import { createConsoleAlerter, createLogger } from "@ballast/observability";
 import { loadNetworkConfig } from "@ballast/network-config";
 import type { AssetConfig } from "@ballast/domain-types";
 import type { PriceGuardClient } from "@ballast/contract-clients";
@@ -19,6 +19,7 @@ import { scaledToDecimalString } from "./scaled.js";
 import { submitSignedTx, type KmsSigner, type SubmitResult } from "@ballast/operator-signing";
 
 const alerter = createConsoleAlerter("price-guard");
+const logger = createLogger("price-guard");
 
 type SubmitFn = (signedXdr: string) => Promise<SubmitResult>;
 type Reading = { value: bigint; ts: number };
@@ -39,7 +40,7 @@ async function settle(asset: AssetConfig, source: string, read: Promise<Reading>
   } catch (err) {
     const reason = `${source} fetch failed: ${err instanceof Error ? err.message : String(err)}`;
     alerter.fire("price_degraded", { assetId: asset.id, code: asset.code, reason });
-    console.error(`price-guard: ${asset.code}: ${reason}`);
+    logger.error({ err, assetId: asset.id, code: asset.code }, `price-guard: ${asset.code}: ${reason}`);
     return undefined;
   }
 }
@@ -139,7 +140,7 @@ export async function runPriceUpdateCycle(
         } catch (err) {
           const reason = `issuer NAV publish failed: ${err instanceof Error ? err.message : String(err)}`;
           publishErrors.push({ source: "issuer NAV", reason });
-          console.error(`price-guard: ${asset.code}: ${reason}`);
+          logger.error({ err, assetId: asset.id, code: asset.code }, `price-guard: ${asset.code}: ${reason}`);
         }
       }
       if (feed) {
@@ -155,7 +156,7 @@ export async function runPriceUpdateCycle(
         } catch (err) {
           const reason = `RedStone feed publish failed: ${err instanceof Error ? err.message : String(err)}`;
           publishErrors.push({ source: "RedStone feed", reason });
-          console.error(`price-guard: ${asset.code}: ${reason}`);
+          logger.error({ err, assetId: asset.id, code: asset.code }, `price-guard: ${asset.code}: ${reason}`);
         }
       }
 
@@ -188,7 +189,9 @@ export async function runPriceUpdateCycle(
     } catch (err) {
       // Don't let one asset's failure crash the whole cycle — other assets still need their
       // prices published this run.
-      console.error(`price-guard: cycle failed for asset ${asset.code}`, err);
+      const reason = err instanceof Error ? err.message : String(err);
+      alerter.fire("price_degraded", { assetId: asset.id, code: asset.code, reason });
+      logger.error({ err, assetId: asset.id, code: asset.code }, `price-guard: cycle failed for asset ${asset.code}`);
     }
   }
 }
