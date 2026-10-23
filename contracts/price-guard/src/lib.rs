@@ -238,6 +238,26 @@ fn track_source_name(env: &Env, asset: &Address, name: &Symbol) {
     }
 }
 
+fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
+    let names_key = (Symbol::new(env, "src_names"), asset.clone());
+    let names: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&names_key)
+        .unwrap_or_else(|| Vec::new(env));
+    if let Some(idx) = names.first_index_of(name) {
+        let mut new_names = Vec::new(env);
+        for (i, n) in names.iter().enumerate() {
+            if i as u32 != idx {
+                new_names.push_back(n);
+            }
+        }
+        env.storage().instance().set(&names_key, &new_names);
+    }
+    let key = DataKey::Source(asset.clone(), name.clone());
+    env.storage().persistent().remove(&key);
+}
+
 fn read_all_sources(env: &Env, asset: &Address) -> Vec<PriceSource> {
     let names_key = (Symbol::new(env, "src_names"), asset.clone());
     let names: Vec<Symbol> = env
@@ -767,6 +787,24 @@ impl PriceGuard {
             (Symbol::new(&env, "configure_signature_requirement"),),
             required,
         );
+    }
+
+    /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
+    /// for `asset`. Unknown name removal is a safe no-op.
+    pub fn remove_source(env: Env, admin: Address, asset: Address, name: Symbol) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+
+        remove_source_internal(&env, &asset, &name);
+
+        env.events().publish(
+            (Symbol::new(&env, "source_removed"), asset.clone()),
+            name,
+        );
+
+        evaluate(&env, asset);
     }
 
     /// Queues a loosening configuration change, subject to a 48h timelock delay.
@@ -2697,6 +2735,81 @@ mod test {
         // The middle value never matters; only min and max, wherever they sit in the slice.
         assert!(within_band(&[10_025, 10_050, 10_000], 50));
         assert!(!within_band(&[10_051, 10_025, 10_000], 50));
+    }
+
+    #[test]
+    fn admin_can_remove_source_and_free_slot() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Publish NAV (slot 1) + 7 feeds (slots 2..8) -> total 8 sources.
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        for i in 1..=7 {
+            let name = Symbol::new(&env, &std::format!("feed_{}", i));
+            client.publish_source(&publisher, &asset, &name, &SCALE, &now);
+        }
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.sources.len(), 8);
+
+        // Attempting a 9th publish before removal panics because SortBuf capacity is 8.
+        let name_9 = Symbol::new(&env, "feed_9");
+        let res_9 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&publisher, &asset, &name_9, &SCALE, &now);
+        }));
+        assert!(res_9.is_err(), "publishing 9th source must panic before removal");
+
+        // Admin removes feed_7.
+        let name_7 = Symbol::new(&env, "feed_7");
+        client.remove_source(&admin, &asset, &name_7);
+
+        let price_after_remove = client.guarded_price(&asset);
+        assert_eq!(price_after_remove.status, PriceStatus::Ok);
+        assert_eq!(price_after_remove.sources.len(), 7);
+
+        // Now feed_9 can be published successfully in the freed slot.
+        client.publish_source(&publisher, &asset, &name_9, &SCALE, &now);
+        let price_after_9 = client.guarded_price(&asset);
+        assert_eq!(price_after_9.status, PriceStatus::Ok);
+        assert_eq!(price_after_9.sources.len(), 8);
+
+        // Removing unknown name is a safe no-op.
+        let unknown = Symbol::new(&env, "unknown");
+        client.remove_source(&admin, &asset, &unknown);
+        let price_after_unknown = client.guarded_price(&asset);
+        assert_eq!(price_after_unknown.sources.len(), 8);
+    }
+
+    #[test]
+    fn a_stranger_cannot_remove_source() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let stranger = Address::generate(&env);
+        let feed_name = feed(&env);
+        let now = env.ledger().timestamp();
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "remove_source",
+                args: (stranger.clone(), asset.clone(), feed_name.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.remove_source(&stranger, &asset, &feed_name);
+        }));
+        assert!(result.is_err(), "only the stored admin may remove a source");
+
+        // Real admin succeeds.
+        env.mock_all_auths();
+        client.remove_source(&admin, &asset, &feed_name);
     }
 
     mod invariants;

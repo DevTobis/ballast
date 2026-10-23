@@ -63,6 +63,13 @@
 //! change) to be booked. That accounting is left to the off-chain `ledger`/`margin-monitor`
 //! services (PRD §6.5); on-chain, "lender keeps the collateral, trade closed" is the full
 //! outcome.
+//! **Maturity default path (PRD §5 Phase 3 "Fail path"):**
+//! If the cash borrower fails to fund leg 2 at maturity, `unwind` reverts. Once the trade remains
+//! unpaid past `maturity_at + maturity_grace` (default 24h, admin-configurable with a 60s floor),
+//! the cash lender or keeper can trigger `default_at_maturity`. Like `default_close`, this values
+//! the pledged RWA at the guarded price with no haircut, transfers `ceil(total_due / price)` units
+//! to the cash lender (capped at what is pledged), and returns any surplus units to the borrower.
+//! If collateral value is less than `total_due`, the lender takes all units and bears the shortfall.
 //!
 //! **Skeleton simplification (yield during repo):** PRD §5 Phase 3 "Yield during repo" (passing
 //! manufactured payments on the pledged RWA back to the original owner during the term) is not
@@ -87,6 +94,12 @@ pub const MARGIN_CURE_GRACE_SECONDS: u64 = 24 * 60 * 60;
 /// The shortest cure window the admin may configure. A window shorter than a minute leaves a
 /// borrower no real chance to respond, whatever a keeper's schedule.
 pub const MIN_CURE_GRACE_SECONDS: u64 = 60;
+
+/// Grace period past maturity before `default_at_maturity` may act.
+pub const DEFAULT_MATURITY_GRACE_SECONDS: u64 = 24 * 60 * 60;
+
+/// The shortest maturity grace window the admin may configure.
+pub const MIN_MATURITY_GRACE_SECONDS: u64 = 60;
 
 /// How long past maturity the borrower's leg-2 allowance stays spendable (about one week of
 /// ~5s ledgers), so a late keeper run can still unwind.
@@ -198,6 +211,8 @@ enum DataKey {
     /// earlier trade's keeper unwind still needs.
     BorrowerDueExpiry(Address),
 
+    MaturityGrace,
+
     PendingUnpause(u64),
 
     LatestProposal(Address),
@@ -209,6 +224,14 @@ fn cure_grace(env: &Env) -> u64 {
         .instance()
         .get(&DataKey::CureGrace)
         .unwrap_or(MARGIN_CURE_GRACE_SECONDS)
+}
+
+/// The grace period past maturity before default_at_maturity may act: the admin's setting, else default 24h.
+fn maturity_grace(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaturityGrace)
+        .unwrap_or(DEFAULT_MATURITY_GRACE_SECONDS)
 }
 
 fn read_asset_config(env: &Env, asset: &Address) -> RepoAssetConfig {
@@ -427,6 +450,23 @@ impl RepoDvp {
 
     pub fn cure_grace_seconds(env: Env) -> u64 {
         cure_grace(&env)
+    }
+
+    /// Sets how long past maturity an unpaid trade must wait before `default_at_maturity` may act
+    /// (default 24h, at least [`MIN_MATURITY_GRACE_SECONDS`]).
+    pub fn set_maturity_grace(env: Env, admin: Address, seconds: u64) {
+        require_admin_is(&env, &admin);
+        assert!(
+            seconds >= MIN_MATURITY_GRACE_SECONDS,
+            "repo-dvp: maturity grace is shorter than the minimum"
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MaturityGrace, &seconds);
+    }
+
+    pub fn maturity_grace_seconds(env: Env) -> u64 {
+        maturity_grace(&env)
     }
 
     /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
@@ -962,6 +1002,79 @@ impl RepoDvp {
 
         env.events()
             .publish((symbol_short!("default"), id), (lender_units, borrower_units));
+    }
+
+    /// If the cash borrower fails to repay leg 2 at maturity, the cash lender or keeper can
+    /// default the trade once `now >= maturity_at + maturity_grace`. The cash lender receives
+    /// units covering `total_due` at the guarded price with no haircut, capped at what is pledged,
+    /// and any surplus units return to the borrower. If the collateral is worth less than `total_due`,
+    /// the lender takes all units and bears the shortfall. No USDC moves.
+    pub fn default_at_maturity(env: Env, caller: Address, id: u64) {
+        caller.require_auth();
+
+        let mut trade = read_trade(&env, id);
+        if trade.status != RepoStatus::Settled {
+            panic!("repo-dvp: trade is not settled");
+        }
+        let is_lender = caller == trade.cash_lender;
+        if !is_lender {
+            let roles = access::read_roles(&env);
+            if caller != roles.keeper {
+                panic!("repo-dvp: caller is neither lender nor keeper");
+            }
+        }
+        let grace = maturity_grace(&env);
+        let default_after = trade
+            .maturity_at
+            .checked_add(grace)
+            .expect("repo-dvp: overflow computing maturity grace");
+        if env.ledger().timestamp() < default_after {
+            panic!("repo-dvp: maturity grace period has not expired yet");
+        }
+
+        let settled_at = trade
+            .settled_at
+            .expect("repo-dvp: trade has no settlement time");
+        let total_due = total_due(&trade, settled_at);
+
+        let config = read_asset_config(&env, &trade.asset);
+        let guarded = PriceGuardClient::new(&env, &config.price_guard).guarded_price(&trade.asset);
+        if !guarded.is_usable_for_new_risk() {
+            panic!("repo-dvp: price is not Ok, cannot default");
+        }
+        let price = guarded.value;
+        assert!(price > 0, "repo-dvp: guarded price is not positive");
+
+        // Units worth `total_due` at the guarded price, rounded up so the lender is never short by
+        // rounding; ceil(a / b) = (a + b - 1) / b.
+        let owed_units = total_due
+            .checked_mul(PRICE_SCALE)
+            .expect("repo-dvp: overflow valuing total due")
+            .checked_add(price - 1)
+            .expect("repo-dvp: overflow valuing total due")
+            / price;
+        let lender_units = owed_units.min(trade.units);
+        let borrower_units = trade.units - lender_units;
+
+        let asset_client = token::Client::new(&env, &trade.asset);
+        asset_client.transfer(
+            &env.current_contract_address(),
+            to_muxed(&trade.cash_lender),
+            &lender_units,
+        );
+        if borrower_units > 0 {
+            asset_client.transfer(
+                &env.current_contract_address(),
+                to_muxed(&trade.cash_borrower),
+                &borrower_units,
+            );
+        }
+
+        trade.status = RepoStatus::Defaulted;
+        write_trade(&env, &trade);
+
+        env.events()
+            .publish((symbol_short!("mat_def"), id), (lender_units, borrower_units));
     }
 
     /// Pure read: where the trade's margin stands right now. Changes nothing.

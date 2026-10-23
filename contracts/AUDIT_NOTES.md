@@ -162,11 +162,17 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not
   pause-gated. `margin_view` is a free read.
-- **Default.** `default_close` is keeper-only, needs the cure window to have passed, re-evaluates
-  the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
-  guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the
-  collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
-  No USDC moves on default.
+- **Default.** Two routes lead to `Defaulted`:
+  - Margin default (`default_close`): keeper-only, needs the cure window to have passed, re-evaluates
+    the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
+    guarded price with no haircut, capped at the pledge; any remainder returns to the borrower.
+  - Maturity default (`default_at_maturity`): lender or keeper, available once `now >= maturity_at + maturity_grace`
+    (admin-configurable with a minimum floor). Covers unpaid leg 2 where the borrower did not fund repayment.
+    The lender receives `ceil(total_due / price)` units at the guarded price with no haircut, capped at
+    the pledge; any remainder returns to the borrower. If collateral is worth less than total due, the lender
+    takes all units and bears the shortfall. Requires an `Ok` guarded price.
+  - On both default paths, if the collateral is worth less than what is owed the lender takes all of it
+    and bears the shortfall. No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
 
 ## Known limits
