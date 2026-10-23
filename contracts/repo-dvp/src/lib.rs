@@ -40,6 +40,10 @@
 //!
 //! One live proposal per (lender, token) at a time: an allowance is a single number per
 //! owner/spender pair, so a lender's second `propose` replaces the first one's allowance.
+//! If a proposal is cancelled via `cancel_proposal` by the lender, the allowance is reset to 0
+//! if this was the lender's latest proposal. When a proposal is cancelled by the borrower,
+//! the trade status moves to `Cancelled` preventing acceptance, but the lender's allowance
+//! remains unchanged as the borrower does not hold authorization to modify the lender's allowance.
 //!
 //! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
 //! `default_close` gives the cash lender full title to the pledged RWA units and closes the
@@ -110,6 +114,7 @@ pub enum RepoStatus {
     Settled,
     Unwound,
     Defaulted,
+    Cancelled,
 }
 
 #[contracttype]
@@ -167,6 +172,7 @@ enum DataKey {
     AssetDisabled(Address),
     Trade(u64),
     CureGrace,
+    LatestProposal(Address),
 }
 
 /// The cure window a margin call opens with: the admin's setting, else the 24h default.
@@ -443,6 +449,9 @@ impl RepoDvp {
         );
 
         let id = timelock::next_id(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::LatestProposal(cash_lender.clone()), &id);
         let trade = RepoTrade {
             id,
             cash_lender,
@@ -464,6 +473,47 @@ impl RepoDvp {
         };
         write_trade(&env, &trade);
         id
+    }
+
+    /// Cancels a proposal that is still in `Proposed` status. Callable by either the cash lender
+    /// or the cash borrower.
+    ///
+    /// If cancelled by the cash lender, the contract's leg-1 USDC allowance is reset to 0 if this
+    /// was the lender's latest proposal. If cancelled by the cash borrower, the trade status moves
+    /// to `Cancelled` (blocking settlement) without modifying the lender's token allowance, as the
+    /// borrower is not authorized to sign for the lender.
+    pub fn cancel_proposal(env: Env, caller: Address, id: u64) {
+        caller.require_auth();
+
+        let mut trade = read_trade(&env, id);
+        if trade.status != RepoStatus::Proposed {
+            panic!("repo-dvp: trade is not in proposed status");
+        }
+        if caller != trade.cash_lender && caller != trade.cash_borrower {
+            panic!("repo-dvp: caller is neither lender nor borrower");
+        }
+
+        if caller == trade.cash_lender {
+            let latest: Option<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::LatestProposal(trade.cash_lender.clone()));
+            if latest == Some(id) {
+                let usdc = read_usdc(&env);
+                token::Client::new(&env, &usdc).approve(
+                    &trade.cash_lender,
+                    &env.current_contract_address(),
+                    &0,
+                    &allowance_expiry(&env, 0, 0),
+                );
+            }
+        }
+
+        trade.status = RepoStatus::Cancelled;
+        write_trade(&env, &trade);
+
+        env.events()
+            .publish((symbol_short!("cancel"), id), caller);
     }
 
     /// Leg 1, atomic (PRD invariant 7): within this single function, `units` of `asset` move from

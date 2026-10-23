@@ -77,6 +77,25 @@ export function readSecret(name: string, env: NodeJS.ProcessEnv): string | undef
 }
 
 /** `TRUST_PROXY`: `true`, a hop count (`1`), or a comma-separated list of proxy addresses/CIDRs. */
+export function parseComplianceEnforced(value: string | undefined, nodeEnv: string | undefined): boolean {
+  const v = (value ?? "").trim().toLowerCase();
+  if (v === "") {
+    return nodeEnv === "production";
+  }
+  if (v === "true" || v === "1") {
+    return true;
+  }
+  if (v === "false" || v === "0") {
+    if (nodeEnv === "production") {
+      console.warn("services/api: COMPLIANCE_ENFORCED is explicitly disabled in production; compliance gate is inactive");
+    }
+    return false;
+  }
+  throw new Error(
+    `services/api: invalid COMPLIANCE_ENFORCED value '${value}'. Expected boolean (true/false, 1/0) or leave unset for environment default`,
+  );
+}
+
 export function parseTrustProxy(value: string | undefined): boolean | number | string {
   const v = (value ?? "").trim();
   if (v === "" || v === "false") return false;
@@ -116,7 +135,7 @@ export function loadApiConfig(rawEnv: NodeJS.ProcessEnv = process.env): ApiConfi
     webhookSecretKey: env.WEBHOOK_SECRET_KEY ?? "",
     apiKeySecretKey: env.API_KEY_SECRET_KEY ?? "",
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
-    complianceEnforced: env.COMPLIANCE_ENFORCED ? env.COMPLIANCE_ENFORCED === "true" : env.NODE_ENV === "production",
+    complianceEnforced: parseComplianceEnforced(env.COMPLIANCE_ENFORCED, env.NODE_ENV),
     consoleOrigin: env.CONSOLE_ORIGIN ?? "http://localhost:5173",
   };
 }
