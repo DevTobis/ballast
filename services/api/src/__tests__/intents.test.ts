@@ -22,7 +22,7 @@ function makeDb(rows: Map<unknown, unknown[]>, claimRows: unknown[] = [{}]) {
     promise.limit = () => chain(data);
     return promise;
   };
-  const db = {
+  const db: any = {
     select: () => ({ from: (table: unknown) => chain(rows.get(table) ?? []) }),
     insert: (table: unknown) => ({
       values: async (values: unknown) => {
@@ -39,8 +39,9 @@ function makeDb(rows: Map<unknown, unknown[]>, claimRows: unknown[] = [{}]) {
         },
       }),
     }),
-  } as unknown as Database;
-  return { db, inserted, updated };
+    transaction: async (cb: (trx: any) => Promise<any>) => cb(db),
+  };
+  return { db: db as Database, inserted, updated };
 }
 
 function intent(overrides: Record<string, unknown> = {}) {
@@ -139,6 +140,36 @@ describe("settleIntent", () => {
 
     expect(result).toMatchObject({ status: "settled", ledger: 777 });
     expect(updated.filter((u) => u.table === schema.creditLine)).toHaveLength(0);
+  });
+
+  it("rolls back the intent claim and leaves it pending if book update fails", async () => {
+    let rolledBack = false;
+    let committed = false;
+    const { db } = makeDb(new Map());
+    // Simulate real transaction rollback on error:
+    db.transaction = async (cb: any) => {
+      try {
+        const res = await cb(db);
+        committed = true;
+        return res;
+      } catch (e) {
+        rolledBack = true;
+        throw e;
+      }
+    };
+    // Force book update failure by throwing on creditLine update
+    db.update = ((orig: any) => (table: unknown) => {
+      if (table === schema.creditLine) {
+        throw new Error("DB connection lost during line update");
+      }
+      return orig(table);
+    })(db.update) as any;
+
+    const chain = chainWith({ status: "SUCCESS", ledger: 777, returnValue: 4n });
+
+    await expect(settleIntent(db, chain, noContracts, intent())).rejects.toThrow("DB connection lost during line update");
+    expect(rolledBack).toBe(true);
+    expect(committed).toBe(false);
   });
 
   it("doesn't ask the network about an intent that is already final", async () => {

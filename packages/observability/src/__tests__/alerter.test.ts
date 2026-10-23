@@ -44,6 +44,20 @@ describe("createAlerter", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
+  it("sends state escalation from MarginCall to Liquidation within cooldown, but deduplicates same state", () => {
+    const { alerter, fetchImpl } = setup();
+    alerter.fire("margin_call", { creditLineId: "line-1", state: "MarginCall", ltvBps: 8500 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    // Escalation from MarginCall to Liquidation within cooldown MUST be sent
+    alerter.fire("margin_call", { creditLineId: "line-1", state: "Liquidation", ltvBps: 9500 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+
+    // Repeated alert for the same state remains deduplicated within cooldown
+    alerter.fire("margin_call", { creditLineId: "line-1", state: "Liquidation", ltvBps: 9600 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("only logs when no webhook is configured", () => {
     const { alerter, fetchImpl } = setup({ webhookUrl: undefined, env: {} });
     alerter.fire("rpc_lag_high", { lagLedgers: 40 });
