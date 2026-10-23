@@ -58,6 +58,10 @@ export interface PollOnceResult {
   insertedCount: number;
   latestLedger: number;
   scannedUpTo: number;
+  /** First ledger whose events were lost because the RPC no longer retains them, when clamped. */
+  skippedFrom?: number;
+  /** Last ledger whose events were lost because the RPC no longer retains them, when clamped. */
+  skippedTo?: number;
 }
 
 export interface IndexerState {
@@ -92,6 +96,11 @@ export function computeRpcLag(
 /**
  * Fetches events for `contractIds` since `cursorLedger + 1` (or the last-ingested ledger, or
  * `latestLedger - 1000` on a cold start) and inserts one `chain_event` row per event.
+ *
+ * The resume cursor can fall outside the RPC's retention window when the indexer has been idle
+ * longer than the node keeps history. `getEvents` rejects that `startLedger` outright, so the
+ * cursor would never advance. We clamp it to the oldest ledger the node still has and report the
+ * skipped range; those events are gone and the caller must surface the gap.
  */
 export async function pollOnce(
   db: Database,
@@ -99,17 +108,29 @@ export async function pollOnce(
   contractIds: string[],
   cursorLedger?: number,
 ): Promise<PollOnceResult> {
-  let startLedger: number;
+  let desiredStartLedger: number;
   if (cursorLedger !== undefined) {
-    startLedger = cursorLedger + 1;
+    desiredStartLedger = cursorLedger + 1;
   } else {
     const lastIngested = await getLastIngestedLedger(db);
     if (lastIngested !== null) {
-      startLedger = lastIngested + 1;
+      desiredStartLedger = lastIngested + 1;
     } else {
       const { sequence } = await rpcServer.getLatestLedger();
-      startLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
+      desiredStartLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
     }
+  }
+
+  const { oldestLedger } = await rpcServer.getHealth();
+  const startLedger = Math.max(desiredStartLedger, oldestLedger);
+  const skippedFrom = startLedger > desiredStartLedger ? desiredStartLedger : undefined;
+  const skippedTo = skippedFrom !== undefined ? startLedger - 1 : undefined;
+
+  if (skippedFrom !== undefined && skippedTo !== undefined) {
+    metrics.increment("indexer.events_gap_skipped", {
+      from: String(skippedFrom),
+      to: String(skippedTo),
+    });
   }
 
   // Drain every page before returning. The next poll resumes from `max(ledger) + 1`, so stopping
@@ -149,7 +170,14 @@ export async function pollOnce(
   metrics.gauge("indexer.latest_ledger", latestLedger);
 
   const scannedUpTo = Math.max(cursorLedger ?? 0, latestLedger);
-  return { fromLedger: startLedger, insertedCount: events.length, latestLedger, scannedUpTo };
+  return {
+    fromLedger: startLedger,
+    insertedCount: events.length,
+    latestLedger,
+    scannedUpTo,
+    skippedFrom,
+    skippedTo,
+  };
 }
 
 /**
@@ -181,6 +209,12 @@ export async function runIndexerCycle(
   }
 
   const result = await pollOnce(db, rpcServer, contractIds, state.lastScannedLedger);
+  if (result.skippedFrom !== undefined && result.skippedTo !== undefined) {
+    alerter.fire("event_gap_skipped", {
+      fromLedger: result.skippedFrom,
+      toLedger: result.skippedTo,
+    });
+  }
   state.lastScannedLedger = result.scannedUpTo;
   return result;
 }
