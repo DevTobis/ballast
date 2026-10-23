@@ -53,9 +53,18 @@ export function registerTxRoutes(
     }
 
     for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt++) {
-      const settled = await settleIntent(db, chain, contracts, intent);
-      if (settled.status !== "pending") {
-        return reply.code(settled.status === "settled" ? 200 : 422).send(settled);
+      try {
+        const settled = await settleIntent(db, chain, contracts, intent);
+        if (settled.status !== "pending") {
+          return reply.code(settled.status === "settled" ? 200 : 422).send(settled);
+        }
+      } catch (err) {
+        // The envelope was already sent, so a failure here is not the caller's
+        // problem to retry: settleIntent has put the intent back to `pending`
+        // and the sweeper will settle it. Answering 5xx would make the wallet
+        // user sign and submit again — and possibly double-act. Keep polling
+        // and fall through to the honest 202 below.
+        request.log.error({ err, txHash }, "settle attempt failed; intent is still pending");
       }
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }

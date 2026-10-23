@@ -18,22 +18,64 @@ get started.
 
 ## Development Setup
 
+Choose the setup path matching your contribution:
+
+### Path A: Logic-only work (Recommended for most contributors)
+
+For changes to backend services, shared packages, the web console, or contract unit tests, you do not need to run a live network or deploy contracts. Unit tests run offline against test doubles and recorded fixtures:
+
 ```bash
 git clone https://github.com/DevTobis/ballast.git
 cd ballast
 pnpm install
-scripts/dev-setup.sh testnet   # Postgres, .env, migrations, seed data - see scripts/README.md
-pnpm dev                       # every service + the console (http://localhost:5173)
-scripts/e2e-services.sh        # optional: drive the whole stack end to end
+pnpm build
+pnpm test                  # runs the Vitest suite across all services and packages
 ```
 
-Needs Node >= 22.12, pnpm, the Stellar CLI, and Docker or Podman (for Postgres).
+If you are working on contracts:
 
-You'll also need [Rust](https://rustup.rs/) and the
-[Stellar CLI](https://developers.stellar.org/docs/build/smart-contracts/getting-started/setup) if
-you're touching `contracts/`. See `scripts/README.md` for running the contracts against a local
-network or public Stellar testnet, and `TESTNET_DEPLOYMENT.md` for the current live testnet
-deployment.
+```bash
+cd contracts
+cargo test --workspace     # tests all contract logic on the host target (no CLI or network needed)
+```
+
+### Path B: Full stack (Contracts + Services + Console + E2E)
+
+If you are developing or verifying on-chain behavior end-to-end against a live network:
+
+```bash
+git clone https://github.com/DevTobis/ballast.git
+cd ballast
+pnpm install
+scripts/deploy.sh testnet      # builds/deploys contracts, generates & funds your own role keys (~2-3 min)
+scripts/dev-setup.sh testnet   # starts Postgres container, generates .env, runs migrations & seeds
+pnpm dev                       # starts all services + console at http://localhost:5173
+scripts/e2e-services.sh        # optional: drive the full collateral rail, exit desk, and repo flows
+```
+
+> [!NOTE]
+> **Documented live deployment is read-only for outsiders:** The live testnet deployment documented in [`TESTNET_DEPLOYMENT.md`](TESTNET_DEPLOYMENT.md) is for public reference and audit only. Its role keys reside exclusively in the original deployer's local Stellar CLI identity store. Outside contributors running the full stack must deploy their own contracts using `scripts/deploy.sh testnet` (or `local`), which creates and funds local identities via friendbot.
+
+---
+
+## Toolchain & Prerequisites
+
+Depending on the scope of your changes, ensure the following tools and minimum versions are available on your system:
+
+| Tool | Minimum Version | Required For | Notes |
+|---|---|---|---|
+| **Node.js** | `>= 22.12` | All TypeScript packages & services | Monorepo root engine requirement |
+| **pnpm** | `>= 9.0` (uses `10.22.0`) | Package management | Core workspace package manager |
+| **Rust & Cargo** | Stable toolchain | Smart contracts (`contracts/`) | Managed via `rustup` |
+| **`wasm32v1-none` target** | Current stable | Building contracts to WASM | Install with `rustup target add wasm32v1-none` |
+| **Stellar CLI (`stellar`)** | `>= 25.2` (CI uses `28.1.0`) | Contract builds & deployments | Install from [Stellar CLI docs](https://developers.stellar.org/docs/build/smart-contracts/getting-started/setup) |
+| **Docker or Podman** | Any modern version | Local Postgres (`ballast-pg`) | Required by `scripts/dev-setup.sh` |
+| **Bash** | `>= 4.0` | Deployment & E2E scripts | Scripts use associative arrays (`declare -A`) and `mapfile` |
+| **Python 3** | `>= 3.9` | Deployment scripts | Used for JSON parsing and base32/hex key derivations |
+| **curl** | Standard | Scripts & network checks | Used for Horizon balance queries and network health checks |
+| **OpenSSL** | Standard | Security & scripts | Used for random token and key generation |
+
+If `scripts/doctor.sh` is present in the repository, you can run it to verify your local toolchain setup.
 
 ---
 

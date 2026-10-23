@@ -83,12 +83,14 @@ web console. You need Node >= 22.12, pnpm, the
 
 ```bash
 pnpm install
-scripts/deploy.sh testnet      # only for a fresh deployment - see TESTNET_DEPLOYMENT.md for the live one
+scripts/deploy.sh testnet      # deploys your own contracts and creates funded role keys
 scripts/dev-setup.sh testnet   # Postgres, .env, migrations, seeded lender/borrower/asset
 pnpm dev                       # all services + console on http://localhost:5173
 scripts/e2e-services.sh        # collateral rail, exit desk and repo, through the API
 scripts/e2e-liquidation.sh     # price falls, the services liquidate a line on their own
 ```
+
+The documented deployment in [`TESTNET_DEPLOYMENT.md`](TESTNET_DEPLOYMENT.md) is for reference and audit; its admin keys reside in the original deployer's key store, so outside contributors deploy their own contracts via `scripts/deploy.sh testnet`.
 
 How a transaction flows: `services/api` builds unsigned XDR and records what it means
 (`tx_intent`); the customer signs it in their own wallet (Freighter in the console); the signed

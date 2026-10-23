@@ -357,6 +357,59 @@ fn only_the_admin_can_withdraw() {
 }
 
 #[test]
+fn disabled_asset_blocks_quote_and_exit_but_allows_withdraw_and_reenable() {
+    let h = setup();
+    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    assert!(desk.is_asset_enabled(&h.rwa));
+
+    // Non-admin cannot disable asset
+    let stranger = Address::generate(&h.env);
+    let unauthorized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.disable_asset(&stranger, &h.rwa);
+    }));
+    assert!(unauthorized.is_err(), "only admin may disable asset");
+
+    // Admin disables asset
+    desk.disable_asset(&h.admin, &h.rwa);
+    assert!(!desk.is_asset_enabled(&h.rwa));
+
+    // Quoting a disabled asset panics
+    let quote_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.quote(&h.rwa, &PRICE_SCALE);
+    }));
+    assert!(quote_res.is_err(), "quoting disabled asset must fail");
+
+    // Exiting a disabled asset panics
+    let holder = Address::generate(&h.env);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &(10 * PRICE_SCALE));
+    let exit_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.exit(&holder, &h.rwa, &(10 * PRICE_SCALE), &0, &holder);
+    }));
+    assert!(exit_res.is_err(), "exiting disabled asset must fail");
+
+    // Operator withdraw of float or inventory still succeeds when an asset is disabled
+    let treasury = Address::generate(&h.env);
+    desk.withdraw(&h.admin, &h.usdc, &(100 * PRICE_SCALE), &treasury);
+    assert_eq!(MockTokenClient::new(&h.env, &h.usdc).balance(&treasury), 100 * PRICE_SCALE);
+
+    // Re-enabling the asset restores quotes and exits
+    desk.enable_asset(&h.admin, &h.rwa);
+    assert!(desk.is_asset_enabled(&h.rwa));
+
+    let q = desk.quote(&h.rwa, &PRICE_SCALE);
+    assert!(q.usdc_out > 0);
+
+    let out = desk.exit(&holder, &h.rwa, &(10 * PRICE_SCALE), &0, &holder);
+    assert!(out > 0);
+    assert_eq!(MockTokenClient::new(&h.env, &h.usdc).balance(&holder), out);
+}
+
+
+#[test]
 fn pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work() {
     let h = setup();
     configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
