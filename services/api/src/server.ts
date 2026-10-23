@@ -63,13 +63,6 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     trustProxy: (config.trustProxy ?? false) as boolean | string,
   });
 
-  app.setErrorHandler((error, request, reply) => {
-    if (error instanceof ZodError) {
-      return reply.code(400).send({ error: "invalid request", issues: error.issues });
-    }
-    return reply.send(error);
-  });
-
   // Registered before auth: this is a pure JSON API (no HTML, so helmet's defaults are fine
   // as-is) that the console browser app calls cross-origin, so CORS must be locked to that one
   // known origin rather than left as `*`.
@@ -97,6 +90,10 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   });
 
   app.setErrorHandler((error: any, request, reply) => {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid request", issues: error.issues });
+    }
+
     const isContractRejected =
       error instanceof ContractRejectedError ||
       error?.name === "ContractRejectedError" ||
@@ -130,7 +127,9 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       return reply.code(error.statusCode).send(error);
     }
 
-    return reply.code(error.statusCode || 500).send({
+    const statusCode = error.statusCode || 500;
+    return reply.code(statusCode).send({
+      statusCode,
       error: "Internal Server Error",
     });
   });
