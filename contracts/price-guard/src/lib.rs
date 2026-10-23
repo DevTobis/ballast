@@ -59,7 +59,7 @@
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
-    ttl,
+    ttl, upgrade,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -591,6 +591,36 @@ impl PriceGuard {
     /// The outstanding queued change for `id`, including its `executes_at` timestamp.
     pub fn pending_role_change(env: Env, id: u64) -> Option<access::PendingRoleChange> {
         access::pending_role_change(&env, id)
+    }
+
+    /// Queues a timelocked contract upgrade to `new_wasm_hash`.
+    /// Admin only. Executable after 48h.
+    pub fn queue_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> u64 {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::queue_upgrade(&env, &new_wasm_hash)
+    }
+
+    /// Cancels a pending contract upgrade.
+    /// Admin only.
+    pub fn cancel_upgrade(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::cancel_upgrade(&env, id);
+    }
+
+    /// Executes a queued contract upgrade once the 48h timelock has elapsed.
+    /// Permissionless once ready.
+    pub fn execute_upgrade(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        upgrade::execute_upgrade(&env, id);
+    }
+
+    /// Returns the pending upgrade for `id`, if one exists.
+    pub fn pending_upgrade(env: Env, id: u64) -> Option<upgrade::PendingUpgrade> {
+        upgrade::pending_upgrade(&env, id)
     }
 
     /// Admin-set per-asset thresholds. Kept local to this contract rather than cross-called from
@@ -1356,6 +1386,8 @@ mod test {
     /// NAV remains fixed at 1.0, while an independent feed steps up +0.1% per publish to +5%, then
     /// drops back down. With a 50 bps band, no step beyond +0.5% may be Ok, the published value
     /// must never exceed the NAV by more than the band, and the guard must not Halt on the way back down.
+    /// With the NAV and this one feed as the only sources, an Ok price is their average, so it
+    /// moves at half the feed's step; Degraded steps hold the last good price.
     #[test]
     fn scripted_replay_ustry_manipulation_2026_02_22() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
@@ -1377,24 +1409,24 @@ mod test {
 
         let steps = [
             Step { step: 0, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
-            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
-            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
-            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 30_000 },
-            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
-            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
-            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
-            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
-            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 5_000 },
+            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 15_000 },
+            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
             Step { step: 19, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
         ];
 
@@ -1875,6 +1907,111 @@ mod test {
         let next_price = client.guarded_price(&asset);
         assert_eq!(next_price.status, PriceStatus::Ok);
         assert_eq!(next_price.value, SCALE);
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_or_cancel_upgrade() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 10_000, 3600);
+        let stranger = Address::generate(&env);
+        let dummy_wasm = BytesN::from_array(&env, &[1u8; 32]);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_upgrade",
+                args: (stranger.clone(), dummy_wasm.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_upgrade(&stranger, &dummy_wasm);
+        }));
+        assert!(result.is_err(), "only the stored admin may queue an upgrade");
+
+        env.mock_all_auths();
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_upgrade",
+                args: (stranger.clone(), id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let cancel_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_upgrade(&stranger, &id);
+        }));
+        assert!(cancel_res.is_err(), "only the stored admin may cancel an upgrade");
+
+        env.mock_all_auths();
+        client.cancel_upgrade(&admin, &id);
+        assert_eq!(client.pending_upgrade(&id), None);
+    }
+
+    #[test]
+    fn execute_upgrade_requires_the_timelock_to_elapse() {
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 10_000, 3600);
+        let dummy_wasm = BytesN::from_array(&env, &[2u8; 32]);
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_upgrade(&id);
+        }));
+        assert!(early.is_err(), "cannot execute upgrade before 48h elapses");
+    }
+
+    #[test]
+    fn test_price_guard_upgrade_and_state_persistence() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        const NEW_WASM: &[u8] = include_bytes!("../../../vendor/test_wasms/contract.wasm");
+        let new_wasm_hash = env.deployer().upload_contract_wasm(NEW_WASM);
+
+        let id = client.queue_upgrade(&admin, &new_wasm_hash);
+        assert_eq!(
+            client.pending_upgrade(&id),
+            Some(ballast_common::upgrade::PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                executes_at: env.ledger().timestamp() + 48 * 3600,
+            })
+        );
+
+        // Advance 48 hours
+        env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600);
+        client.execute_upgrade(&id);
+
+        env.as_contract(&client.address, || {
+            assert_eq!(ballast_common::upgrade::pending_upgrade(&env, id), None);
+        });
+
+        mod upgraded {
+            soroban_sdk::contractimport!(file = "../../vendor/test_wasms/contract.wasm");
+        }
+        let upgraded_client = upgraded::Client::new(&env, &client.address);
+        let sum = upgraded_client.add(&15, &27);
+        assert_eq!(sum, 42);
+
+        // State persists: the last good price and config established before upgrade are still in storage
+        env.as_contract(&client.address, || {
+            let last_good: Option<i128> = env.storage().instance().get(&DataKey::LastGood(asset.clone()));
+            assert_eq!(last_good, Some(SCALE));
+            let config = read_config(&env, &asset);
+            assert_eq!(config.band_bps, 50);
+            assert_eq!(config.daily_move_band_bps, 10_000);
+        });
     }
 
     #[test]
