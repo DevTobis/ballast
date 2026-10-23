@@ -7,7 +7,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 
 | Role | Can | Cannot |
 |---|---|---|
-| `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
+| `admin` | configure assets, tighten thresholds immediately, queue loosening changes (48h timelock); set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender; loosen guard parameters without 48h timelock |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral`, `liquidate`, vault `liquidate`, repo `call_margin`/`default_close`, `poke` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
@@ -46,6 +46,15 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
   good value is a sticky `Halted` that only `risk` clears.
+- **Threshold loosening and key rotations require a 48h timelock.** Tightening configuration changes
+  (narrowing `band_bps`, `daily_move_band_bps`, `window_move_band_bps`, reducing `max_staleness_s`,
+  lengthening `window_seconds`, registering an initial issuer key, or enabling NAV signature requirement)
+  take effect immediately via `configure_asset`, `configure_issuer_key`, and
+  `configure_signature_requirement`. In contrast, any loosening changes (widening bands, increasing staleness
+  tolerance, shortening the smoothing window), rotating an already-registered issuer public key, or
+  disabling NAV signature requirement cannot be executed directly; they must be queued via `queue_config`
+  by admin, wait out the 48-hour delay (`ballast_common::timelock`), and then be applied permissionlessly
+  via `execute_config`. Admin can cancel queued changes via `cancel_config`.
 - **A rolling reference bounds slow drift over a window.** `daily_move_band_bps` only compares a
   publish against the immediately preceding one, so a publisher (or a bug) moving the price a little
   on every publish could walk it anywhere over an hour without ever tripping a single-step check. The
@@ -129,6 +138,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   contract between transactions.
 - Quotes are the guarded price less the spread, rounded down (in the desk's favour), and refuse any
   price that is not `Ok`.
+- **Pause.** `pause(pauser, scope)` lets the pauser halt `PauseScope::Exits` or `PauseScope::All` immediately.
+  `exit` is the only gated path; `quote` and `withdraw` remain active while paused (invariant 5).
+  Unpausing requires a 48-hour timelock (`queue_unpause` / `execute_unpause`) by the admin.
+  Note for maintainers: `CreditLine` and `PledgeVault` follow this same localized instance-storage pause pattern
+  for `Draws` and `Pledges`.
 
 ## RepoDvP
 

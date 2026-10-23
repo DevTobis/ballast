@@ -239,6 +239,8 @@ impl PledgeVault {
         let _ = admin;
         access::require_admin(&env);
         ttl::extend_instance(&env);
+
+        thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
             &AssetConfig {
@@ -483,6 +485,11 @@ impl PledgeVault {
         );
         ttl::extend_persistent(&env, &key);
     }
+
+    /// Read-only helper for consoles/tests: full position for `(line, asset)`.
+    pub fn position(env: Env, line: u64, asset: Address) -> Position {
+        read_position(&env, line, &asset)
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +664,7 @@ mod test {
         price_guard: mock_price_guard::MockPriceGuardClient<'static>,
         credit_line: mock_credit_line::MockCreditLineClient<'static>,
         admin: Address,
+        keeper: Address,
         borrower: Address,
         asset: Address,
         thresholds: MarginThresholds,
@@ -714,6 +722,7 @@ mod test {
             price_guard,
             credit_line,
             admin,
+            keeper,
             borrower,
             asset: token_id,
             thresholds,
@@ -956,6 +965,101 @@ mod test {
     }
 
     #[test]
+    fn escrow_partial_liquidation_and_token_delivery() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+
+        // Recipient balance and remaining position asserted
+        assert_eq!(h.token.balance(&lender), 400 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 600 * PRICE_SCALE);
+        assert_eq!(h.vault.position(&1, &h.asset).units, 600 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 600 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.vault.address), 600 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: liquidate exceeds pledged units")]
+    fn liquidate_exceeds_pledged_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 600 * PRICE_SCALE);
+
+        // 600 units remaining; liquidating 601 must panic
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(601 * PRICE_SCALE), &lender);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn liquidate_zero_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &0, &lender);
+    }
+
+    #[test]
+    fn liquidate_rejected_for_non_keeper() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        let stranger = Address::generate(&h.env);
+        let lender = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "liquidate",
+                args: (
+                    stranger.clone(),
+                    1u64,
+                    h.asset.clone(),
+                    400 * PRICE_SCALE,
+                    lender.clone(),
+                )
+                    .into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .liquidate(&stranger, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+        }));
+        assert!(res.is_err(), "non-keeper must be rejected");
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn liquidate_lien_mode_preserves_pending_lien_units() {
+        let h = setup(500, 0, PRICE_SCALE);
+    }
+
     fn record_lien_publishes_event_on_success_and_none_on_failure() {
         use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
 
@@ -971,6 +1075,36 @@ mod test {
             &h.thresholds,
             &CustodyMode::IssuerLien,
         );
+
+        // Pledge 500 units in lien mode -> all 500 are pending confirmation
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(500 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 0);
+        assert_eq!(
+            h.vault.position(&1, &h.asset).pending_lien_units,
+            500 * PRICE_SCALE
+        );
+
+        // Confirm 200 units -> 200 confirmed, 300 pending
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-alpha");
+        h.vault
+            .record_lien(&gateway, &1, &h.asset, &(200 * PRICE_SCALE), &lien_ref);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 200 * PRICE_SCALE);
+        assert_eq!(
+            h.vault.position(&1, &h.asset).pending_lien_units,
+            300 * PRICE_SCALE
+        );
+
+        // Liquidate 150 confirmed units to lender
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(150 * PRICE_SCALE), &lender);
+
+        // Confirmed units reduce to 50, but pending lien units are completely untouched at 300
+        let pos = h.vault.position(&1, &h.asset);
+        assert_eq!(pos.units, 50 * PRICE_SCALE);
+        assert_eq!(pos.pending_lien_units, 300 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 50 * PRICE_SCALE);
 
         let line_id = 42u64;
         let pledge_amount = 250 * PRICE_SCALE;
