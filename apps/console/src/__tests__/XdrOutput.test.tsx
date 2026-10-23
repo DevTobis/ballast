@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { XdrOutput } from "../components/XdrOutput.tsx";
 import { signTransaction } from "@stellar/freighter-api";
 import { api, type BuiltTx } from "../lib/api.ts";
@@ -120,6 +120,8 @@ describe("XdrOutput error branches", () => {
     vi.mocked(api.submitTx).mockResolvedValue({
       status: "failed",
       txHash: sampleTx.txHash,
+      kind: "credit_line.repay",
+      refId: null,
       ledger: 123456,
     });
 
