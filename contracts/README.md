@@ -130,3 +130,46 @@ Update `PRICE_PUBLISHER` in `.env.<network>-deploy` before re-running
 (`PRICE_PUBLISHER_SIGNER_MODE` and its KMS/Vault/local key — see `services/price-guard/README.md`).
 The admin itself moves with the two-step `propose_admin` / `accept_admin` pair; every other role
 uses `queue_role_change` / `execute_role_change`.
+
+## Timelocked contract upgrades (`Registry` and `PriceGuard`)
+
+`Registry` and `PriceGuard` implement timelocked in-place contract upgrades (`ballast_common::upgrade`) using Soroban's `env.deployer().update_current_contract_wasm(...)`. This enables upgrading contract logic and storage layouts without losing deployed state (`LastGood`, configured assets, latches, haircut configs) and avoids rewiring all six protocol contracts.
+
+### Upgrade Procedure
+
+1. **Upload the new contract Wasm byte code:**
+   ```bash
+   stellar contract install --wasm target/wasm32v1-none/release/<contract>.wasm --network testnet --source admin
+   # Outputs the NEW_WASM_HASH (32-byte hex)
+   ```
+
+2. **Admin queues the upgrade:**
+   The admin initiates the upgrade proposal. This generates a monotonic upgrade ID, sets `executes_at = now + 48h`, and emits a `queue_upgrade` event.
+   ```bash
+   stellar contract invoke --id "$CONTRACT_CID" --network testnet --source admin -- \
+     queue_upgrade --admin "$ADMIN" --new_wasm_hash "$NEW_WASM_HASH"
+   ```
+
+3. **Wait out the 48-hour timelock delay:**
+   The PRD §6.2 / §11 mandates a 48-hour timelock window so protocol participants have advance notice to review the incoming code or withdraw capital if they disagree.
+   - If an issue or malicious proposal is identified during the delay, the admin can cancel the upgrade:
+     ```bash
+     stellar contract invoke --id "$CONTRACT_CID" --network testnet --source admin -- \
+       cancel_upgrade --admin "$ADMIN" --id "$UPGRADE_ID"
+     ```
+
+4. **Execute the upgrade:**
+   Once 48 hours have elapsed, any caller can execute the upgrade (execution is permissionless once ready). The contract calls `env.deployer().update_current_contract_wasm(new_wasm_hash)`, clears the pending upgrade, and emits an `execute_upgrade` event. All instance and persistent storage state persists across the upgrade.
+   ```bash
+   stellar contract invoke --id "$CONTRACT_CID" --network testnet --source admin -- \
+     execute_upgrade --id "$UPGRADE_ID"
+   ```
+
+### Freeze-after-audit decision
+
+The upgrade entry points are essential during pre-audit development, testnet deployments, and protocol parameter stabilization to safely fix bugs and update storage layouts in place without state loss.
+
+However, once Ballast undergoes external security audit and reaches production maturity, the upgrade capability introduces governance risk if left open indefinitely. The protocol's architectural policy is **freeze-after-audit**:
+- After completing the formal security audit and deployment verification on mainnet, upgrade authority will be permanently renounced or burned (e.g. by setting the contract admin to an unspendable burn address or locking the upgrade mechanism).
+- Freezing post-audit guarantees immutability, ensuring neither compromised admin keys nor rogue governance actions can replace contract code or drain user collateral, fulfilling Ballast's core security commitments.
+
