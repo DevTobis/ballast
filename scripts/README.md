@@ -165,7 +165,8 @@ and sends nothing on-chain.
 `scripts/deploy-mainnet-prices.sh` deploys only `registry` and `price-guard` to mainnet (no funds
 are held by either) and registers the assets in `scripts/shadow-assets.json`, so the public
 live-price page has an on-chain guarded price to show. It does nothing without
-`CONFIRM_MAINNET=deploy-prices`, and `--dry-run` prints every command without sending any.
+`CONFIRM_MAINNET=deploy-prices`, `--dry-run` prints every command without sending any, and
+`--help` displays usage. Unknown options are rejected with exit code 2 to prevent accidental live runs.
 
 Run `scripts/shadow-run.sh` for a week or two first and look at source divergence and staleness
 before sending the first mainnet transaction. The role accounts (`mainnet_admin`, `mainnet_pauser`,

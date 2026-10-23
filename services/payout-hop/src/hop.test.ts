@@ -10,6 +10,12 @@ import {
   type PayoutPolicy,
 } from "./hop.js";
 import type { PayoutSigner } from "./signer.js";
+import {
+  FirstLegRefusedError,
+  FirstLegUnavailableError,
+  type FirstLegExpectation,
+  type FirstLegVerifier,
+} from "./firstLeg.js";
 
 const OPERATOR = Keypair.random().publicKey();
 const ANCHOR = Keypair.random().publicKey();
@@ -34,6 +40,9 @@ function fakeSigner(status = "PENDING"): PayoutSigner & { submittedTx: Transacti
   };
   return signer;
 }
+
+/** Accepts every first leg; the first-leg tests below swap in one that refuses or is down. */
+const verified: FirstLegVerifier = { verify: async () => {} };
 
 /**
  * Stateful fake of the slice of `Database` the hop touches: the payout_forward claim table
@@ -97,7 +106,7 @@ describe("forwardPayout", () => {
     const signer = fakeSigner();
     const { db, inserted, claims } = fakeDb();
 
-    const result = await forwardPayout(db, signer, base(), policy);
+    const result = await forwardPayout(db, signer, verified, base(), policy);
 
     expect(result).toEqual({ hash: "fakehash123", status: "PENDING" });
     expect(signer.submittedTx?.memo.type).toBe(MemoText);
@@ -121,7 +130,7 @@ describe("forwardPayout", () => {
     const signer = fakeSigner();
     const { db, inserted } = fakeDb();
 
-    await forwardPayout(db, signer, base({ fromContractPayoutTxHash: "h2", amount: 10n * UNIT, memo: "88221199", quoteId: undefined }), policy);
+    await forwardPayout(db, signer, verified, base({ fromContractPayoutTxHash: "h2", amount: 10n * UNIT, memo: "88221199", quoteId: undefined }), policy);
 
     expect(signer.submittedTx?.memo.type).toBe(MemoID);
     expect(signer.submittedTx?.memo.value?.toString()).toBe("88221199");
@@ -132,9 +141,9 @@ describe("forwardPayout", () => {
     const signer = fakeSigner();
     const { db } = fakeDb();
 
-    await forwardPayout(db, signer, base(), policy);
-    await expect(forwardPayout(db, signer, base(), policy)).rejects.toBeInstanceOf(DuplicatePayoutError);
-    await expect(forwardPayout(db, signer, base({ amount: 1n * UNIT }), policy)).rejects.toBeInstanceOf(DuplicatePayoutError);
+    await forwardPayout(db, signer, verified, base(), policy);
+    await expect(forwardPayout(db, signer, verified, base(), policy)).rejects.toBeInstanceOf(DuplicatePayoutError);
+    await expect(forwardPayout(db, signer, verified, base({ amount: 1n * UNIT }), policy)).rejects.toBeInstanceOf(DuplicatePayoutError);
 
     expect(signer.calls).toBe(1);
   });
@@ -142,19 +151,71 @@ describe("forwardPayout", () => {
   it("lets a payout that failed to send be tried again, and pays it once it succeeds", async () => {
     const { db, claims } = fakeDb();
     const failing: PayoutSigner = { ...fakeSigner(), signAndSubmit: async () => { throw new Error("rpc down"); } };
-    await expect(forwardPayout(db, failing, base(), policy)).rejects.toThrow("rpc down");
+    await expect(forwardPayout(db, failing, verified, base(), policy)).rejects.toThrow("rpc down");
     expect(claims.get("contracttxhash")?.status).toBe("failed");
 
     const working = fakeSigner();
-    await forwardPayout(db, working, base(), policy);
+    await forwardPayout(db, working, verified, base(), policy);
     expect(working.calls).toBe(1);
     expect(claims.get("contracttxhash")?.status).toBe("sent");
   });
 
   it("treats a network ERROR status as a failed payout, not a sent one", async () => {
     const { db, claims } = fakeDb();
-    await expect(forwardPayout(db, fakeSigner("ERROR"), base(), policy)).rejects.toThrow(/submission failed/);
+    await expect(forwardPayout(db, fakeSigner("ERROR"), verified, base(), policy)).rejects.toThrow(/submission failed/);
     expect(claims.get("contracttxhash")?.status).toBe("failed");
+  });
+});
+
+describe("first-leg verification", () => {
+  it("asks the verifier whether the named hash paid the operator at least the requested USDC", async () => {
+    const seen: FirstLegExpectation[] = [];
+    const recording: FirstLegVerifier = { verify: async (e) => { seen.push(e); } };
+    const { db } = fakeDb();
+
+    await forwardPayout(db, fakeSigner(), recording, base(), policy);
+
+    expect(seen).toEqual([
+      { txHash: "contracttxhash", operator: OPERATOR, usdcIssuer: USDC_ISSUER, minAmount: 5_000n * UNIT },
+    ]);
+  });
+
+  it.each([
+    "first-leg transaction contracttxhash was not found on the network",
+    "first-leg transaction contracttxhash did not succeed (status FAILED)",
+    "first-leg transaction did not pay the configured USDC to the operator account",
+    "first leg paid the operator 4999.0000000 USDC, less than the 5000.0000000 requested",
+  ])("refuses before claiming or sending when the verifier says: %s", async (reason) => {
+    const signer = fakeSigner();
+    const { db, claims } = fakeDb();
+    const refusing: FirstLegVerifier = { verify: async () => { throw new FirstLegRefusedError(reason); } };
+
+    await expect(forwardPayout(db, signer, refusing, base(), policy)).rejects.toThrow(new FirstLegRefusedError(reason));
+
+    expect(claims.size).toBe(0);
+    expect(signer.calls).toBe(0);
+  });
+
+  it("claims nothing when the verifier cannot reach the network, so a later request can still pay", async () => {
+    const signer = fakeSigner();
+    const { db, claims } = fakeDb();
+    const down: FirstLegVerifier = { verify: async () => { throw new FirstLegUnavailableError("rpc timeout"); } };
+
+    await expect(forwardPayout(db, signer, down, base(), policy)).rejects.toBeInstanceOf(FirstLegUnavailableError);
+    expect(claims.size).toBe(0);
+    expect(signer.calls).toBe(0);
+
+    await forwardPayout(db, signer, verified, base(), policy);
+    expect(signer.calls).toBe(1);
+  });
+
+  it("does not consult the verifier for a payout the policy already refuses", async () => {
+    let asked = false;
+    const { db } = fakeDb();
+    const watching: FirstLegVerifier = { verify: async () => { asked = true; } };
+
+    await expect(forwardPayout(db, fakeSigner(), watching, base({ toAnchorAccount: OTHER_ANCHOR }), policy)).rejects.toBeInstanceOf(PayoutRefusedError);
+    expect(asked).toBe(false);
   });
 });
 
@@ -162,8 +223,8 @@ describe("payout policy", () => {
   const refused = async (over: Partial<ForwardPayoutArgs>, reason: RegExp) => {
     const signer = fakeSigner();
     const { db, claims } = fakeDb();
-    await expect(forwardPayout(db, signer, base(over), policy)).rejects.toThrow(reason);
-    await expect(forwardPayout(db, signer, base(over), policy)).rejects.toBeInstanceOf(PayoutRefusedError);
+    await expect(forwardPayout(db, signer, verified, base(over), policy)).rejects.toThrow(reason);
+    await expect(forwardPayout(db, signer, verified, base(over), policy)).rejects.toBeInstanceOf(PayoutRefusedError);
     expect(signer.calls).toBe(0);
     expect(claims.size).toBe(0); // refused before anything was claimed
   };
@@ -180,7 +241,7 @@ describe("payout policy", () => {
 
   it("accepts a payout exactly at the cap", async () => {
     const { db } = fakeDb();
-    await expect(forwardPayout(db, fakeSigner(), base({ amount: 10_000n * UNIT }), policy)).resolves.toBeDefined();
+    await expect(forwardPayout(db, fakeSigner(), verified, base({ amount: 10_000n * UNIT }), policy)).resolves.toBeDefined();
   });
 });
 

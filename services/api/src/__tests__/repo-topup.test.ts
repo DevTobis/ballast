@@ -57,6 +57,69 @@ describe("POST /v1/repo/trades/:id/top-ups", () => {
   });
 });
 
+describe("POST /v1/repo/trades/:id/unwind", () => {
+  const LENDER = { partyId: "llllllll-llll-llll-llll-llllllllllll", account: "GLENDERACCOUNT" };
+  const STRANGER = { partyId: "ssssssss-ssss-ssss-ssss-ssssssssssss", account: "GSTRANGERACCOUNT" };
+
+  function unwindServer(caller = BORROWER) {
+    const unwind = vi.fn().mockResolvedValue("xdr-unwind");
+    const db = createFakeDb(
+      new Map<unknown, unknown[]>([
+        [schema.partyAccount, [
+          { partyId: caller.partyId, stellarAccount: caller.account, role: "user" },
+        ]],
+        [schema.repoTrade, [{ id: TRADE_ID, cashBorrowerId: BORROWER.partyId, cashLenderId: LENDER.partyId, status: "settled", contractTradeId: "9" }]],
+      ]),
+    );
+    const app = buildServer({
+      config,
+      db,
+      contracts: { repoDvp: { unwind } } as unknown as ContractClients,
+      chain: { txHash: () => "unwind-tx" } as unknown as ChainGateway,
+    });
+    return { app, unwind };
+  }
+
+  it("builds an unwind transaction with the lender account when lender calls", async () => {
+    const { app, unwind } = unwindServer(LENDER);
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/repo/trades/${TRADE_ID}/unwind`,
+      headers: bearer(LENDER.account),
+      payload: {},
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ xdr: "xdr-unwind", txHash: "unwind-tx", tradeId: TRADE_ID });
+    expect(unwind).toHaveBeenCalledWith(LENDER.account, 9n);
+  });
+
+  it("builds an unwind transaction with the borrower account when borrower calls", async () => {
+    const { app, unwind } = unwindServer(BORROWER);
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/repo/trades/${TRADE_ID}/unwind`,
+      headers: bearer(BORROWER.account),
+      payload: {},
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ xdr: "xdr-unwind", txHash: "unwind-tx", tradeId: TRADE_ID });
+    expect(unwind).toHaveBeenCalledWith(BORROWER.account, 9n);
+  });
+
+  it("returns 404 for an authenticated stranger not involved in the trade", async () => {
+    const { app, unwind } = unwindServer(STRANGER);
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/repo/trades/${TRADE_ID}/unwind`,
+      headers: bearer(STRANGER.account),
+      payload: {},
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ error: "repo trade not found" });
+    expect(unwind).not.toHaveBeenCalled();
+  });
+});
+
 describe("settling a repo.top_up transaction", () => {
   const settle = async (onChain: object) => {
     const updates: Array<{ table: unknown; set: Record<string, unknown> }> = [];

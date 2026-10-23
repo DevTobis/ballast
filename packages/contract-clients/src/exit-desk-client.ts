@@ -42,4 +42,17 @@ export class ExitDeskClient extends BaseContractClient {
       scAddress(to),
     ]);
   }
+
+  disableAsset(admin: string, assetAddress: string): Promise<string> {
+    return this.invoke(admin, "disable_asset", [scAddress(admin), scAddress(assetAddress)]);
+  }
+
+  enableAsset(admin: string, assetAddress: string): Promise<string> {
+    return this.invoke(admin, "enable_asset", [scAddress(admin), scAddress(assetAddress)]);
+  }
+
+  isAssetEnabled(assetAddress: string): Promise<boolean> {
+    return this.read<boolean>("is_asset_enabled", [scAddress(assetAddress)]);
+  }
 }
+
