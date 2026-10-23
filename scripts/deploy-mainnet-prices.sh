@@ -9,6 +9,7 @@
 #
 # Usage:
 #   scripts/deploy-mainnet-prices.sh --dry-run     # print every command, send nothing
+#   scripts/deploy-mainnet-prices.sh --help        # print usage
 #   CONFIRM_MAINNET=deploy-prices scripts/deploy-mainnet-prices.sh
 #
 # Prerequisites (this script refuses to create keys on mainnet):
@@ -37,8 +38,47 @@ WINDOW_MOVE_BAND_BPS=${WINDOW_MOVE_BAND_BPS:-100}
 MAX_STALENESS_S=${MAX_STALENESS_S:-21600}
 HAIRCUT_BASE_BPS=${HAIRCUT_BASE_BPS:-500}
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/deploy-mainnet-prices.sh [OPTIONS]
+
+Deploys only the price layer (`registry` and `price-guard`) to Stellar mainnet.
+
+Options:
+  --dry-run       Print every command without submitting transactions
+  -h, --help      Show this help message and exit
+
+Environment:
+  CONFIRM_MAINNET=deploy-prices  Required for live deployment
+EOF
+}
+
 DRY_RUN=false
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "!!! Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$DRY_RUN" == false && "${CONFIRM_MAINNET:-}" == "deploy-prices" ]]; then
+  if [[ "${DRYRUN:-}" =~ ^(1|true|yes)$ || "${DRY_RUN:-}" =~ ^(1|true|yes)$ ]]; then
+    echo "!!! Refusing live deployment: dry-run environment variable detected but --dry-run flag was not passed." >&2
+    exit 2
+  fi
+fi
 
 log() { echo ">>> $*"; }
 

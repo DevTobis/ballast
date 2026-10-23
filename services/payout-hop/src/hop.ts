@@ -13,6 +13,7 @@ import { StrKey } from "@stellar/stellar-sdk";
 import { schema, recordJournalEntry, type Database } from "@ballast/db";
 import { scaledToDecimalString } from "@ballast/domain-types";
 import type { PayoutSigner } from "./signer.js";
+import type { FirstLegVerifier } from "./firstLeg.js";
 
 
 /**
@@ -80,7 +81,10 @@ function buildMemo(memo: string): Memo {
 }
 
 export interface ForwardPayoutArgs {
-  /** The tx hash of the prior leg: Ballast contract -> operator G-account. Recorded for audit/traceability. */
+  /**
+   * The tx hash of the prior leg: Ballast contract -> operator G-account. Checked on-chain before
+   * anything is paid (see `firstLeg.ts`), then recorded as the idempotency key.
+   */
   fromContractPayoutTxHash: string;
   toAnchorAccount: string;
   /** Fixed-point USDC amount, `PRICE_SCALE` (7 decimals) convention. */
@@ -107,17 +111,26 @@ export interface ForwardPayoutResult {
 }
 
 /**
- * Builds a classic (non-Soroban) payment operation from the operator G-account to
- * `toAnchorAccount`, attaching the memo the anchor needs, signs and submits it, then records the
- * transfer in Postgres.
+ * Checks that the first leg landed and paid the operator at least `amount` USDC, then builds a
+ * classic (non-Soroban) payment operation from the operator G-account to `toAnchorAccount`,
+ * attaching the memo the anchor needs, signs and submits it, and records the transfer in Postgres.
  */
 export async function forwardPayout(
   db: Database,
   signer: PayoutSigner,
+  verifier: FirstLegVerifier,
   args: ForwardPayoutArgs,
   policy: PayoutPolicy,
 ): Promise<ForwardPayoutResult> {
   checkPolicy(args, policy);
+
+  // Before the claim, so a hash that does not back this payout (or a verifier outage) leaves no row.
+  await verifier.verify({
+    txHash: args.fromContractPayoutTxHash,
+    operator: signer.publicKey(),
+    usdcIssuer: policy.usdcIssuer,
+    minAmount: args.amount,
+  });
 
   // Claim the first-leg transaction before any money moves. The primary key means the same payout
   // can be requested any number of times (a retry, a replay, a duplicate caller) and be paid once;

@@ -13,6 +13,31 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
 
+### Admin function delays
+
+PRD §6.2 promises a 48-hour timelock on parameter changes. The actual delay depends on the
+contract:
+
+**Registry**
+
+| Function | Delay | Notes |
+|---|---|---|
+| `register_asset` | immediate | New asset only; no existing positions to protect |
+| `queue_param` / `execute_param` | **48h timelock** | Changes to an existing asset's haircut/band/other params |
+| `cancel_param` | immediate | Removes a pending queued change before it executes |
+| `queue_role_change` / `execute_role_change` | **48h timelock** | Rotates `pauser`, `keeper`, `price_publisher`, or `risk` |
+| `propose_admin` / `accept_admin` | no delay (two-step) | Admin key transfer; requires both current and new admin to sign; no timelock |
+
+**PriceGuard**
+
+| Function | Delay | Notes |
+|---|---|---|
+| `configure_asset` | **immediate** | Sets band, daily-move, window, and staleness thresholds — gap vs. PRD §6.2; see Known limits |
+| `configure_issuer_key` | **immediate** | Registers the Ed25519 public key used to verify NAV signatures — gap vs. PRD §6.2 |
+| `configure_signature_requirement` | **immediate** | Toggles NAV signature enforcement globally — gap vs. PRD §6.2 |
+| `queue_role_change` / `execute_role_change` | **48h timelock** | Rotates `price_publisher`, `pauser`, `keeper`, or `risk` |
+| `propose_admin` / `accept_admin` | no delay (two-step) | Admin key transfer; requires both current and new admin to sign; no timelock |
+
 The keeper is trusted for **timing and completeness**, not for **value**: every amount a settlement
 uses comes from the contract's own state or from the PriceGuard, never from a keeper-supplied number.
 
@@ -49,6 +74,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   `propose_admin` / `accept_admin` pair. A publisher rotation preserves `LastGood`, a `Halted` latch,
   asset configs and issuer keys; it does not automatically re-register the NAV attestor key, so
   `configure_issuer_key` must be called too when the publisher is the attestor.
+- **Admin key has no rotation delay.** The `propose_admin` / `accept_admin` handshake is a
+  safety guard against typos — it requires the named successor to accept — but it carries no
+  timelock. A compromised admin key can be replaced immediately with no notice period. Non-admin
+  roles (`price_publisher`, `pauser`, `keeper`, `risk`) do have the 48h queue before the new
+  address takes effect.
 - `max_staleness_s` is per asset; RedStone's RWA feeds update every 1-2 hours, so values under that
   make the guard refuse to lend.
 
@@ -134,3 +164,15 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   moving changes the encoding and needs the indexer and ledger readers updated together.
 - No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
   scripts in `scripts/` exercise them on testnet.
+- **PriceGuard parameter changes are immediate, not timelocked (gap vs. PRD §6.2).** `configure_asset`,
+  `configure_issuer_key`, and `configure_signature_requirement` all take effect in the same
+  transaction — there is no `queue_param` / `execute_param` mechanism for PriceGuard the way
+  Registry has one. A compromised or mistaken admin can change band thresholds, replace the NAV
+  attestor key, or disable signature verification instantly and with no on-chain notice period.
+  This section should be updated and this bullet removed when a timelock is added to those
+  functions.
+- **Admin key rotation has no timelock.** `propose_admin` / `accept_admin` prevents accidents
+  (both parties must sign) but carries no delay. A new admin is effective the moment the named
+  successor calls `accept_admin`. Non-admin roles (`price_publisher`, `pauser`, `keeper`, `risk`)
+  rotate through the 48h `queue_role_change` / `execute_role_change` path and do have a notice
+  period. This section should be updated if a timelock is added to `accept_admin`.
