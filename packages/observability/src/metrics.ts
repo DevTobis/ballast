@@ -32,6 +32,7 @@ export type AlertKind =
   | "keeper_balance_low"
   | "operator_balance_low"
   | "reconciliation_break"
+  | "event_gap_skipped"
   | "rpc_lag_high";
 
 export interface Alerter {
