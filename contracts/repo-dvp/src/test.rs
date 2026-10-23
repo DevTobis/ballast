@@ -377,6 +377,135 @@ fn accept_and_settle_refuses_a_proposal_past_its_maturity() {
     );
 }
 
+#[test]
+fn lender_can_cancel_proposal_and_zeroes_allowance() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), cash_amount);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_lender, &id);
+
+    let trade = repo.trade(&id);
+    assert_eq!(trade.status, RepoStatus::Cancelled);
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), 0);
+
+    // Cancelled proposal cannot be accepted
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    let accept_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(accept_res.is_err(), "cancelled proposal cannot be accepted");
+}
+
+#[test]
+fn borrower_can_cancel_proposal() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_borrower, &id);
+
+    let trade = repo.trade(&id);
+    assert_eq!(trade.status, RepoStatus::Cancelled);
+
+    // Cancelled proposal cannot be accepted
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    let accept_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(accept_res.is_err(), "cancelled proposal cannot be accepted");
+}
+
+#[test]
+fn stranger_cannot_cancel_proposal() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let stranger = Address::generate(&h.env);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_proposal(&stranger, &id);
+    }));
+    assert!(result.is_err(), "stranger cannot cancel proposal");
+}
+
+#[test]
+fn double_cancel_is_rejected() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_lender, &id);
+
+    let second_cancel = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_proposal(&h.cash_lender, &id);
+    }));
+    assert!(second_cancel.is_err(), "cannot cancel already cancelled proposal");
+}
+
+#[test]
+fn cancel_after_settle_is_rejected() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    let cancel_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_proposal(&h.cash_lender, &id);
+    }));
+    assert!(cancel_res.is_err(), "cannot cancel settled trade");
+}
+
+#[test]
+fn cancelling_older_proposal_does_not_zero_latest_allowance() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_1 = 50 * PRICE_SCALE;
+    let cash_2 = 100 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    let id1 = propose(&h, units, cash_1, 500, maturity);
+    let id2 = propose(&h, units, cash_2, 500, maturity);
+
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), cash_2);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.cancel_proposal(&h.cash_lender, &id1);
+
+    assert_eq!(repo.trade(&id1).status, RepoStatus::Cancelled);
+    // Since id1 was not the latest proposal, the allowance for id2 was NOT zeroed
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), cash_2);
+
+    // Trade 2 can still be settled
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_2);
+    repo.accept_and_settle(&h.cash_borrower, &id2);
+    assert_eq!(repo.trade(&id2).status, RepoStatus::Settled);
+}
+
 /// The expiry handed to `approve` must not depend on which ledger the call lands in, or a
 /// transaction simulated in one ledger and executed in the next would fail authorization.
 #[test]
@@ -590,6 +719,103 @@ fn the_cure_window_has_a_floor_and_only_the_admin_sets_it() {
     assert!(not_admin.is_err(), "only the admin may set it");
 }
 
+#[test]
+fn disabled_asset_blocks_propose_and_accept_and_settle() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    assert!(repo.is_asset_enabled(&h.rwa));
+
+    // Stranger cannot disable asset
+    let stranger = Address::generate(&h.env);
+    let unauthorized = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.disable_asset(&stranger, &h.rwa);
+    }));
+    assert!(unauthorized.is_err(), "only admin can disable asset");
+
+    // Admin disables asset
+    repo.disable_asset(&h.admin, &h.rwa);
+    assert!(!repo.is_asset_enabled(&h.rwa));
+
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    // Proposing on disabled asset panics
+    let propose_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        propose(&h, units, cash_amount, 500, maturity);
+    }));
+    assert!(propose_res.is_err(), "propose on disabled asset must fail");
+
+    // Re-enable asset allows proposing
+    repo.enable_asset(&h.admin, &h.rwa);
+    assert!(repo.is_asset_enabled(&h.rwa));
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    // Disable asset after proposing: accept_and_settle must fail
+    repo.disable_asset(&h.admin, &h.rwa);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+
+    let settle_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(settle_res.is_err(), "accept_and_settle on disabled asset must fail");
+}
+
+#[test]
+fn existing_trades_can_be_unwound_topped_up_and_defaulted_when_asset_is_disabled() {
+    // 1. Unwind works on disabled asset
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 500, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    // Admin disables asset after trade is settled
+    repo.disable_asset(&h.admin, &h.rwa);
+    assert!(!repo.is_asset_enabled(&h.rwa));
+
+    // Fast-forward to maturity and unwind
+    h.env.ledger().set_timestamp(maturity);
+    let interest = accrue_interest(cash_amount, 500, 3_600);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &(cash_amount + interest));
+
+    repo.unwind(&h.cash_borrower, &id);
+    assert_eq!(repo.trade(&id).status, RepoStatus::Unwound);
+
+    // 2. Margin call and top_up work on disabled asset
+    let h2 = setup();
+    let id2 = settled_under_margin(&h2);
+    let repo2 = RepoDvpClient::new(&h2.env, &h2.repo);
+    repo2.disable_asset(&h2.admin, &h2.rwa);
+
+    repo2.call_margin(&h2.keeper, &id2);
+    assert!(repo2.trade(&id2).pending_margin_call);
+
+    repo2.top_up(&h2.cash_borrower, &id2, &(100 * PRICE_SCALE));
+    assert!(!repo2.trade(&id2).pending_margin_call);
+    assert_eq!(repo2.trade(&id2).units, 200 * PRICE_SCALE);
+
+    // 3. Default close works on disabled asset
+    let h3 = setup();
+    let id3 = settled_under_margin(&h3);
+    let repo3 = RepoDvpClient::new(&h3.env, &h3.repo);
+    repo3.disable_asset(&h3.admin, &h3.rwa);
+
+    repo3.call_margin(&h3.keeper, &id3);
+    let deadline = repo3.trade(&id3).cure_deadline.unwrap();
+    h3.env.ledger().set_timestamp(deadline);
+
+    repo3.default_close(&h3.keeper, &id3);
+    assert_eq!(repo3.trade(&id3).status, RepoStatus::Defaulted);
+}
+
 mod sac {
     use super::*;
 
@@ -795,5 +1021,60 @@ mod sac {
         // One ledger past expiry, SAC treats it as 0.
         h.env.ledger().set_sequence_number(expected_expiry + 1);
         assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
+    }
+
+    // ── #31: no trade for an asset without margin parameters ────────────────
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: asset not configured")]
+    fn propose_panics_for_an_unconfigured_asset() {
+        let h = setup();
+        let unconfigured = h.env.register(MockToken, ());
+        RepoDvpClient::new(&h.env, &h.repo).propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &unconfigured,
+            &100,
+            &1_000,
+            &500u32,
+            &RepoKind::Intraday,
+            &(h.env.ledger().timestamp() + 3_600),
+            &hash(&h, 9),
+        );
+    }
+
+    #[test]
+    fn a_failed_propose_grants_no_leg1_allowance() {
+        let h = setup();
+        let unconfigured = h.env.register(MockToken, ());
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            RepoDvpClient::new(&h.env, &h.repo).propose(
+                &h.cash_lender,
+                &h.cash_borrower,
+                &unconfigured,
+                &100,
+                &1_000,
+                &500u32,
+                &RepoKind::Intraday,
+                &maturity,
+                &hash(&h, 9),
+            );
+        }));
+        assert!(result.is_err(), "propose must refuse the unconfigured asset");
+        // The config check runs before the leg-1 approve, so the lender's USDC
+        // allowance to the contract must still be zero.
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_lender, &h.repo),
+            0
+        );
+    }
+
+    #[test]
+    fn propose_still_works_for_a_configured_asset() {
+        let h = setup();
+        let id = propose(&h, 100, 1_000, 500, h.env.ledger().timestamp() + 3_600);
+        assert!(MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_lender, &h.repo) >= 1_000);
+        assert_eq!(RepoDvpClient::new(&h.env, &h.repo).trade(&id).status, RepoStatus::Proposed);
     }
 }

@@ -41,15 +41,40 @@ interface RedeemBody {
   destination: string;
 }
 
-async function audit(db: Database, action: string, payload: Record<string, unknown>): Promise<void> {
-  await db.insert(schema.auditLog).values({
-    actor: "issuer-gateway",
-    action,
-    payload,
-  });
+export interface IssuerGatewayLogger {
+  error(obj: unknown, msg?: string): void;
+  info?(obj: unknown, msg?: string): void;
+  warn?(obj: unknown, msg?: string): void;
+  debug?(obj: unknown, msg?: string): void;
 }
 
-export function buildServer(db: Database, internalToken: string): FastifyInstance {
+const defaultLogger = createLogger("issuer-gateway");
+
+async function audit(
+  db: Database,
+  action: string,
+  payload: Record<string, unknown>,
+  logger: IssuerGatewayLogger = defaultLogger,
+): Promise<void> {
+  try {
+    await db.insert(schema.auditLog).values({
+      actor: "issuer-gateway",
+      action,
+      payload,
+    });
+  } catch (err) {
+    logger.error(
+      { err, action, payload },
+      `issuer-gateway: audit log insert failed for action ${action}`,
+    );
+  }
+}
+
+export function buildServer(
+  db: Database,
+  internalToken: string,
+  logger: IssuerGatewayLogger = defaultLogger,
+): FastifyInstance {
   const app = Fastify({ logger: false });
   requireInternalToken(app, internalToken);
 
@@ -60,7 +85,7 @@ export function buildServer(db: Database, internalToken: string): FastifyInstanc
       const { assetCode, holderAddress } = req.body;
       const adapter = getAdapter(code);
       const result = await adapter.requestAuthorization(assetCode, holderAddress);
-      await audit(db, "issuer.authorize", { issuerCode: code, assetCode, holderAddress, result });
+      await audit(db, "issuer.authorize", { issuerCode: code, assetCode, holderAddress, result }, logger);
       return reply.send(result);
     },
   );
@@ -72,7 +97,7 @@ export function buildServer(db: Database, internalToken: string): FastifyInstanc
       const { assetCode, txXdr } = req.body;
       const adapter = getAdapter(code);
       const result = await adapter.requestSep8Approval(assetCode, txXdr);
-      await audit(db, "issuer.sep8_approve", { issuerCode: code, assetCode, result });
+      await audit(db, "issuer.sep8_approve", { issuerCode: code, assetCode, result }, logger);
       return reply.send(result);
     },
   );
@@ -84,7 +109,7 @@ export function buildServer(db: Database, internalToken: string): FastifyInstanc
       const { assetCode, holderAddress, units } = req.body;
       const adapter = getAdapter(code);
       const result = await adapter.requestLienFreeze(assetCode, holderAddress, BigInt(units));
-      await audit(db, "issuer.lien_freeze", { issuerCode: code, assetCode, holderAddress, units, result });
+      await audit(db, "issuer.lien_freeze", { issuerCode: code, assetCode, holderAddress, units, result }, logger);
       return reply.send(result);
     },
   );
@@ -96,7 +121,7 @@ export function buildServer(db: Database, internalToken: string): FastifyInstanc
       const { assetCode, lienRef } = req.body;
       const adapter = getAdapter(code);
       await adapter.requestLienRelease(assetCode, lienRef);
-      await audit(db, "issuer.lien_release", { issuerCode: code, assetCode, lienRef });
+      await audit(db, "issuer.lien_release", { issuerCode: code, assetCode, lienRef }, logger);
       return reply.send({ ok: true });
     },
   );
@@ -108,7 +133,7 @@ export function buildServer(db: Database, internalToken: string): FastifyInstanc
       const { assetCode, units, destination } = req.body;
       const adapter = getAdapter(code);
       const result = await adapter.requestRedemption(assetCode, BigInt(units), destination);
-      await audit(db, "issuer.redeem", { issuerCode: code, assetCode, units, destination, result });
+      await audit(db, "issuer.redeem", { issuerCode: code, assetCode, units, destination, result }, logger);
       return reply.send(result);
     },
   );

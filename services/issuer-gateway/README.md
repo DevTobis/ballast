@@ -26,6 +26,9 @@ returns 500. Adapters are built per request, so issuers can be configured indepe
 - SEP-8 follows the Stellar Regulated Assets protocol: the adapter POSTs `{ tx }` to
   `<ISSUER>_SEP8_APPROVAL_SERVER_URL` (default `<base URL>/sep8`) and maps `success`, `revised`,
   `rejected` and `pending` onto the interface.
+- Outbound HTTP requests have a 15-second timeout by default, including reading the response body.
+  Timeout errors name the issuer and adapter operation. Requests are not automatically retried:
+  a timeout does not establish whether the issuer processed the request.
 - Authorisation, liens and redemptions call `POST /v1/authorizations`, `POST /v1/liens`,
   `DELETE /v1/liens/:ref` and `POST /v1/redemptions` with a bearer key. **These endpoints are guesses**:
   none of the three issuers publishes such an API. They are marked TODO in the adapters and must be
@@ -54,6 +57,7 @@ pnpm --filter @ballast/service-issuer-gateway build && pnpm --filter @ballast/se
 |---|---|
 | `INTERNAL_API_TOKEN` | shared secret for the header above |
 | `ISSUER_GATEWAY_PORT` (3001), `ISSUER_GATEWAY_HOST` (127.0.0.1) | listen address |
+| `ISSUER_GATEWAY_TIMEOUT_MS` (15000) | per-request issuer API and SEP-8 HTTP timeout in milliseconds, including the response body; integer from 1 to 2147483647 (invalid values fail before the request) |
 | `DATABASE_URL` | Postgres, for `audit_log` |
 | `SPIKO_`, `ETHERFUSE_`, `FRANKLIN_` + `API_BASE_URL`, `API_KEY`, `SEP8_APPROVAL_SERVER_URL` | per-issuer back office (nine variables) |
 
@@ -73,6 +77,8 @@ unconfigured or unknown issuer, and 401 without the token before any issuer is c
 `src/__tests__/liveAdapters.test.ts` covers fail-fast config checks, request shapes, error text on
 non-2xx, the SEP-8 status mapping and URL override, and `getAdapter`. The stubbed responses are the
 shapes the adapters expect, not recordings of a real issuer.
+`src/__tests__/liveShared.test.ts` covers stalled fetches and response bodies, timeout configuration,
+issuer/operation diagnostics, and the absence of automatic POST retries.
 
 ## Known limits
 

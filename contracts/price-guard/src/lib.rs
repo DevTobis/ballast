@@ -59,7 +59,7 @@
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
-    ttl,
+    ttl, upgrade,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -344,6 +344,9 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
 /// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
 ///
+/// For an odd source count, the median is the middle value. For an even source count, the median
+/// is the average of the two middle values rounded down (conservative collateral valuation).
+///
 /// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
 /// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
 /// stick and the baseline would never move until some unrelated transaction happened to call it;
@@ -402,7 +405,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         alloc_free_sort::SortBuf::from(&fresh_values);
     plain_values.sort();
     let len = plain_values.len();
-    let median_value = plain_values.get(len / 2);
+    let median_value = if len % 2 == 1 {
+        plain_values.get(len / 2)
+    } else {
+        (plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2
+    };
 
     let mut as_array: [i128; 8] = [0; 8];
     for (i, slot) in as_array.iter_mut().enumerate().take(len) {
@@ -586,6 +593,36 @@ impl PriceGuard {
         access::pending_role_change(&env, id)
     }
 
+    /// Queues a timelocked contract upgrade to `new_wasm_hash`.
+    /// Admin only. Executable after 48h.
+    pub fn queue_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> u64 {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::queue_upgrade(&env, &new_wasm_hash)
+    }
+
+    /// Cancels a pending contract upgrade.
+    /// Admin only.
+    pub fn cancel_upgrade(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::cancel_upgrade(&env, id);
+    }
+
+    /// Executes a queued contract upgrade once the 48h timelock has elapsed.
+    /// Permissionless once ready.
+    pub fn execute_upgrade(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        upgrade::execute_upgrade(&env, id);
+    }
+
+    /// Returns the pending upgrade for `id`, if one exists.
+    pub fn pending_upgrade(env: Env, id: u64) -> Option<upgrade::PendingUpgrade> {
+        upgrade::pending_upgrade(&env, id)
+    }
+
     /// Admin-set per-asset thresholds. Kept local to this contract rather than cross-called from
     /// `Registry` — see the module docs on the general Registry-decoupling simplification used
     /// across this pass's contracts.
@@ -746,6 +783,12 @@ impl PriceGuard {
     /// 3. Otherwise, if the new median moved more than `daily_move_band_bps` against the last
     ///    good value -> `Halted` (sticky, until `confirm_halt_cleared`), value = last good.
     /// 4. Otherwise -> `Ok`, value = the new median, and this becomes the new "last good".
+    ///
+    /// Median rule:
+    /// - For an odd number of fresh sources: middle value after sorting (`len / 2`).
+    /// - For an even number of fresh sources: average of the two middle values rounded down
+    ///   (`(plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2`), providing conservative
+    ///   valuation for collateral.
     pub fn guarded_price(env: Env, asset: Address) -> GuardedPrice {
         evaluate(&env, asset)
     }
@@ -1339,6 +1382,86 @@ mod test {
         }
     }
 
+    /// Replay of the 2026-02-22 YieldBlox / USTRY manipulation path (PRD §11, Backlog B-0082).
+    /// NAV remains fixed at 1.0, while an independent feed steps up +0.1% per publish to +5%, then
+    /// drops back down. With a 50 bps band, no step beyond +0.5% may be Ok, the published value
+    /// must never exceed the NAV by more than the band, and the guard must not Halt on the way back down.
+    /// With the NAV and this one feed as the only sources, an Ok price is their average, so it
+    /// moves at half the feed's step; Degraded steps hold the last good price.
+    #[test]
+    fn scripted_replay_ustry_manipulation_2026_02_22() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let mut now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+
+        struct Step {
+            step: u32,
+            feed_value: i128,
+            expected_status: PriceStatus,
+            expected_value: i128,
+        }
+
+        let max_allowed = SCALE + (SCALE * 50) / 10_000;
+
+        let steps = [
+            Step { step: 0, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 5_000 },
+            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 15_000 },
+            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 19, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+        ];
+
+        assert!(steps.len() >= 15, "table must cover at least 15 steps");
+
+        for s in steps.iter() {
+            now += 10;
+            env.ledger().set_timestamp(now);
+            client.publish_source(&publisher, &asset, &feed_name, &s.feed_value, &now);
+
+            let price = client.guarded_price(&asset);
+            assert_eq!(
+                price.status, s.expected_status,
+                "step {}: feed {} expected status {:?}, got {:?}",
+                s.step, s.feed_value, s.expected_status, price.status
+            );
+            assert_eq!(
+                price.value, s.expected_value,
+                "step {}: feed {} expected value {}, got {}",
+                s.step, s.feed_value, s.expected_value, price.value
+            );
+            assert!(
+                price.value <= max_allowed,
+                "step {}: price {} must never exceed NAV by more than band ({})",
+                s.step, price.value, max_allowed
+            );
+            assert_ne!(
+                price.status,
+                PriceStatus::Halted,
+                "step {}: guard must not Halt on the way back down",
+                s.step
+            );
+        }
+    }
+
     #[test]
     fn one_fresh_source_can_never_set_a_price_however_large_the_move() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
@@ -1784,6 +1907,189 @@ mod test {
         let next_price = client.guarded_price(&asset);
         assert_eq!(next_price.status, PriceStatus::Ok);
         assert_eq!(next_price.value, SCALE);
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_or_cancel_upgrade() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 10_000, 3600);
+        let stranger = Address::generate(&env);
+        let dummy_wasm = BytesN::from_array(&env, &[1u8; 32]);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_upgrade",
+                args: (stranger.clone(), dummy_wasm.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_upgrade(&stranger, &dummy_wasm);
+        }));
+        assert!(result.is_err(), "only the stored admin may queue an upgrade");
+
+        env.mock_all_auths();
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_upgrade",
+                args: (stranger.clone(), id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let cancel_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_upgrade(&stranger, &id);
+        }));
+        assert!(cancel_res.is_err(), "only the stored admin may cancel an upgrade");
+
+        env.mock_all_auths();
+        client.cancel_upgrade(&admin, &id);
+        assert_eq!(client.pending_upgrade(&id), None);
+    }
+
+    #[test]
+    fn execute_upgrade_requires_the_timelock_to_elapse() {
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 10_000, 3600);
+        let dummy_wasm = BytesN::from_array(&env, &[2u8; 32]);
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_upgrade(&id);
+        }));
+        assert!(early.is_err(), "cannot execute upgrade before 48h elapses");
+    }
+
+    #[test]
+    fn test_price_guard_upgrade_and_state_persistence() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        const NEW_WASM: &[u8] = include_bytes!("../../../vendor/test_wasms/contract.wasm");
+        let new_wasm_hash = env.deployer().upload_contract_wasm(NEW_WASM);
+
+        let id = client.queue_upgrade(&admin, &new_wasm_hash);
+        assert_eq!(
+            client.pending_upgrade(&id),
+            Some(ballast_common::upgrade::PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                executes_at: env.ledger().timestamp() + 48 * 3600,
+            })
+        );
+
+        // Advance 48 hours
+        env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600);
+        client.execute_upgrade(&id);
+
+        env.as_contract(&client.address, || {
+            assert_eq!(ballast_common::upgrade::pending_upgrade(&env, id), None);
+        });
+
+        mod upgraded {
+            soroban_sdk::contractimport!(file = "../../vendor/test_wasms/contract.wasm");
+        }
+        let upgraded_client = upgraded::Client::new(&env, &client.address);
+        let sum = upgraded_client.add(&15, &27);
+        assert_eq!(sum, 42);
+
+        // State persists: the last good price and config established before upgrade are still in storage
+        env.as_contract(&client.address, || {
+            let last_good: Option<i128> = env.storage().instance().get(&DataKey::LastGood(asset.clone()));
+            assert_eq!(last_good, Some(SCALE));
+            let config = read_config(&env, &asset);
+            assert_eq!(config.band_bps, 50);
+            assert_eq!(config.daily_move_band_bps, 10_000);
+        });
+    }
+
+    #[test]
+    fn median_of_two_sources_averages_middle_rounded_down() {
+        // Band of 100 bps (1%), daily move band 10,000 bps (100%).
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // 1.0000000 and 1.0050000 (diff is 50 bps, within 100 bps band).
+        let val1 = SCALE; // 10_000_000
+        let val2 = SCALE + 50_000; // 10_050_000 (1.005)
+        let expected = (val1 + val2) / 2; // 10_025_000 (1.0025)
+
+        client.publish_nav(&publisher, &asset, &code, &val1, &now, &sig);
+        let feed_name = feed(&env);
+        client.publish_source(&publisher, &asset, &feed_name, &val2, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+    }
+
+    #[test]
+    fn median_of_four_sources_averages_middle_two_rounded_down() {
+        // Band of 100 bps, daily move band 10,000 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Four sorted values: 10_000_000, 10_020_000, 10_040_001, 10_050_000.
+        // Middle two: 10_020_000 and 10_040_001.
+        // Sum = 20_060_001. Average rounded down = 10_030_000.
+        let v1 = SCALE; // 10_000_000
+        let v2 = SCALE + 20_000; // 10_020_000
+        let v3 = SCALE + 40_001; // 10_040_001
+        let v4 = SCALE + 50_000; // 10_050_000
+        let expected = (v2 + v3) / 2;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        let s4 = Symbol::new(&env, "feed_4");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+        client.publish_source(&publisher, &asset, &s4, &v4, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+        assert_eq!(price.value, 10_030_000);
+    }
+
+    #[test]
+    fn median_of_odd_sources_returns_middle_value() {
+        // Band of 100 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Three sorted values: 10_000_000, 10_030_000, 10_060_000.
+        // Middle is 10_030_000.
+        let v1 = SCALE;
+        let v2 = SCALE + 30_000;
+        let v3 = SCALE + 60_000;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, v2);
     }
 
     mod invariants;

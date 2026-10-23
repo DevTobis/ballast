@@ -1,5 +1,5 @@
 export { BaseContractClient, type ContractClientConfig } from "./base-client.js";
-export { UNSIGNED_TX_TIMEOUT_S, buildUnsignedTx, resolvePokeSource, resolveSimulationSource, simulateRead } from "./unsigned-tx.js";
+export { ContractRejectedError, UNSIGNED_TX_TIMEOUT_S, buildUnsignedTx, resolvePokeSource, resolveSimulationSource, simulateRead } from "./unsigned-tx.js";
 export { getTxOutcome, sendSignedTx, txHashOf, type TxOutcome } from "./tx.js";
 export * from "./scval.js";
 

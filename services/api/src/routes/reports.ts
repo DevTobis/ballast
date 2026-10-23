@@ -8,9 +8,56 @@ const querySchema = z.object({
   format: z.enum(["json", "csv"]).default("json"),
 });
 
-function toCsv(rows: Record<string, unknown>[]): string {
-  if (rows.length === 0) return "";
-  const headers = Object.keys(rows[0]);
+export const REPORT_CSV_FALLBACK_COLUMNS = [
+  "kind",
+  "id",
+  "creditLineId",
+  "fromState",
+  "toState",
+  "ltvBps",
+  "priceSnapshotId",
+  "createdAt",
+  "route",
+  "units",
+  "proceeds",
+  "shortfall",
+  "txHashes",
+  "startedAt",
+  "completedAt",
+  "amount",
+  "txHash",
+  "ledger",
+  "principal",
+  "interest",
+];
+
+export function toCsv(rows: Record<string, unknown>[], defaultColumns: string[] = REPORT_CSV_FALLBACK_COLUMNS): string {
+  const headerSet = new Set<string>();
+  if (rows.length === 0) {
+    for (const col of defaultColumns) {
+      headerSet.add(col);
+    }
+  } else {
+    // Ensure 'kind' is always first if present in any row
+    let hasKind = false;
+    for (const row of rows) {
+      if ("kind" in row) {
+        hasKind = true;
+        break;
+      }
+    }
+    if (hasKind) {
+      headerSet.add("kind");
+    }
+
+    for (const row of rows) {
+      for (const key of Object.keys(row)) {
+        headerSet.add(key);
+      }
+    }
+  }
+
+  const headers = Array.from(headerSet);
   const lines = [headers.join(",")];
   for (const row of rows) {
     lines.push(headers.map((h) => JSON.stringify(row[h] ?? "")).join(","));
