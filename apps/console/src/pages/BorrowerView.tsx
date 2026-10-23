@@ -82,6 +82,7 @@ export function BorrowerView() {
 
       {selected ? (
         <BorrowerLineDetail
+          key={selected.id}
           detail={selected}
           pledges={myPledges.filter((p) => p.creditLineId === selected.id)}
           assets={assets}
