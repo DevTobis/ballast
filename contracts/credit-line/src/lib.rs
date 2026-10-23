@@ -36,13 +36,23 @@
 //! `require_auth` on the actual borrower/lender/payer address named in the call — never the
 //! admin's. There is no `admin_withdraw`/`sweep`-style function anywhere in this contract. See
 //! the `admin_cannot_substitute_for_borrower_auth` test below.
+//!
+//! **TTL Management and Archival Prevention**:
+//! Instance storage (roles, asset config, next line id, vault address) and persistent storage
+//! (`Line`, `Claimable`, `Liquidation`) use shared TTL thresholds and targets from `ballast_common::ttl`:
+//! - `INSTANCE_LIFETIME_THRESHOLD_LEDGERS` (~1 day / 17,280 ledgers) & `INSTANCE_EXTEND_TO_LEDGERS` (~30 days / 518,400 ledgers)
+//! - `PERSISTENT_LIFETIME_THRESHOLD_LEDGERS` (~1 day / 17,280 ledgers) & `PERSISTENT_EXTEND_TO_LEDGERS` (~30 days / 518,400 ledgers)
+//! Every contract entry point calls `ttl::extend_instance(&env)` to ensure the contract instance never expires.
+//! Every read and write to `Line`, `Claimable`, and `Liquidation` extends entry persistent TTL.
+//! In addition, a public `extend_ttl(line)` entry point allows anyone (including keepers or users) to extend
+//! the TTL of a dormant credit line before it archives.
 
 use ballast_common::{
     access::{self, Roles},
     margin::{self, LiquidationRoute, MarginState, MarginThresholds},
     pause::{self, PauseScope},
     price::{GuardedPrice, PriceStatus},
-    risk,
+    risk, ttl,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, token, Address, BytesN, Env, MuxedAddress,
@@ -163,27 +173,52 @@ enum DataKey {
 }
 
 fn read_claimable(env: &Env, line: u64) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Claimable(line))
-        .unwrap_or(0)
+    let key = DataKey::Claimable(line);
+    let amount = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        ttl::extend_persistent(env, &key);
+    }
+    amount
 }
 
 fn write_claimable(env: &Env, line: u64, amount: i128) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::Claimable(line), &amount);
+    let key = DataKey::Claimable(line);
+    env.storage().persistent().set(&key, &amount);
+    ttl::extend_persistent(env, &key);
 }
 
 fn read_line(env: &Env, line: u64) -> Line {
-    env.storage()
+    let key = DataKey::Line(line);
+    let state: Line = env
+        .storage()
         .persistent()
-        .get(&DataKey::Line(line))
-        .expect("credit-line: unknown line")
+        .get(&key)
+        .expect("credit-line: unknown line");
+    ttl::extend_persistent(env, &key);
+    state
 }
 
 fn write_line(env: &Env, line: u64, state: &Line) {
-    env.storage().persistent().set(&DataKey::Line(line), state);
+    let key = DataKey::Line(line);
+    env.storage().persistent().set(&key, state);
+    ttl::extend_persistent(env, &key);
+}
+
+fn read_liquidation(env: &Env, line: u64) -> LiquidationRecord {
+    let key = DataKey::Liquidation(line);
+    let record: LiquidationRecord = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .expect("credit-line: line was not liquidated");
+    ttl::extend_persistent(env, &key);
+    record
+}
+
+fn write_liquidation(env: &Env, line: u64, record: &LiquidationRecord) {
+    let key = DataKey::Liquidation(line);
+    env.storage().persistent().set(&key, record);
+    ttl::extend_persistent(env, &key);
 }
 
 fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
@@ -244,6 +279,7 @@ impl CreditLine {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("credit-line: already initialized");
         }
@@ -271,6 +307,7 @@ impl CreditLine {
         haircut_bps: u32,
         thresholds: MarginThresholds,
     ) {
+        ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
         env.storage().instance().set(
@@ -294,6 +331,7 @@ impl CreditLine {
         cure_s: u64,
         agreement: BytesN<32>,
     ) -> u64 {
+        ttl::extend_instance(&env);
         lender.require_auth();
         assert!(limit > 0, "credit-line: limit must be positive");
 
@@ -335,6 +373,7 @@ impl CreditLine {
     /// Funds the line with USDC that sits here, undrawn, until `draw` pulls it out (PRD §6.2:
     /// "USDC in transit only").
     pub fn fund(env: Env, lender: Address, line: u64, amount: i128) {
+        ttl::extend_instance(&env);
         lender.require_auth();
         assert!(amount > 0, "credit-line: amount must be positive");
 
@@ -358,6 +397,7 @@ impl CreditLine {
 
     /// Names the `PledgeVault` allowed to report collateral through `sync_from_vault`. Admin only.
     pub fn set_vault(env: Env, admin: Address, vault: Address) {
+        ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
         env.storage().instance().set(&DataKey::Vault, &vault);
@@ -365,6 +405,7 @@ impl CreditLine {
 
     /// The collateral asset of `line`, so the vault can refuse a pledge of the wrong token.
     pub fn asset_of(env: Env, line: u64) -> Address {
+        ttl::extend_instance(&env);
         read_line(&env, line).asset
     }
 
@@ -378,6 +419,7 @@ impl CreditLine {
     /// funded against collateral that was no longer there. `sync_collateral` stays as the keeper's
     /// reconciliation path; this is the path that closes the window.
     pub fn sync_from_vault(env: Env, vault: Address, line: u64, asset: Address, units: i128) {
+        ttl::extend_instance(&env);
         vault.require_auth();
         let stored: Address = env
             .storage()
@@ -402,6 +444,7 @@ impl CreditLine {
     /// instead of a live cross-contract read, to avoid a circular `CreditLine <-> PledgeVault`
     /// dependency (`PledgeVault::release` already reads `CreditLine::ltv` the other way).
     pub fn sync_collateral(env: Env, caller: Address, line: u64, units: i128) {
+        ttl::extend_instance(&env);
         access::require_admin_or_keeper(&env, &caller);
         assert!(units >= 0, "credit-line: units cannot be negative");
 
@@ -413,6 +456,7 @@ impl CreditLine {
     /// PRD §8 invariant 1 ("never over-lent") and invariant 2 ("no draws on a bad price"). Both
     /// are enforced here before a single stroop of USDC moves.
     pub fn draw(env: Env, borrower: Address, line: u64, amount: i128, to: Address) {
+        ttl::extend_instance(&env);
         borrower.require_auth();
         pause::require_not_paused(&env, &PauseScope::Draws);
         assert!(amount > 0, "credit-line: amount must be positive");
@@ -472,6 +516,7 @@ impl CreditLine {
     /// PRD §8 invariant 5 ("pausing cannot move funds"): deliberately *not* gated by
     /// `require_not_paused` — repayment must always work while `Draws` (or any scope) is paused.
     pub fn repay(env: Env, payer: Address, line: u64, amount: i128) {
+        ttl::extend_instance(&env);
         payer.require_auth();
         assert!(amount > 0, "credit-line: amount must be positive");
 
@@ -507,6 +552,7 @@ impl CreditLine {
     /// Pure read (no auth): PRD §8 `{ debt, collateral_value, ltv_bps, state, price_status }`.
     /// This is what `PledgeVault::release` cross-calls.
     pub fn ltv(env: Env, line: u64) -> LtvView {
+        ttl::extend_instance(&env);
         let state = read_line(&env, line);
         compute_ltv(&env, &state)
     }
@@ -515,6 +561,7 @@ impl CreditLine {
     /// arming (or clearing) the breach flag `liquidate` needs. Anyone may call this — it can only
     /// ever make on-chain state match a fresh price read, never move funds.
     pub fn poke(env: Env, line: u64) -> MarginState {
+        ttl::extend_instance(&env);
         let mut state = read_line(&env, line);
         let view = compute_ltv(&env, &state);
         state.margin_state = view.state.clone();
@@ -547,6 +594,7 @@ impl CreditLine {
     /// one ledger after the breach was first flagged (via `poke`), that still confirms the
     /// breach. This function does not itself move collateral — see the module doc comment.
     pub fn liquidate(env: Env, keeper: Address, line: u64, route: LiquidationRoute) {
+        ttl::extend_instance(&env);
         let _ = keeper;
         access::require_keeper(&env);
         let _ = route;
@@ -577,8 +625,9 @@ impl CreditLine {
 
         // Freeze what the outcome will be measured against: the whole position, the confirmed
         // price and the debt at this moment (see `LiquidationRecord`).
-        env.storage().persistent().set(
-            &DataKey::Liquidation(line),
+        write_liquidation(
+            &env,
+            line,
             &LiquidationRecord {
                 seized_units: state.pledged_units,
                 price,
@@ -606,6 +655,7 @@ impl CreditLine {
     /// repaid is written off the line's funded balance, so what is left in `funded` is exactly the
     /// USDC still held here and withdrawable with `withdraw_undrawn`.
     pub fn close_liquidated(env: Env, lender: Address, line: u64) {
+        ttl::extend_instance(&env);
         lender.require_auth();
 
         let mut state = read_line(&env, line);
@@ -615,11 +665,7 @@ impl CreditLine {
             "credit-line: line is not being liquidated"
         );
 
-        let mut record: LiquidationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Liquidation(line))
-            .expect("credit-line: no liquidation record");
+        let mut record = read_liquidation(&env, line);
 
         let recovered = risk::collateral_value(record.seized_units, record.price, 0);
         let surplus = (recovered - record.debt).max(0);
@@ -649,9 +695,7 @@ impl CreditLine {
         record.recovered = recovered;
         record.surplus = surplus;
         record.shortfall = shortfall;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Liquidation(line), &record);
+        write_liquidation(&env, line, &record);
 
         env.events().publish(
             (Symbol::new(&env, "line_closed"), line),
@@ -662,6 +706,7 @@ impl CreditLine {
     /// Takes undrawn USDC back out of the line (reducing the commitment). Repaid principal returns
     /// to the undrawn balance, so this is also how a lender gets principal back.
     pub fn withdraw_undrawn(env: Env, lender: Address, line: u64, amount: i128) {
+        ttl::extend_instance(&env);
         lender.require_auth();
         assert!(amount > 0, "credit-line: amount must be positive");
 
@@ -686,6 +731,7 @@ impl CreditLine {
     /// Takes repaid interest out of the contract. Interest is tracked separately from principal
     /// (it never counts as undrawn funding) so it can be withdrawn without touching the commitment.
     pub fn withdraw_interest(env: Env, lender: Address, line: u64, amount: i128) {
+        ttl::extend_instance(&env);
         lender.require_auth();
         assert!(amount > 0, "credit-line: amount must be positive");
 
@@ -709,19 +755,19 @@ impl CreditLine {
 
     /// Interest repaid on `line` and not yet withdrawn.
     pub fn claimable_interest(env: Env, line: u64) -> i128 {
+        ttl::extend_instance(&env);
         read_claimable(&env, line)
     }
 
     /// The recorded liquidation outcome for `line`, if it was liquidated.
     pub fn liquidation_record(env: Env, line: u64) -> LiquidationRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Liquidation(line))
-            .expect("credit-line: line was not liquidated")
+        ttl::extend_instance(&env);
+        read_liquidation(&env, line)
     }
 
     /// Read-only helper for consoles/tests.
     pub fn line(env: Env, line: u64) -> Line {
+        ttl::extend_instance(&env);
         read_line(&env, line)
     }
 
@@ -729,7 +775,29 @@ impl CreditLine {
     /// the line they're claiming to release collateral from, without decoding this contract's
     /// full `Line` struct on the other side.
     pub fn borrower_of(env: Env, line: u64) -> Address {
+        ttl::extend_instance(&env);
         read_line(&env, line).borrower
+    }
+
+    /// Extends instance TTL and persistent storage TTL for `line` (and its claimable and
+    /// liquidation entries if present). Anyone (e.g. borrower, lender, or keeper) can call
+    /// this to keep a dormant line from archiving.
+    pub fn extend_ttl(env: Env, line: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::Line(line);
+        assert!(
+            env.storage().persistent().has(&key),
+            "credit-line: unknown line"
+        );
+        ttl::extend_persistent(&env, &key);
+        let claimable_key = DataKey::Claimable(line);
+        if env.storage().persistent().has(&claimable_key) {
+            ttl::extend_persistent(&env, &claimable_key);
+        }
+        let liq_key = DataKey::Liquidation(line);
+        if env.storage().persistent().has(&liq_key) {
+            ttl::extend_persistent(&env, &liq_key);
+        }
     }
 }
 
@@ -737,6 +805,7 @@ impl CreditLine {
 mod test {
     use super::*;
     use ballast_common::price::PRICE_SCALE;
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
     use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
 
@@ -1349,5 +1418,67 @@ mod test {
         }));
         assert!(result.is_err(), "only the configured vault may report collateral");
         assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+    }
+
+    #[test]
+    fn credit_line_persistent_and_instance_storage_extended_ttl() {
+        let h = setup(2_000, 100 * PRICE_SCALE, PriceStatus::Ok);
+        let agreement = BytesN::from_array(&h.env, &[7u8; 32]);
+        let line = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &100_000,
+            &500,
+            &86_400,
+            &agreement,
+        );
+
+        h.env.as_contract(&h.credit_line.address, || {
+            let key = DataKey::Line(line);
+            assert!(h.env.storage().persistent().has(&key));
+            assert_eq!(
+                h.env.storage().persistent().get_ttl(&key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+            assert_eq!(
+                h.env.storage().instance().get_ttl(),
+                ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
+            );
+        });
+
+        // Advance ledger sequence past the default threshold (~1 day = 17,280 ledgers)
+        h.env.ledger().with_mut(|l| l.sequence_number += 505_000);
+
+        // Reading the line extends the TTL back out
+        assert_eq!(h.credit_line.borrower_of(&line), h.borrower);
+
+        h.env.as_contract(&h.credit_line.address, || {
+            let key = DataKey::Line(line);
+            assert_eq!(
+                h.env.storage().persistent().get_ttl(&key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+            assert_eq!(
+                h.env.storage().instance().get_ttl(),
+                ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
+            );
+        });
+
+        // Advance ledger again, test explicit extend_ttl entry point
+        h.env.ledger().with_mut(|l| l.sequence_number += 505_000);
+        h.credit_line.extend_ttl(&line);
+
+        h.env.as_contract(&h.credit_line.address, || {
+            let key = DataKey::Line(line);
+            assert_eq!(
+                h.env.storage().persistent().get_ttl(&key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+            assert_eq!(
+                h.env.storage().instance().get_ttl(),
+                ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
+            );
+        });
     }
 }

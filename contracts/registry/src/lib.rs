@@ -15,9 +15,9 @@ use ballast_common::{
     access::{self, Roles},
     asset::{AssetConfig, ParamChange},
     pause::{self, PauseScope},
-    timelock, ttl,
+    timelock, ttl, upgrade,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 #[contracttype]
 struct PendingParamChange {
@@ -299,6 +299,36 @@ impl Registry {
     pub fn is_paused(env: Env, scope: PauseScope) -> bool {
         pause::is_paused(&env, &scope)
     }
+
+    /// Queues a timelocked contract upgrade to `new_wasm_hash`.
+    /// Admin only. Executable after 48h.
+    pub fn queue_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> u64 {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::queue_upgrade(&env, &new_wasm_hash)
+    }
+
+    /// Cancels a pending contract upgrade.
+    /// Admin only.
+    pub fn cancel_upgrade(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::cancel_upgrade(&env, id);
+    }
+
+    /// Executes a queued contract upgrade once the 48h timelock has elapsed.
+    /// Permissionless once ready.
+    pub fn execute_upgrade(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        upgrade::execute_upgrade(&env, id);
+    }
+
+    /// Returns the pending upgrade for `id`, if one exists.
+    pub fn pending_upgrade(env: Env, id: u64) -> Option<upgrade::PendingUpgrade> {
+        upgrade::pending_upgrade(&env, id)
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +567,49 @@ mod test {
             }));
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: asset already registered")]
+    fn register_asset_rejects_a_duplicate_asset() {
+        let (env, client, admin, _risk, asset) = setup();
+        client.register_asset(&admin, &asset, &valid_config(&env, &asset));
+    }
+
+    #[test]
+    fn a_stranger_cannot_register_an_asset_even_naming_themselves_admin() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, _asset) = setup();
+        let stranger = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let config = valid_config(&env, &asset);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_asset",
+                args: (stranger.clone(), asset.clone(), config.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.register_asset(&stranger, &asset, &config);
+        }));
+        assert!(
+            result.is_err(),
+            "only the stored admin may register an asset"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: asset not registered")]
+    fn asset_rejects_an_unknown_address() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        let unknown = Address::generate(&env);
+        client.asset(&unknown);
     }
 
     #[test]
@@ -1068,5 +1141,103 @@ mod test {
         assert_ne!(id2, id3);
         assert!(id2 > id1);
         assert!(id3 > id2);
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_or_cancel_upgrade() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _risk, _asset) = setup();
+        let stranger = Address::generate(&env);
+        let dummy_wasm = BytesN::from_array(&env, &[1u8; 32]);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_upgrade",
+                args: (stranger.clone(), dummy_wasm.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_upgrade(&stranger, &dummy_wasm);
+        }));
+        assert!(result.is_err(), "only the stored admin may queue an upgrade");
+
+        env.mock_all_auths();
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_upgrade",
+                args: (stranger.clone(), id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let cancel_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_upgrade(&stranger, &id);
+        }));
+        assert!(cancel_res.is_err(), "only the stored admin may cancel an upgrade");
+
+        env.mock_all_auths();
+        client.cancel_upgrade(&admin, &id);
+        assert_eq!(client.pending_upgrade(&id), None);
+    }
+
+    #[test]
+    fn execute_upgrade_requires_the_timelock_to_elapse() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let dummy_wasm = BytesN::from_array(&env, &[2u8; 32]);
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_upgrade(&id);
+        }));
+        assert!(early.is_err(), "cannot execute upgrade before 48h elapses");
+    }
+
+    #[test]
+    fn test_contract_upgrade_and_state_persistence() {
+        let (env, client, admin, _risk, asset) = setup();
+        let config = valid_config(&env, &asset);
+        assert_eq!(client.asset(&asset).status, config.status);
+
+        const NEW_WASM: &[u8] = include_bytes!("../../../vendor/test_wasms/contract.wasm");
+        let new_wasm_hash = env.deployer().upload_contract_wasm(NEW_WASM);
+
+        let id = client.queue_upgrade(&admin, &new_wasm_hash);
+        assert_eq!(
+            client.pending_upgrade(&id),
+            Some(ballast_common::upgrade::PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                executes_at: env.ledger().timestamp() + 48 * 3600,
+            })
+        );
+
+        // Advance 48 hours
+        env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600);
+        client.execute_upgrade(&id);
+
+        env.as_contract(&client.address, || {
+            assert_eq!(ballast_common::upgrade::pending_upgrade(&env, id), None);
+        });
+
+        mod upgraded {
+            soroban_sdk::contractimport!(file = "../../vendor/test_wasms/contract.wasm");
+        }
+        let upgraded_client = upgraded::Client::new(&env, &client.address);
+        let sum = upgraded_client.add(&15, &27);
+        assert_eq!(sum, 42);
+
+        // State persists: the asset config registered before the upgrade is still in storage
+        env.as_contract(&client.address, || {
+            let loaded = read_asset(&env, &asset);
+            assert_eq!(loaded.contract, asset);
+            assert_eq!(loaded.haircut_base_bps, 300);
+            assert_eq!(loaded.status, config.status);
+        });
     }
 }

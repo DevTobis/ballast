@@ -230,6 +230,18 @@ async function applyFailure(db: Database, intent: IntentRow): Promise<void> {
   }
 }
 
+/** Hands the intent back as pending with the failure recorded, so the next sweep retries it. */
+async function recordSettleError(db: Database, intent: IntentRow, err: unknown): Promise<void> {
+  try {
+    await db
+      .update(schema.txIntent)
+      .set({ status: "pending", error: err instanceof Error ? err.message : String(err) })
+      .where(eq(schema.txIntent.txHash, intent.txHash));
+  } catch {
+    // ignore secondary error if db update fails
+  }
+}
+
 /**
  * Asks the network how `intent`'s transaction ended and, the first time it has a final answer,
  * applies it. Safe to call repeatedly and concurrently: the `pending -> settled|failed` flip is
@@ -259,34 +271,39 @@ export async function settleIntent(
   // Pre-read any on-chain contract data before starting the database transaction so we don't
   // keep a database transaction open during external network RPC calls.
   let contractState: Record<string, unknown> | undefined;
-  if (outcome.status === "SUCCESS") {
-    const refId = intent.refId!;
-    switch (intent.kind as IntentKind) {
-      case "credit_line.close_liquidated": {
-        const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
-        if (line?.contractLineId) {
-          const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId));
-          contractState = { liquidationRecord: record };
+  try {
+    if (outcome.status === "SUCCESS") {
+      const refId = intent.refId!;
+      switch (intent.kind as IntentKind) {
+        case "credit_line.close_liquidated": {
+          const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
+          if (line?.contractLineId) {
+            const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId));
+            contractState = { liquidationRecord: record };
+          }
+          break;
         }
-        break;
-      }
-      case "credit_line.repay": {
-        const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
-        if (line?.contractLineId) {
-          const onChain = await contracts.creditLine.line(BigInt(line.contractLineId));
-          contractState = { line: onChain };
+        case "credit_line.repay": {
+          const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
+          if (line?.contractLineId) {
+            const onChain = await contracts.creditLine.line(BigInt(line.contractLineId));
+            contractState = { line: onChain };
+          }
+          break;
         }
-        break;
-      }
-      case "repo.top_up": {
-        const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, refId)).limit(1);
-        if (trade?.contractTradeId) {
-          const onChain = await contracts.repoDvp.trade(BigInt(trade.contractTradeId));
-          contractState = { trade: onChain };
+        case "repo.top_up": {
+          const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, refId)).limit(1);
+          if (trade?.contractTradeId) {
+            const onChain = await contracts.repoDvp.trade(BigInt(trade.contractTradeId));
+            contractState = { trade: onChain };
+          }
+          break;
         }
-        break;
       }
     }
+  } catch (err) {
+    await recordSettleError(db, intent, err);
+    throw err;
   }
 
   const runWithDb = async (txDb: Database): Promise<SettleResult | null> => {
@@ -324,15 +341,7 @@ export async function settleIntent(
 
     return settleRes;
   } catch (err) {
-    // If a transaction rollback was not used (or for safety recording the error message), record error
-    try {
-      await db
-        .update(schema.txIntent)
-        .set({ status: "pending", error: err instanceof Error ? err.message : String(err) })
-        .where(eq(schema.txIntent.txHash, intent.txHash));
-    } catch {
-      // ignore secondary error if db update fails
-    }
+    await recordSettleError(db, intent, err);
     throw err;
   }
 }

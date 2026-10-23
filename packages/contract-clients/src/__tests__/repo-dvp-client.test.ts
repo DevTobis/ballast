@@ -45,6 +45,10 @@ describe("RepoDvpClient", () => {
     expect((await client.callMargin(source, 1n)).length).toBeGreaterThan(0);
   });
 
+  it("cancelProposal() returns non-empty unsigned XDR", async () => {
+    expect((await client.cancelProposal(source, 1n)).length).toBeGreaterThan(0);
+  });
+
   it("defaultClose() returns non-empty unsigned XDR", async () => {
     expect((await client.defaultClose(source, 1n)).length).toBeGreaterThan(0);
   });

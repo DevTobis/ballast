@@ -1,0 +1,18 @@
+[package]
+name = "ballast-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+ballast-common = { workspace = true }
+ballast-credit-line = { path = "../credit-line", features = ["testutils"] }
+ballast-pledge-vault = { path = "../pledge-vault", features = ["testutils"] }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
