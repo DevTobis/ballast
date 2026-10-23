@@ -33,7 +33,8 @@ export type AlertKind =
   | "operator_balance_low"
   | "reconciliation_break"
   | "event_gap_skipped"
-  | "rpc_lag_high";
+  | "rpc_lag_high"
+  | "payout_unbooked";
 
 export interface Alerter {
   fire(kind: AlertKind, context: Record<string, unknown>): void;
