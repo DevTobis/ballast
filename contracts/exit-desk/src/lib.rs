@@ -77,6 +77,7 @@ pub struct ExitQuote {
 enum DataKey {
     Usdc,
     AssetConfig(Address),
+    AssetDisabled(Address),
     /// RWA units this desk currently holds for `asset` (PRD §5 Phase 2 "Limits": total desk
     /// inventory cap tied to facility size). Grows with every exit and shrinks when the operator
     /// takes inventory back out with `withdraw`.
@@ -93,6 +94,19 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
         .expect("exit-desk: asset not configured")
 }
 
+fn is_asset_disabled(env: &Env, asset: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetDisabled(asset.clone()))
+        .unwrap_or(false)
+}
+
+fn require_asset_enabled(env: &Env, asset: &Address) {
+    if is_asset_disabled(env, asset) {
+        panic!("exit-desk: asset is disabled");
+    }
+}
+
 fn require_admin_is(env: &Env, admin: &Address) {
     let stored_admin = access::require_admin(env);
     assert_eq!(&stored_admin, admin, "exit-desk: admin argument mismatch");
@@ -107,6 +121,7 @@ fn compute_quote(env: &Env, asset: &Address, units: i128) -> ExitQuote {
     if units <= 0 {
         panic!("exit-desk: units must be positive");
     }
+    require_asset_enabled(env, asset);
     let config = read_asset_config(env, asset);
     let guarded = PriceGuardClient::new(env, &config.price_guard).guarded_price(asset);
     if !guarded.is_usable_for_new_risk() {
@@ -196,6 +211,34 @@ impl ExitDesk {
                 desk_inventory_cap,
             },
         );
+    }
+
+    /// Disables an asset so that new quotes and exits are refused. Admin only.
+    pub fn disable_asset(env: Env, admin: Address, asset: Address) {
+        require_admin_is(&env, &admin);
+        let _ = read_asset_config(&env, &asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetDisabled(asset.clone()), &true);
+        env.events()
+            .publish((symbol_short!("disable"), asset), ());
+    }
+
+    /// Re-enables a disabled asset. Admin only.
+    pub fn enable_asset(env: Env, admin: Address, asset: Address) {
+        require_admin_is(&env, &admin);
+        let _ = read_asset_config(&env, &asset);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AssetDisabled(asset.clone()));
+        env.events()
+            .publish((symbol_short!("enable"), asset), ());
+    }
+
+    /// Checks whether an asset is currently enabled.
+    pub fn is_asset_enabled(env: Env, asset: Address) -> bool {
+        let _ = read_asset_config(&env, &asset);
+        !is_asset_disabled(&env, &asset)
     }
 
     /// Simulates the Exit Facility topping up the desk: pulls `amount` of `usdc` from the caller

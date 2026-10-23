@@ -41,6 +41,12 @@
 //! an off-chain keeper service calls both `CreditLine::liquidate` and `PledgeVault::liquidate` as
 //! two separate transactions. Flagged here and in the build report as the least clean part of
 //! this skeleton.
+//!
+//! **Events.** Published with shape `((Symbol, line), payload)`:
+//! - `pledged`: `((Symbol("pledged"), line), (asset: Address, units: i128))`
+//! - `released`: `((Symbol("released"), line), (asset: Address, units: i128))`
+//! - `lien_recorded`: `((Symbol("lien_recorded"), line), (asset: Address, units: i128, lien_ref: Bytes))`
+//! - `liquidated`: `((Symbol("liquidated"), line), (asset: Address, units: i128, to: Address))`
 
 use ballast_common::{
     access::{self, Roles},
@@ -389,9 +395,14 @@ impl PledgeVault {
         );
         position.pending_lien_units -= units;
         position.units += units;
-        position.lien_ref = Some(lien_ref);
+        position.lien_ref = Some(lien_ref.clone());
         write_position(&env, line, &asset, &position);
         sync_credit_line(&env, &read_asset_config(&env, &asset), line, &asset, &position);
+
+        env.events().publish(
+            (Symbol::new(&env, "lien_recorded"), line),
+            (asset, units, lien_ref),
+        );
     }
 
     /// The other half of invariant 4's release path. Not in the PRD §8 interface sketch for
@@ -441,7 +452,8 @@ impl PledgeVault {
 mod test {
     use super::*;
     use ballast_common::{margin::MarginThresholds, price::PRICE_SCALE};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
+    use soroban_sdk::{IntoVal, TryFromVal};
 
     // A minimal in-crate mock token implementing just `transfer`/`balance`/`mint`. Deploying a
     // real Stellar Asset Contract in a unit test (`Env::register_stellar_asset_contract_v2`)
@@ -837,5 +849,82 @@ mod test {
             &CustodyMode::IssuerLien,
         );
         h.vault.pledge(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn record_lien_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 42u64;
+        let pledge_amount = 250 * PRICE_SCALE;
+        h.vault.pledge(&h.borrower, &line_id, &h.asset, &pledge_amount);
+
+        let contract_events = || {
+            h.env
+                .events()
+                .all()
+                .events()
+                .into_iter()
+                .filter(|e| e.type_ == ContractEventType::Contract)
+                .cloned()
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        // 1. Failure case: attempting to record more units than pending
+        let invalid_lien_ref = Bytes::from_slice(&h.env, b"invalid-lien");
+        let failed_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.record_lien(
+                &gateway,
+                &line_id,
+                &h.asset,
+                &(pledge_amount + 1),
+                &invalid_lien_ref,
+            );
+        }));
+        assert!(failed_res.is_err(), "record_lien with excess units must fail");
+
+        // Verify no contract event was published on failure
+        let events_after_failure = contract_events().len();
+        assert_eq!(
+            events_after_failure, 0,
+            "no contract event should be emitted on failed record_lien"
+        );
+
+        // 2. Success case: record valid lien
+        let lien_ref = Bytes::from_slice(&h.env, b"valid-lien-ref-42");
+        h.vault.record_lien(&gateway, &line_id, &h.asset, &pledge_amount, &lien_ref);
+
+        let events_after_success = contract_events();
+        assert_eq!(
+            events_after_success.len(), 1,
+            "exactly one contract event must be emitted on successful record_lien"
+        );
+        let last_event = events_after_success.last().expect("an event must have been published");
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("lien_recorded".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(line_id);
+        let val: soroban_sdk::Val = (h.asset.clone(), pledge_amount, lien_ref).into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
     }
 }
