@@ -91,12 +91,12 @@ export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts
     }
     if (trade.status !== "settled") return reply.code(409).send({ error: `trade is ${trade.status}, not settled` });
 
-    const cashBorrowerAccount = await requireStellarAccount(db, trade.cashBorrowerId);
+    const callerAccount = await requireStellarAccount(db, request.partyId);
     const contractTradeId = body.contractTradeId ?? (trade.contractTradeId ? BigInt(trade.contractTradeId) : null);
     if (contractTradeId === null) {
       return reply.code(409).send({ error: "repo proposal has not settled on-chain yet" });
     }
-    const xdr = await contracts.repoDvp.unwind(cashBorrowerAccount, contractTradeId);
+    const xdr = await contracts.repoDvp.unwind(callerAccount, contractTradeId);
     const txHash = await recordIntent(db, chain, {
       xdr,
       kind: "repo.unwind",
