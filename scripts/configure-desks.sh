@@ -43,7 +43,8 @@ log "Trustlines: lender can receive RWA1 (liquidated collateral), admin can hold
 retry stellar tx new change-trust --source lender --line "RWA1:$RWA_ISSUER" --network "$NETWORK" >/dev/null
 retry stellar tx new change-trust --source admin --line "TUSD:$USDC_ISSUER" --network "$NETWORK" >/dev/null
 
-log "Configuring ExitDesk for RWA1 (25bps spread, 10,000/day per holder, 1,000,000 inventory cap)"
+log "Configuring ExitDesk (TUSD cash leg, RWA1 25bps spread, 10,000/day per holder, 1,000,000 inventory cap)"
+inv --id "$EXIT_DESK_CID" --source admin -- set_usdc --admin "$ADMIN" --usdc "$USDC_SAC" >/dev/null
 inv --id "$EXIT_DESK_CID" --source admin -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$PRICE_GUARD_CID" --spread_bps 25 \
   --per_holder_daily_cap $((10000 * UNIT)) --desk_inventory_cap $((1000000 * UNIT)) >/dev/null

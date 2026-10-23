@@ -31,6 +31,7 @@ use ballast_common::{
     access::{self, Roles},
     pause::{self, PauseScope},
     price::{GuardedPrice, PRICE_SCALE},
+    timelock,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, Env,
@@ -74,6 +75,13 @@ pub struct ExitQuote {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUnpause {
+    pub scope: PauseScope,
+    pub executes_at: u64,
+}
+
+#[contracttype]
 enum DataKey {
     Usdc,
     AssetConfig(Address),
@@ -85,6 +93,7 @@ enum DataKey {
     /// Units a `holder` has exited for `asset` within a given UTC day bucket
     /// (`timestamp / 86_400`), for the per-holder daily cap.
     DailyUsed(Address, Address, u64),
+    PendingUnpause(u64),
 }
 
 fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
@@ -93,6 +102,13 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
         .get(&DataKey::AssetConfig(asset.clone()))
         .expect("exit-desk: asset not configured")
 }
+
+fn read_usdc(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::Usdc)
+        .expect("exit-desk: usdc not configured")
+    }
 
 fn is_asset_disabled(env: &Env, asset: &Address) -> bool {
     env.storage()
@@ -213,6 +229,19 @@ impl ExitDesk {
         );
     }
 
+    /// Admin-set once; exit swaps pay out this token. See module docs for why this isn't
+    /// read from `Registry`.
+    pub fn set_usdc(env: Env, admin: Address, usdc: Address) {
+        require_admin_is(&env, &admin);
+        env.storage().instance().set(&DataKey::Usdc, &usdc);
+        env.events()
+            .publish((symbol_short!("set_usdc"), admin), usdc);
+    }
+
+    pub fn usdc(env: Env) -> Address {
+        read_usdc(&env)
+    }
+
     /// Disables an asset so that new quotes and exits are refused. Admin only.
     pub fn disable_asset(env: Env, admin: Address, asset: Address) {
         require_admin_is(&env, &admin);
@@ -242,18 +271,16 @@ impl ExitDesk {
     }
 
     /// Simulates the Exit Facility topping up the desk: pulls `amount` of `usdc` from the caller
-    /// (admin or keeper) into this contract's float. Stores `usdc`'s address the first time it is
-    /// called; later calls must agree on the same token.
+    /// (admin or keeper) into this contract's float. Requires `set_usdc` to have been called first,
+    /// and the token argument must match the configured USDC token address.
     pub fn fund(env: Env, admin_or_keeper: Address, usdc: Address, amount: i128) {
         access::require_admin_or_keeper(&env, &admin_or_keeper);
         if amount <= 0 {
             panic!("exit-desk: amount must be positive");
         }
 
-        match env.storage().instance().get::<_, Address>(&DataKey::Usdc) {
-            Some(existing) => assert_eq!(existing, usdc, "exit-desk: usdc address mismatch"),
-            None => env.storage().instance().set(&DataKey::Usdc, &usdc),
-        }
+        let configured = read_usdc(&env);
+        assert_eq!(configured, usdc, "exit-desk: usdc address mismatch");
 
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(
@@ -356,11 +383,7 @@ impl ExitDesk {
         let rwa_client = token::Client::new(&env, &asset);
         rwa_client.transfer(&holder, to_muxed(&env.current_contract_address()), &units);
 
-        let usdc: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Usdc)
-            .expect("exit-desk: usdc not funded/configured yet");
+        let usdc = read_usdc(&env);
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(
             &env.current_contract_address(),
@@ -377,6 +400,69 @@ impl ExitDesk {
             .publish((symbol_short!("exit"), holder, asset), quote.usdc_out);
 
         quote.usdc_out
+    }
+
+    /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
+    pub fn pause(env: Env, pauser: Address, scope: PauseScope) {
+        let stored_pauser = access::require_pauser(&env);
+        assert_eq!(&stored_pauser, &pauser, "exit-desk: pauser argument mismatch");
+        pause::set_paused(&env, &scope, true);
+        env.events()
+            .publish((symbol_short!("paused"), pauser), scope);
+    }
+
+    /// Queues an unpause, executable after the 48h timelock — unlike `pause`, lifting a stop is
+    /// not urgent and deserves the same notice period as any other risk-loosening change.
+    pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
+        require_admin_is(&env, &admin);
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingUnpause(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingUnpause {
+                scope: scope.clone(),
+                executes_at,
+            },
+        );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("unp_q"), id), (scope, executes_at));
+        id
+    }
+
+    pub fn execute_unpause(env: Env, id: u64) {
+        let key = DataKey::PendingUnpause(id);
+        let pending: PendingUnpause = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("exit-desk: no such pending unpause");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "exit-desk: timelock has not elapsed"
+        );
+        pause::set_paused(&env, &pending.scope, false);
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((symbol_short!("unp_exec"), id), pending.scope);
+    }
+
+    pub fn cancel_unpause(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        let key = DataKey::PendingUnpause(id);
+        let pending: PendingUnpause = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("exit-desk: no such pending unpause");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((symbol_short!("unp_canc"), id), pending.scope);
+    }
+
+    pub fn is_paused(env: Env, scope: PauseScope) -> bool {
+        pause::is_paused(&env, &scope)
     }
 }
 

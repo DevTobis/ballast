@@ -59,20 +59,40 @@
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
-    ttl, upgrade,
+    timelock, ttl, upgrade,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 const ISSUER_SOURCE: &str = "issuer";
 
 #[contracttype]
-#[derive(Clone)]
-struct AssetGuardConfig {
-    band_bps: u32,
-    daily_move_band_bps: u32,
-    max_staleness_s: u64,
-    window_seconds: u64,
-    window_move_band_bps: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetGuardConfig {
+    pub band_bps: u32,
+    pub daily_move_band_bps: u32,
+    pub max_staleness_s: u64,
+    pub window_seconds: u64,
+    pub window_move_band_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigChange {
+    BandBps(Address, u32),
+    DailyMoveBandBps(Address, u32),
+    WindowSeconds(Address, u64),
+    WindowMoveBandBps(Address, u32),
+    MaxStalenessSeconds(Address, u64),
+    Asset(Address, u32, u32, u64, u32, u64),
+    IssuerPubKey(Address, BytesN<32>),
+    RequireNavSignature(bool),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfigChange {
+    pub change: ConfigChange,
+    pub executes_at: u64,
 }
 
 #[contracttype]
@@ -113,6 +133,7 @@ enum DataKey {
     RequireNavSignature,
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
+    PendingConfig(u64),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -649,6 +670,9 @@ impl PriceGuard {
     /// Admin-set per-asset thresholds. Kept local to this contract rather than cross-called from
     /// `Registry` — see the module docs on the general Registry-decoupling simplification used
     /// across this pass's contracts.
+    ///
+    /// Tightening changes (smaller bands, shorter staleness, longer window) apply immediately;
+    /// loosening changes must be queued via `queue_config` and wait for the 48h timelock.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -662,6 +686,23 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+
+        let existing: Option<AssetGuardConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(asset.clone()));
+        if let Some(old) = existing {
+            let is_loosening = band_bps > old.band_bps
+                || daily_move_band_bps > old.daily_move_band_bps
+                || window_move_band_bps > old.window_move_band_bps
+                || max_staleness_s > old.max_staleness_s
+                || window_seconds < old.window_seconds;
+            assert!(
+                !is_loosening,
+                "price-guard: loosening changes must be queued via queue_config"
+            );
+        }
+
         env.storage().instance().set(
             &DataKey::Config(asset.clone()),
             &AssetGuardConfig {
@@ -689,9 +730,8 @@ impl PriceGuard {
     }
 
     /// Admin-only. Registers/rotates the raw Ed25519 public key `asset`'s issuer signs NAV
-    /// readings with — see the module doc comment. Required before `publish_nav` can succeed for
-    /// `asset` while `require_nav_signature` is `true`. Call this with the new publisher's raw
-    /// public key when rotating `price_publisher` and the publisher is also the NAV attestor.
+    /// readings with. Initial registration applies immediately; rotations must be queued
+    /// via `queue_config` with a 48h delay to protect against key compromise.
     pub fn configure_issuer_key(
         env: Env,
         admin: Address,
@@ -701,6 +741,16 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+        let existing: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::IssuerPubKey(asset.clone()));
+        if let Some(old) = existing {
+            assert!(
+                old == issuer_pubkey,
+                "price-guard: rotating issuer key must be queued via queue_config"
+            );
+        }
         env.storage()
             .instance()
             .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
@@ -710,12 +760,26 @@ impl PriceGuard {
         );
     }
 
-    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all —
-    /// see the module doc comment on why this exists and why it defaults to `true`.
+    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all.
+    /// Tightening (requiring signatures) is immediate; loosening (disabling verification) requires 48h timelock.
     pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+        let has_existing = env
+            .storage()
+            .instance()
+            .has(&DataKey::RequireNavSignature);
+        if has_existing {
+            let existing: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::RequireNavSignature)
+                .unwrap_or(true);
+            if existing && !required {
+                panic!("price-guard: disabling signature requirement must be queued via queue_config");
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::RequireNavSignature, &required);
@@ -741,6 +805,178 @@ impl PriceGuard {
         );
 
         evaluate(&env, asset);
+    }
+
+    /// Queues a loosening configuration change, subject to a 48h timelock delay.
+    /// Admin only. Returns the monotonic ID for `execute_config`.
+    pub fn queue_config(env: Env, admin: Address, change: ConfigChange) -> u64 {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingConfig(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingConfigChange {
+                change: change.clone(),
+                executes_at,
+            },
+        );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events().publish(
+            (Symbol::new(&env, "config_queued"), id),
+            (change, executes_at),
+        );
+        id
+    }
+
+    /// Cancels a pending configuration change. Admin only.
+    pub fn cancel_config(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingConfig(id);
+        let pending: PendingConfigChange = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("price-guard: no such pending change");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "config_cancelled"), id), pending.change);
+    }
+
+    /// Applies a queued configuration change once the 48h timelock has elapsed.
+    /// Permissionless.
+    pub fn execute_config(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingConfig(id);
+        let pending: PendingConfigChange = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("price-guard: no such pending change");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "price-guard: timelock has not elapsed"
+        );
+
+        match pending.change.clone() {
+            ConfigChange::BandBps(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.band_bps = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::DailyMoveBandBps(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.daily_move_band_bps = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::WindowSeconds(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.window_seconds = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::WindowMoveBandBps(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.window_move_band_bps = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::MaxStalenessSeconds(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.max_staleness_s = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::Asset(asset, band, daily, win_sec, win_move, staleness) => {
+                let config = AssetGuardConfig {
+                    band_bps: band,
+                    daily_move_band_bps: daily,
+                    window_seconds: win_sec,
+                    window_move_band_bps: win_move,
+                    max_staleness_s: staleness,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::IssuerPubKey(asset, key_val) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::IssuerPubKey(asset), &key_val);
+            }
+            ConfigChange::RequireNavSignature(val) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RequireNavSignature, &val);
+            }
+        }
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "config_executed"), id), pending.change);
+    }
+
+    /// Read-only inspection of a pending config change.
+    pub fn pending_config(env: Env, id: u64) -> Option<PendingConfigChange> {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingConfig(id);
+        let res = env.storage().persistent().get(&key);
+        if res.is_some() {
+            timelock::extend_entry_ttl(&env, &key);
+        }
+        res
+    }
+
+    /// Read-only inspection of an asset guard config.
+    pub fn asset_config(env: Env, asset: Address) -> Option<AssetGuardConfig> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::Config(asset))
+    }
+
+    /// Read-only inspection of whether NAV signatures are required.
+    pub fn require_nav_signature(env: Env) -> bool {
+        ttl::extend_instance(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::RequireNavSignature)
+            .unwrap_or(true)
+    }
+
+    /// Read-only inspection of an asset's issuer public key.
+    pub fn issuer_pubkey(env: Env, asset: Address) -> Option<BytesN<32>> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::IssuerPubKey(asset))
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
@@ -1991,6 +2227,294 @@ mod test {
         let next_price = client.guarded_price(&asset);
         assert_eq!(next_price.status, PriceStatus::Ok);
         assert_eq!(next_price.value, SCALE);
+    }
+
+    /// Golden vectors for the canonical NAV message. The same vectors live in
+    /// `services/price-guard/src/__fixtures__/nav-message-vectors.json`, asserted by
+    /// `services/price-guard/src/navSignature.test.ts` against `canonicalNavMessage`. If one side
+    /// changes, both tests have to change in the same commit:
+    ///   ("SPIKO",   1700000000, 10234567)                                -> "SPIKO:1700000000:10234567"
+    ///   ("CETES28", 4102444800, 170141183460469231731687303715884105727) -> "CETES28:4102444800:170141183460469231731687303715884105727"
+    #[test]
+    fn build_nav_message_matches_golden_vectors() {
+        let env = Env::default();
+
+        let message = build_nav_message(
+            &env,
+            &Bytes::from_slice(&env, b"SPIKO"),
+            1_700_000_000,
+            10_234_567,
+        );
+        assert_eq!(message, Bytes::from_slice(&env, b"SPIKO:1700000000:10234567"));
+
+        let message = build_nav_message(
+            &env,
+            &Bytes::from_slice(&env, b"CETES28"),
+            4_102_444_800,
+            i128::MAX,
+        );
+        assert_eq!(
+            message,
+            Bytes::from_slice(
+                &env,
+                b"CETES28:4102444800:170141183460469231731687303715884105727"
+            )
+        );
+    }
+
+    #[test]
+    fn timelock_tightening_asset_config_is_immediate() {
+        let (_env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        client.configure_asset(&admin, &asset, &50, &100, &172_800, &50, &1800);
+        let cfg = client.asset_config(&asset).expect("asset config must exist");
+        assert_eq!(cfg.band_bps, 50);
+        assert_eq!(cfg.daily_move_band_bps, 100);
+        assert_eq!(cfg.window_seconds, 172_800);
+        assert_eq!(cfg.window_move_band_bps, 50);
+        assert_eq!(cfg.max_staleness_s, 1800);
+    }
+
+    #[test]
+    fn timelock_loosening_asset_config_direct_call_panics() {
+        let (_env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let base = client.asset_config(&asset).unwrap();
+
+        // 1. Wider band_bps
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &(base.band_bps + 1),
+                &base.daily_move_band_bps,
+                &base.window_seconds,
+                &base.window_move_band_bps,
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "widening band_bps directly must fail");
+
+        // 2. Wider daily_move_band_bps
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &(base.daily_move_band_bps + 1),
+                &base.window_seconds,
+                &base.window_move_band_bps,
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "widening daily_move_band_bps directly must fail");
+
+        // 3. Shorter window_seconds
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &base.daily_move_band_bps,
+                &(base.window_seconds - 1),
+                &base.window_move_band_bps,
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "shortening window_seconds directly must fail");
+
+        // 4. Wider window_move_band_bps
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &base.daily_move_band_bps,
+                &base.window_seconds,
+                &(base.window_move_band_bps + 1),
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "widening window_move_band_bps directly must fail");
+
+        // 5. Longer max_staleness_s
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &base.daily_move_band_bps,
+                &base.window_seconds,
+                &base.window_move_band_bps,
+                &(base.max_staleness_s + 1),
+            );
+        }));
+        assert!(res.is_err(), "increasing max_staleness_s directly must fail");
+    }
+
+    #[test]
+    fn timelock_loosening_parameters_via_queue_config() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let t0 = env.ledger().timestamp();
+
+        let id1 = client.queue_config(&admin, &ConfigChange::BandBps(asset.clone(), 150));
+        assert!(client.pending_config(&id1).is_some());
+
+        let id2 = client.queue_config(&admin, &ConfigChange::DailyMoveBandBps(asset.clone(), 300));
+        let id3 = client.queue_config(&admin, &ConfigChange::WindowSeconds(asset.clone(), 1800));
+        let id4 = client.queue_config(&admin, &ConfigChange::WindowMoveBandBps(asset.clone(), 250));
+        let id5 = client.queue_config(&admin, &ConfigChange::MaxStalenessSeconds(asset.clone(), 7200));
+        let id6 = client.queue_config(&admin, &ConfigChange::Asset(asset.clone(), 200, 400, 900, 350, 10_000));
+
+        for id in [id1, id2, id3, id4, id5, id6] {
+            let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.execute_config(&id);
+            }));
+            assert!(early.is_err(), "early execution must fail");
+        }
+
+        env.ledger().with_mut(|l| {
+            l.timestamp = t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+
+        client.execute_config(&id1);
+        assert_eq!(client.asset_config(&asset).unwrap().band_bps, 150);
+        assert!(client.pending_config(&id1).is_none());
+
+        client.execute_config(&id2);
+        assert_eq!(client.asset_config(&asset).unwrap().daily_move_band_bps, 300);
+
+        client.execute_config(&id3);
+        assert_eq!(client.asset_config(&asset).unwrap().window_seconds, 1800);
+
+        client.execute_config(&id4);
+        assert_eq!(client.asset_config(&asset).unwrap().window_move_band_bps, 250);
+
+        client.execute_config(&id5);
+        assert_eq!(client.asset_config(&asset).unwrap().max_staleness_s, 7200);
+
+        client.execute_config(&id6);
+        let final_cfg = client.asset_config(&asset).unwrap();
+        assert_eq!(final_cfg.band_bps, 200);
+        assert_eq!(final_cfg.daily_move_band_bps, 400);
+        assert_eq!(final_cfg.window_seconds, 900);
+        assert_eq!(final_cfg.window_move_band_bps, 350);
+        assert_eq!(final_cfg.max_staleness_s, 10_000);
+    }
+
+    #[test]
+    fn timelock_issuer_key_initial_and_rotation() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let (pubkey1, _) = test_issuer_keypair(&env);
+        let pubkey2 = BytesN::from_array(&env, &[7u8; 32]);
+
+        client.configure_issuer_key(&admin, &asset, &pubkey1);
+        assert_eq!(client.issuer_pubkey(&asset), Some(pubkey1.clone()));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_issuer_key(&admin, &asset, &pubkey2);
+        }));
+        assert!(res.is_err(), "direct rotation of issuer key must fail");
+
+        let t0 = env.ledger().timestamp();
+        let id = client.queue_config(&admin, &ConfigChange::IssuerPubKey(asset.clone(), pubkey2.clone()));
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&id);
+        }));
+        assert!(early.is_err());
+
+        env.ledger().with_mut(|l| {
+            l.timestamp = t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+
+        client.execute_config(&id);
+        assert_eq!(client.issuer_pubkey(&asset), Some(pubkey2));
+    }
+
+    #[test]
+    fn timelock_signature_requirement_tighten_vs_loosen() {
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(100, 200, 3600);
+
+        client.configure_signature_requirement(&admin, &true);
+        assert_eq!(client.require_nav_signature(), true);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_signature_requirement(&admin, &false);
+        }));
+        assert!(res.is_err(), "disabling signature requirement directly must fail");
+
+        let t0 = env.ledger().timestamp();
+        let id = client.queue_config(&admin, &ConfigChange::RequireNavSignature(false));
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&id);
+        }));
+        assert!(early.is_err());
+
+        env.ledger().with_mut(|l| {
+            l.timestamp = t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+
+        client.execute_config(&id);
+        assert_eq!(client.require_nav_signature(), false);
+    }
+
+    #[test]
+    fn timelock_cancel_config_and_stranger_checks() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let stranger = Address::generate(&env);
+
+        let change = ConfigChange::BandBps(asset.clone(), 150);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_config",
+                args: (stranger.clone(), change.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_config(&stranger, &change);
+        }));
+        assert!(res.is_err(), "stranger cannot queue_config");
+
+        env.mock_all_auths();
+        let id = client.queue_config(&admin, &change);
+        assert!(client.pending_config(&id).is_some());
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_config",
+                args: (stranger.clone(), id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_config(&stranger, &id);
+        }));
+        assert!(res.is_err(), "stranger cannot cancel_config");
+
+        env.mock_all_auths();
+        client.cancel_config(&admin, &id);
+        assert!(client.pending_config(&id).is_none());
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&id);
+        }));
+        assert!(res.is_err(), "cancelled config cannot be executed");
     }
 
     #[test]
