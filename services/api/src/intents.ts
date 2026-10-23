@@ -3,13 +3,6 @@
  * the `tx_intent` table's doc comment in `@ballast/db` for why this exists. `recordIntent` runs
  * when a route builds a transaction; `settleIntent` runs once the network has a final status for
  * it and applies that intent's effect to Postgres exactly once.
- *
- * Settle atomicity: Any external RPC or contract data needed for book effects is fetched first,
- * outside the database transaction. Then the conditional status claim (`status = 'pending' -> 'settled'|'failed'`)
- * and the bookkeeping writes (`applySuccess` / `applyFailure`) are executed together within a single
- * `db.transaction`. If the process crashes or an error is raised during book application, the entire
- * transaction rolls back, leaving the intent `pending` so it can be retried rather than permanently settled
- * without effects.
  */
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
@@ -74,25 +67,14 @@ function result(intent: IntentRow, status: SettleResult["status"], ledger: numbe
   return { txHash: intent.txHash, kind: intent.kind, refId: intent.refId, status, ledger };
 }
 
-/**
- * Extra data fetched outside the DB transaction (e.g. from contract RPCs or pre-transaction queries)
- * needed to update the books.
- */
-interface SettleContext {
-  liquidationRecord?: { recovered: bigint; shortfall: bigint };
-  outstandingDebt?: bigint;
-  contractLineDrawn?: bigint;
-  repoTradeUnits?: bigint;
-  repoMarginCallPending?: boolean;
-}
-
 /** What a transaction that closed successfully means for the books. */
 async function applySuccess(
   db: Database,
+  contracts: ContractClients,
   intent: IntentRow,
   ledger: number,
   returnValue: unknown,
-  ctx?: SettleContext,
+  contractState?: Record<string, unknown>,
 ): Promise<void> {
   const refId = intent.refId!;
   const payload = (intent.payload ?? {}) as Record<string, string>;
@@ -115,19 +97,22 @@ async function applySuccess(
     case "credit_line.close_liquidated": {
       // The contract values the collateral at the price frozen when the liquidation was confirmed;
       // the books take its recorded outcome rather than recomputing it.
-      const record = ctx?.liquidationRecord;
+      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
+      const record =
+        (contractState?.liquidationRecord as any) ??
+        (await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId!)));
       const [liquidation] = await db
         .select()
         .from(schema.liquidation)
         .where(eq(schema.liquidation.creditLineId, refId))
         .orderBy(desc(schema.liquidation.startedAt))
         .limit(1);
-      if (liquidation && record) {
+      if (liquidation) {
         await db
           .update(schema.liquidation)
           .set({
-            proceeds: scaledToDecimalString(record.recovered),
-            shortfall: scaledToDecimalString(record.shortfall),
+            proceeds: scaledToDecimalString(BigInt(record.recovered)),
+            shortfall: scaledToDecimalString(BigInt(record.shortfall)),
             txHashes: [...(liquidation.txHashes ?? []), intent.txHash],
             completedAt: new Date(),
           })
@@ -151,9 +136,12 @@ async function applySuccess(
       // is read back from the contract: whatever principal the line no longer owes is what this
       // repayment retired, and the rest of the amount was interest.
       const amount = BigInt(payload.amount);
-      const before = ctx?.outstandingDebt ?? 0n;
-      const drawn = ctx?.contractLineDrawn ?? 0n;
-      let principal = before - drawn;
+      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
+      const before = await outstandingDebt(db, refId);
+      const onChain =
+        (contractState?.line as any) ??
+        (await contracts.creditLine.line(BigInt(line.contractLineId!)));
+      let principal = before - BigInt(onChain.drawn);
       if (principal < 0n) principal = 0n;
       if (principal > amount) principal = amount;
       await db.insert(schema.repayment).values({
@@ -202,13 +190,15 @@ async function applySuccess(
 
     case "repo.top_up": {
       // The contract decides whether the top-up was enough to cure; the books follow it.
-      if (ctx?.repoTradeUnits !== undefined) {
-        await db
-          .update(schema.repoTrade)
-          .set({ units: scaledToDecimalString(ctx.repoTradeUnits) })
-          .where(eq(schema.repoTrade.id, refId));
-      }
-      if (ctx && !ctx.repoMarginCallPending) {
+      const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, refId)).limit(1);
+      const onChain =
+        (contractState?.trade as any) ??
+        (await contracts.repoDvp.trade(BigInt(trade.contractTradeId!)));
+      await db
+        .update(schema.repoTrade)
+        .set({ units: scaledToDecimalString(BigInt(onChain.units)) })
+        .where(eq(schema.repoTrade.id, refId));
+      if (!onChain.pendingMarginCall) {
         await db
           .update(schema.repoMarginCall)
           .set({ curedAt: new Date() })
@@ -240,11 +230,26 @@ async function applyFailure(db: Database, intent: IntentRow): Promise<void> {
   }
 }
 
+/** Hands the intent back as pending with the failure recorded, so the next sweep retries it. */
+async function recordSettleError(db: Database, intent: IntentRow, err: unknown): Promise<void> {
+  try {
+    await db
+      .update(schema.txIntent)
+      .set({ status: "pending", error: err instanceof Error ? err.message : String(err) })
+      .where(eq(schema.txIntent.txHash, intent.txHash));
+  } catch {
+    // ignore secondary error if db update fails
+  }
+}
+
 /**
  * Asks the network how `intent`'s transaction ended and, the first time it has a final answer,
- * applies it. Safe to call repeatedly and concurrently: claiming the intent and writing its
- * book effects happen in an atomic `db.transaction`. If a crash occurs or an error is thrown
- * during book updates, the transaction rolls back, leaving the intent pending so it is retried.
+ * applies it. Safe to call repeatedly and concurrently: the `pending -> settled|failed` flip is
+ * a conditional update inside a transaction alongside book changes, and only the caller that wins
+ * it applies the effect.
+ *
+ * All external RPC and contract reads are performed before opening the database transaction so
+ * the transaction is not held open across network calls.
  */
 export async function settleIntent(
   db: Database,
@@ -252,73 +257,107 @@ export async function settleIntent(
   contracts: ContractClients,
   intent: IntentRow,
 ): Promise<SettleResult> {
+  return (await settle(db, chain, contracts, intent)).result;
+}
+
+/**
+ * `settleIntent`, also saying whether the network answered NOT_FOUND for the transaction. A
+ * `pending` result alone doesn't say that: a lost claim race re-reads the row, which can still be
+ * pending if the winner's book update failed.
+ */
+async function settle(
+  db: Database,
+  chain: ChainGateway,
+  contracts: ContractClients,
+  intent: IntentRow,
+): Promise<{ result: SettleResult; notFound: boolean }> {
   if (intent.status !== "pending") {
-    return result(intent, intent.status as SettleResult["status"], intent.ledger);
+    return { result: result(intent, intent.status as SettleResult["status"], intent.ledger), notFound: false };
   }
 
   const outcome = await chain.outcome(intent.txHash);
   if (outcome.status === "NOT_FOUND") {
-    return result(intent, "pending", null);
-  }
-
-  // Pre-fetch any external RPC or contract data needed for book updates before opening the DB transaction.
-  const ctx: SettleContext = {};
-  if (outcome.status === "SUCCESS" && intent.refId) {
-    if (intent.kind === "credit_line.close_liquidated") {
-      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, intent.refId)).limit(1);
-      if (line?.contractLineId) {
-        const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId));
-        ctx.liquidationRecord = { recovered: BigInt(record.recovered), shortfall: BigInt(record.shortfall) };
-      }
-    } else if (intent.kind === "credit_line.repay") {
-      const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, intent.refId)).limit(1);
-      ctx.outstandingDebt = await outstandingDebt(db, intent.refId);
-      if (line?.contractLineId) {
-        const onChain = await contracts.creditLine.line(BigInt(line.contractLineId));
-        ctx.contractLineDrawn = BigInt(onChain.drawn);
-      }
-    } else if (intent.kind === "repo.top_up") {
-      const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, intent.refId)).limit(1);
-      if (trade?.contractTradeId) {
-        const onChain = await contracts.repoDvp.trade(BigInt(trade.contractTradeId));
-        ctx.repoTradeUnits = BigInt(onChain.units);
-        ctx.repoMarginCallPending = Boolean(onChain.pendingMarginCall);
-      }
-    }
+    return { result: result(intent, "pending", null), notFound: true };
   }
 
   const next = outcome.status === "SUCCESS" ? "settled" : "failed";
 
-  // Atomically claim the intent and write book changes. If an error is thrown or process crashes,
-  // the transaction rolls back so tx_intent remains pending.
-  const runInTx = typeof db.transaction === "function" ? db.transaction.bind(db) : (fn: (tx: any) => Promise<any>) => fn(db);
+  // Pre-read any on-chain contract data before starting the database transaction so we don't
+  // keep a database transaction open during external network RPC calls.
+  let contractState: Record<string, unknown> | undefined;
+  try {
+    if (outcome.status === "SUCCESS") {
+      const refId = intent.refId!;
+      switch (intent.kind as IntentKind) {
+        case "credit_line.close_liquidated": {
+          const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
+          if (line?.contractLineId) {
+            const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId));
+            contractState = { liquidationRecord: record };
+          }
+          break;
+        }
+        case "credit_line.repay": {
+          const [line] = await db.select().from(schema.creditLine).where(eq(schema.creditLine.id, refId)).limit(1);
+          if (line?.contractLineId) {
+            const onChain = await contracts.creditLine.line(BigInt(line.contractLineId));
+            contractState = { line: onChain };
+          }
+          break;
+        }
+        case "repo.top_up": {
+          const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, refId)).limit(1);
+          if (trade?.contractTradeId) {
+            const onChain = await contracts.repoDvp.trade(BigInt(trade.contractTradeId));
+            contractState = { trade: onChain };
+          }
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    await recordSettleError(db, intent, err);
+    throw err;
+  }
 
-  const claimedWinner = await runInTx(async (tx: any) => {
-    const claimed = await tx
+  const runWithDb = async (txDb: Database): Promise<SettleResult | null> => {
+    const claimed = await txDb
       .update(schema.txIntent)
       .set({ status: next, ledger: outcome.ledger, settledAt: new Date() })
       .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
       .returning();
 
     if (claimed.length === 0) {
-      return false;
+      return null;
     }
 
     if (outcome.status === "SUCCESS") {
-      await applySuccess(tx as unknown as Database, intent, outcome.ledger, outcome.returnValue, ctx);
+      await applySuccess(txDb, contracts, intent, outcome.ledger, outcome.returnValue, contractState);
     } else {
-      await applyFailure(tx as unknown as Database, intent);
+      await applyFailure(txDb, intent);
     }
 
-    return true;
-  });
+    return result(intent, next, outcome.ledger);
+  };
 
-  if (!claimedWinner) {
-    const current = (await findIntent(db, intent.txHash)) ?? intent;
-    return result(current, current.status as SettleResult["status"], current.ledger);
+  try {
+    let settleRes: SettleResult | null;
+    if (typeof db.transaction === "function") {
+      settleRes = await db.transaction(async (trx) => runWithDb(trx as unknown as Database));
+    } else {
+      settleRes = await runWithDb(db);
+    }
+
+    if (!settleRes) {
+      const current = (await findIntent(db, intent.txHash)) ?? intent;
+      return { result: result(current, current.status as SettleResult["status"], current.ledger), notFound: false };
+    }
+
+    return { result: settleRes, notFound: false };
+  } catch (err) {
+    await recordSettleError(db, intent, err);
+    throw err;
   }
-
-  return result(intent, next, outcome.ledger);
 }
 
 /** How long after it was built an unsubmitted transaction is written off (its envelope is only
@@ -342,31 +381,44 @@ export async function sweepPendingIntents(
   const pending = await db.select().from(schema.txIntent).where(eq(schema.txIntent.status, "pending"));
 
   for (const intent of pending) {
-    // One intent the RPC chokes on must not stop the sweep reaching the others; it stays
-    // pending (and is retried next sweep) until it settles or ages out below.
+    // One intent the RPC chokes on, or whose book update fails, must not stop the sweep reaching
+    // the others. It stays pending and is retried next sweep: a throw says nothing about whether
+    // the transaction landed, so only a NOT_FOUND answer on this pass can write it off. NOT_FOUND
+    // also covers a transaction older than the RPC's retention window, so a success that went
+    // unswept for that long is still expired here.
     let status: SettleResult["status"] = "pending";
+    let notFound = false;
     try {
-      status = (await settleIntent(db, chain, contracts, intent)).status;
+      ({ result: { status }, notFound } = await settle(db, chain, contracts, intent));
     } catch {
       tally.errors++;
     }
 
     if (status === "settled") tally.settled++;
     else if (status === "failed") tally.failed++;
-    else if (status === "pending" && now - intent.createdAt.getTime() > INTENT_EXPIRY_MS) {
-      const runInTx = typeof db.transaction === "function" ? db.transaction.bind(db) : (fn: (tx: any) => Promise<any>) => fn(db);
-      const expiredWinner = await runInTx(async (tx: any) => {
-        const claimed = await tx
+    else if (notFound && now - intent.createdAt.getTime() > INTENT_EXPIRY_MS) {
+      // The claim and the book update share a transaction, as in `settle`: a crash between them
+      // would otherwise leave the intent `expired` with its line or pledge still `pending`, and
+      // no later sweep would revisit it.
+      const expire = async (txDb: Database): Promise<boolean> => {
+        const claimed = await txDb
           .update(schema.txIntent)
           .set({ status: "expired", settledAt: new Date(now) })
           .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
           .returning();
         if (claimed.length === 0) return false;
-        await applyFailure(tx as unknown as Database, intent);
+        await applyFailure(txDb, intent);
         return true;
-      });
-      if (expiredWinner) {
-        tally.expired++;
+      };
+      try {
+        const wroteOff =
+          typeof db.transaction === "function"
+            ? await db.transaction(async (trx) => expire(trx as unknown as Database))
+            : await expire(db);
+        if (wroteOff) tally.expired++;
+      } catch {
+        // Rolled back: the intent is still pending and the next sweep tries again.
+        tally.errors++;
       }
     }
   }

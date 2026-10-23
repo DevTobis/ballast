@@ -71,7 +71,7 @@ describe("loadApiConfig", () => {
   });
 });
 
-import { parseTrustProxy } from "../config.js";
+import { parseComplianceEnforced, parseTrustProxy } from "../config.js";
 
 describe("parseTrustProxy", () => {
   it("is off unless asked for, and understands true, a hop count and a list", () => {
@@ -81,5 +81,34 @@ describe("parseTrustProxy", () => {
     expect(parseTrustProxy("true")).toBe(true);
     expect(parseTrustProxy("1")).toBe(1);
     expect(parseTrustProxy("10.0.0.0/8,172.16.0.0/12")).toBe("10.0.0.0/8,172.16.0.0/12");
+  });
+});
+
+describe("parseComplianceEnforced", () => {
+  it("defaults to true in production and false in other environments when unset or empty", () => {
+    expect(parseComplianceEnforced(undefined, "production")).toBe(true);
+    expect(parseComplianceEnforced("", "production")).toBe(true);
+    expect(parseComplianceEnforced(undefined, "development")).toBe(false);
+    expect(parseComplianceEnforced("", "test")).toBe(false);
+  });
+
+  it("enables compliance on true, TRUE, and 1", () => {
+    expect(parseComplianceEnforced("true", "development")).toBe(true);
+    expect(parseComplianceEnforced("TRUE", "development")).toBe(true);
+    expect(parseComplianceEnforced("1", "development")).toBe(true);
+    expect(parseComplianceEnforced(" 1 ", "development")).toBe(true);
+  });
+
+  it("disables compliance on false, FALSE, and 0", () => {
+    expect(parseComplianceEnforced("false", "production")).toBe(false);
+    expect(parseComplianceEnforced("FALSE", "production")).toBe(false);
+    expect(parseComplianceEnforced("0", "production")).toBe(false);
+    expect(parseComplianceEnforced(" 0 ", "production")).toBe(false);
+  });
+
+  it("throws a clear error on unrecognized values", () => {
+    expect(() => parseComplianceEnforced("yes", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED/);
+    expect(() => parseComplianceEnforced("ture", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED/);
+    expect(() => parseComplianceEnforced("foo", "development")).toThrowError(/invalid COMPLIANCE_ENFORCED/);
   });
 });

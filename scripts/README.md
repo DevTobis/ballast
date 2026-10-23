@@ -146,6 +146,19 @@ then update `PRICE_PUBLISHER` in `.env.<network>-deploy` and re-run `scripts/con
 so the new key is the registered NAV attestor. See `contracts/README.md` for the full sequence and
 why the issuer-key step is required.
 
+`Registry` exposes the same role-rotation entry points (`propose_admin`, `accept_admin`,
+`queue_role_change`, `execute_role_change`, `roles`). To rotate the pauser on `Registry` without
+redeploying:
+
+```bash
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  queue_role_change --role '"Pauser"' --new_address "$NEW_PAUSER"
+# After the 48h timelock:
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  execute_role_change --id "$CHANGE_ID"
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- roles
+```
+
 To see the real sources without any contract or database (safe against mainnet):
 
 ```
@@ -165,7 +178,8 @@ and sends nothing on-chain.
 `scripts/deploy-mainnet-prices.sh` deploys only `registry` and `price-guard` to mainnet (no funds
 are held by either) and registers the assets in `scripts/shadow-assets.json`, so the public
 live-price page has an on-chain guarded price to show. It does nothing without
-`CONFIRM_MAINNET=deploy-prices`, and `--dry-run` prints every command without sending any.
+`CONFIRM_MAINNET=deploy-prices`, `--dry-run` prints every command without sending any, and
+`--help` displays usage. Unknown options are rejected with exit code 2 to prevent accidental live runs.
 
 Run `scripts/shadow-run.sh` for a week or two first and look at source divergence and staleness
 before sending the first mainnet transaction. The role accounts (`mainnet_admin`, `mainnet_pauser`,

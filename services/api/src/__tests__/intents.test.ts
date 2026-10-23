@@ -22,43 +22,26 @@ function makeDb(rows: Map<unknown, unknown[]>, claimRows: unknown[] = [{}]) {
     promise.limit = () => chain(data);
     return promise;
   };
-  const makeDbInstance = (insertLog: typeof inserted, updateLog: typeof updated): Database =>
-    ({
-      select: () => ({ from: (table: unknown) => chain(rows.get(table) ?? []) }),
-      insert: (table: unknown) => ({
-        values: async (values: unknown) => {
-          insertLog.push({ table, values });
+  const db: any = {
+    select: () => ({ from: (table: unknown) => chain(rows.get(table) ?? []) }),
+    insert: (table: unknown) => ({
+      values: async (values: unknown) => {
+        inserted.push({ table, values });
+      },
+    }),
+    update: (table: unknown) => ({
+      set: (set: unknown) => ({
+        where: () => {
+          updated.push({ table, set });
+          const done: any = Promise.resolve([]);
+          done.returning = async () => claimRows;
+          return done;
         },
       }),
-      update: (table: unknown) => ({
-        set: (set: unknown) => ({
-          where: () => {
-            updateLog.push({ table, set });
-            const done: any = Promise.resolve([]);
-            done.returning = async () => claimRows;
-            return done;
-          },
-        }),
-      }),
-      transaction: async (fn: (tx: any) => Promise<any>) => {
-        // Run with transaction-scoped logs so that if an error is thrown, updates/inserts rollback
-        const txInserted: typeof inserted = [];
-        const txUpdated: typeof updated = [];
-        const txDb = makeDbInstance(txInserted, txUpdated);
-        try {
-          const res = await fn(txDb);
-          inserted.push(...txInserted);
-          updated.push(...txUpdated);
-          return res;
-        } catch (err) {
-          // Transaction aborts on error; txInserted and txUpdated are discarded (rolled back)
-          throw err;
-        }
-      },
-    }) as unknown as Database;
-
-  const db = makeDbInstance(inserted, updated);
-  return { db, inserted, updated };
+    }),
+    transaction: async (cb: (trx: any) => Promise<any>) => cb(db),
+  };
+  return { db: db as Database, inserted, updated };
 }
 
 function intent(overrides: Record<string, unknown> = {}) {
@@ -159,6 +142,36 @@ describe("settleIntent", () => {
     expect(updated.filter((u) => u.table === schema.creditLine)).toHaveLength(0);
   });
 
+  it("rolls back the intent claim and leaves it pending if book update fails", async () => {
+    let rolledBack = false;
+    let committed = false;
+    const { db } = makeDb(new Map());
+    // Simulate real transaction rollback on error:
+    db.transaction = async (cb: any) => {
+      try {
+        const res = await cb(db);
+        committed = true;
+        return res;
+      } catch (e) {
+        rolledBack = true;
+        throw e;
+      }
+    };
+    // Force book update failure by throwing on creditLine update
+    db.update = ((orig: any) => (table: unknown) => {
+      if (table === schema.creditLine) {
+        throw new Error("DB connection lost during line update");
+      }
+      return orig(table);
+    })(db.update) as any;
+
+    const chain = chainWith({ status: "SUCCESS", ledger: 777, returnValue: 4n });
+
+    await expect(settleIntent(db, chain, noContracts, intent())).rejects.toThrow("DB connection lost during line update");
+    expect(rolledBack).toBe(true);
+    expect(committed).toBe(false);
+  });
+
   it("doesn't ask the network about an intent that is already final", async () => {
     const { db } = makeDb(new Map());
     const chain = chainWith({ status: "SUCCESS", ledger: 1 });
@@ -167,40 +180,6 @@ describe("settleIntent", () => {
 
     expect(result).toMatchObject({ status: "failed", ledger: 9 });
     expect(chain.outcome).not.toHaveBeenCalled();
-  });
-
-  it("rolls back the claim if book updates fail so the intent is not left settled-without-effect", async () => {
-    const intentRow = intent({ kind: "credit_line.open", refId: "line-crash" });
-    const { db, updated } = makeDb(new Map([[schema.txIntent, [intentRow]]]));
-    const chain = chainWith({ status: "SUCCESS", ledger: 888, returnValue: 12n });
-
-    // Mock an update error during applySuccess (e.g. database crash or constraint violation on creditLine)
-    const originalTransaction = (db as any).transaction;
-    (db as any).transaction = async (fn: any) => {
-      return originalTransaction(async (tx: any) => {
-        const origUpdate = tx.update;
-        tx.update = (table: unknown) => {
-          if (table === schema.creditLine) {
-            return {
-              set: () => ({
-                where: () => Promise.reject(new Error("simulated crash during book update")),
-              }),
-            };
-          }
-          return origUpdate(table);
-        };
-        return fn(tx);
-      });
-    };
-
-    await expect(settleIntent(db, chain, noContracts, intentRow)).rejects.toThrow("simulated crash during book update");
-
-    // Because the transaction rolled back, tx_intent was NOT committed as settled
-    const intentUpdates = updated.filter((u) => u.table === schema.txIntent);
-    expect(intentUpdates).toHaveLength(0);
-    // And books were not updated
-    const lineUpdates = updated.filter((u) => u.table === schema.creditLine);
-    expect(lineUpdates).toHaveLength(0);
   });
 });
 
@@ -216,20 +195,78 @@ describe("sweepPendingIntents", () => {
     expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(true);
   });
 
-  it("keeps going past an intent the network errors on, and still ages it out", async () => {
-    const broken = intent({ txHash: "bad", createdAt: new Date(Date.now() - INTENT_EXPIRY_MS - 1000) });
+  it("keeps going past an intent the network errors on, and leaves it pending however old", async () => {
+    const broken = intent({ txHash: "bad", createdAt: new Date(Date.now() - 100 * INTENT_EXPIRY_MS) });
     const fine = intent({ txHash: "good" });
-    const { db } = makeDb(new Map([[schema.txIntent, [broken, fine]]]));
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [broken, fine]]]));
     const chain = {
       outcome: vi.fn(async (hash: string) => {
-        if (hash === "bad") throw new Error("unexpected hash length");
+        if (hash === "bad") throw new Error("RPC unavailable");
         return { status: "SUCCESS", ledger: 5, returnValue: 1n };
       }),
     } as unknown as ChainGateway;
 
     const tally = await sweepPendingIntents(db, chain, noContracts);
 
-    expect(tally).toEqual({ settled: 1, failed: 0, expired: 1, errors: 1 });
+    expect(tally).toEqual({ settled: 1, failed: 0, expired: 0, errors: 1 });
+    expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(false);
+    expect(updated).not.toContainEqual({ table: schema.creditLine, set: { status: "failed" } });
+  });
+
+  it("retries a stale intent whose book update failed instead of expiring it", async () => {
+    const stale = intent({ createdAt: new Date(Date.now() - INTENT_EXPIRY_MS - 1000) });
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [stale]]]));
+    const chain = chainWith({ status: "SUCCESS", ledger: 12, returnValue: 7n });
+    const update = db.update as any;
+    let linesDown = true;
+    db.update = ((table: unknown) => {
+      if (table === schema.creditLine && linesDown) throw new Error("DB connection lost during line update");
+      return update(table);
+    }) as any;
+
+    const first = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(first).toEqual({ settled: 0, failed: 0, expired: 0, errors: 1 });
+    expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(false);
+    expect(updated).not.toContainEqual({ table: schema.creditLine, set: { status: "failed" } });
+
+    linesDown = false;
+    const second = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(second).toEqual({ settled: 1, failed: 0, expired: 0, errors: 0 });
+  });
+
+  it("rolls the expiry claim back when the book update fails, so a later sweep retries it", async () => {
+    const stale = intent({ createdAt: new Date(Date.now() - INTENT_EXPIRY_MS - 1000) });
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [stale]]]));
+    const update = db.update as any;
+    let linesDown = true;
+    db.update = ((table: unknown) => {
+      if (table === schema.creditLine && linesDown) throw new Error("DB connection lost during line update");
+      return update(table);
+    }) as any;
+    // Discard what a throwing transaction wrote, as Postgres would.
+    (db as any).transaction = async (cb: (trx: any) => Promise<any>) => {
+      const before = updated.length;
+      try {
+        return await cb(db);
+      } catch (err) {
+        updated.length = before;
+        throw err;
+      }
+    };
+    const chain = chainWith({ status: "NOT_FOUND" });
+
+    const first = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(first).toEqual({ settled: 0, failed: 0, expired: 0, errors: 1 });
+    expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(false);
+
+    linesDown = false;
+    const second = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(second).toEqual({ settled: 0, failed: 0, expired: 1, errors: 0 });
+    expect(updated).toContainEqual({ table: schema.creditLine, set: { status: "failed" } });
   });
 
   it("leaves a recent unsubmitted transaction pending", async () => {

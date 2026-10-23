@@ -5,11 +5,22 @@
  */
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { schema, type Database } from "@ballast/db";
-import { sql } from "drizzle-orm";
-import { createConsoleMetricsSink } from "@ballast/observability";
+import { eq, sql } from "drizzle-orm";
+import { createLogger, createConsoleMetricsSink, type Alerter } from "@ballast/observability";
 import type { RpcClient } from "./rpc.js";
 
+export interface IndexerLogger {
+  warn(obj: Record<string, unknown>, msg?: string): void;
+  info?(obj: Record<string, unknown>, msg?: string): void;
+  error?(obj: Record<string, unknown>, msg?: string): void;
+  debug?(obj: Record<string, unknown>, msg?: string): void;
+}
+
+const defaultLogger = createLogger("indexer");
 const metrics = createConsoleMetricsSink("indexer");
+
+/** Default key used for single-tenant indexer cursor */
+const DEFAULT_CURSOR_ID = "default";
 
 /** How many ledgers to look back on a cold start (no rows in `chain_event` yet). */
 const COLD_START_LOOKBACK_LEDGERS = 1000;
@@ -19,6 +30,12 @@ const PAGE_SIZE = 100;
 
 /** Stellar RPC rejects a `getEvents` filter naming more than this many contracts. */
 const MAX_CONTRACT_IDS_PER_FILTER = 5;
+
+/** Approximate ledger close time in seconds on Stellar. */
+export const LEDGER_CLOSE_SECONDS = 5;
+
+/** Default threshold (in ledgers) before rpc_lag_high alert is raised (60s / 5s). */
+export const DEFAULT_LAG_ALERT_LEDGERS = 12;
 
 /** Recursively replaces `bigint`s with strings so the result is safe to store in a jsonb column. */
 function toJsonSafe(value: unknown): unknown {
@@ -41,6 +58,19 @@ function decodeTopicName(topic: xdr.ScVal[]): string {
 }
 
 async function getLastIngestedLedger(db: Database): Promise<number | null> {
+  try {
+    const [cursorRow] = await db
+      .select({ lastLedger: schema.indexerCursor.lastLedger })
+      .from(schema.indexerCursor)
+      .where(eq(schema.indexerCursor.id, DEFAULT_CURSOR_ID))
+      .limit(1);
+    if (cursorRow?.lastLedger !== undefined && cursorRow?.lastLedger !== null) {
+      return cursorRow.lastLedger;
+    }
+  } catch {
+    // If indexer_cursor table does not exist or query fails, fall back to event-derived value
+  }
+
   const [row] = await db
     .select({ maxLedger: sql<number | null>`max(${schema.chainEvent.ledger})` })
     .from(schema.chainEvent);
@@ -51,25 +81,81 @@ export interface PollOnceResult {
   fromLedger: number;
   insertedCount: number;
   latestLedger: number;
+  scannedUpTo: number;
+  /** First ledger whose events were lost because the RPC no longer retains them, when clamped. */
+  skippedFrom?: number;
+  /** Last ledger whose events were lost because the RPC no longer retains them, when clamped. */
+  skippedTo?: number;
+}
+
+export interface IndexerState {
+  lastScannedLedger?: number;
+}
+
+export interface LagCheckResult {
+  lagLedgers: number;
+  isLagging: boolean;
 }
 
 /**
- * Fetches events for `contractIds` since the last-ingested ledger (or `latestLedger - 1000` on a
- * cold start) and inserts one `chain_event` row per event.
+ * Computes lag between current RPC tip and the last scanned ledger sequence.
+ * During quiet periods when contracts emit no events, lastScannedLedger advances
+ * with the chain tip so no false lag alert is raised.
+ */
+export function computeRpcLag(
+  rpcTip: number,
+  lastScannedLedger?: number,
+  thresholdLedgers: number = DEFAULT_LAG_ALERT_LEDGERS,
+): LagCheckResult {
+  if (lastScannedLedger === undefined) {
+    return { lagLedgers: 0, isLagging: false };
+  }
+  const lagLedgers = Math.max(0, rpcTip - lastScannedLedger);
+  return {
+    lagLedgers,
+    isLagging: lagLedgers > thresholdLedgers,
+  };
+}
+
+/**
+ * Fetches events for `contractIds` since `cursorLedger + 1` (or the last-ingested ledger, or
+ * `latestLedger - 1000` on a cold start) and inserts one `chain_event` row per event.
+ *
+ * The resume cursor can fall outside the RPC's retention window when the indexer has been idle
+ * longer than the node keeps history. `getEvents` rejects that `startLedger` outright, so the
+ * cursor would never advance. We clamp it to the oldest ledger the node still has and report the
+ * skipped range; those events are gone and the caller must surface the gap.
  */
 export async function pollOnce(
   db: Database,
   rpcServer: RpcClient,
   contractIds: string[],
+  cursorLedger?: number,
+  logger: IndexerLogger = defaultLogger,
 ): Promise<PollOnceResult> {
-  const lastIngested = await getLastIngestedLedger(db);
-
-  let startLedger: number;
-  if (lastIngested !== null) {
-    startLedger = lastIngested + 1;
+  let desiredStartLedger: number;
+  if (cursorLedger !== undefined) {
+    desiredStartLedger = cursorLedger + 1;
   } else {
-    const { sequence } = await rpcServer.getLatestLedger();
-    startLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
+    const lastIngested = await getLastIngestedLedger(db);
+    if (lastIngested !== null) {
+      desiredStartLedger = lastIngested + 1;
+    } else {
+      const { sequence } = await rpcServer.getLatestLedger();
+      desiredStartLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
+    }
+  }
+
+  const { oldestLedger } = await rpcServer.getHealth();
+  const startLedger = Math.max(desiredStartLedger, oldestLedger);
+  const skippedFrom = startLedger > desiredStartLedger ? desiredStartLedger : undefined;
+  const skippedTo = skippedFrom !== undefined ? startLedger - 1 : undefined;
+
+  if (skippedFrom !== undefined && skippedTo !== undefined) {
+    metrics.increment("indexer.events_gap_skipped", {
+      from: String(skippedFrom),
+      to: String(skippedTo),
+    });
   }
 
   // Drain every page before returning. The next poll resumes from `max(ledger) + 1`, so stopping
@@ -90,23 +176,127 @@ export async function pollOnce(
   }
 
   if (events.length > 0) {
-    await db.insert(schema.chainEvent).values(
-      events.map((event) => ({
-        eventId: event.id ?? null,
-        ledger: event.ledger,
-        txHash: event.txHash,
-        contract: event.contractId,
-        topic: decodeTopicName(event.topic),
-        data: toJsonSafe({
-          topics: event.topic.slice(1).map((t) => scValToNative(t)),
-          value: scValToNative(event.value),
-        }),
-      })),
-    ).onConflictDoNothing();
+    const rows = events.map((event) => {
+      try {
+        return {
+          eventId: event.id ?? null,
+          ledger: event.ledger,
+          txHash: event.txHash,
+          contract: event.contractId,
+          topic: decodeTopicName(event.topic),
+          data: toJsonSafe({
+            topics: event.topic.slice(1).map((t) => scValToNative(t)),
+            value: scValToNative(event.value),
+          }),
+        };
+      } catch (err) {
+        let raw = "";
+        try {
+          if (typeof (event as any).rawXdr === "string") {
+            raw = (event as any).rawXdr;
+          } else if (typeof (event.value as any)?.toXDR === "function") {
+            raw = (event.value as any).toXDR("base64");
+          } else if (typeof (event as any).raw === "string") {
+            raw = (event as any).raw;
+          } else {
+            raw = String(event.value);
+          }
+        } catch {
+          raw = String(event.value);
+        }
+
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          { eventId: event.id, ledger: event.ledger, err },
+          `indexer: undecodable event at ledger ${event.ledger} (id ${event.id}): ${errorMessage}`,
+        );
+
+        return {
+          eventId: event.id ?? null,
+          ledger: event.ledger,
+          txHash: event.txHash,
+          contract: event.contractId,
+          topic: "undecodable",
+          data: {
+            error: errorMessage,
+            raw,
+          },
+        };
+      }
+    });
+
+    await db.insert(schema.chainEvent).values(rows).onConflictDoNothing();
+  }
+
+  if (latestLedger > 0) {
+    try {
+      await db
+        .insert(schema.indexerCursor)
+        .values({
+          id: DEFAULT_CURSOR_ID,
+          lastLedger: latestLedger,
+        })
+        .onConflictDoUpdate({
+          target: schema.indexerCursor.id,
+          set: {
+            lastLedger: latestLedger,
+            updatedAt: new Date(),
+          },
+        });
+    } catch {
+      // In tests with fake DBs lacking indexerCursor table
+    }
   }
 
   metrics.increment("indexer.events_ingested", { count: String(events.length) });
   metrics.gauge("indexer.latest_ledger", latestLedger);
 
-  return { fromLedger: startLedger, insertedCount: events.length, latestLedger };
+  const scannedUpTo = Math.max(cursorLedger ?? 0, latestLedger);
+  return {
+    fromLedger: startLedger,
+    insertedCount: events.length,
+    latestLedger,
+    scannedUpTo,
+    skippedFrom,
+    skippedTo,
+  };
+}
+
+/**
+ * Executes a single indexer cycle:
+ * 1. Inspects RPC tip and verifies RPC lag against the previous cycle's scanned ledger.
+ * 2. Runs `pollOnce` with the in-memory cursor to avoid re-requesting old ledgers on quiet chains.
+ * 3. Advances `state.lastScannedLedger` to the newly scanned ledger tip.
+ */
+export async function runIndexerCycle(
+  db: Database,
+  rpcServer: RpcClient,
+  contractIds: string[],
+  state: IndexerState,
+  alerter: Alerter,
+  lagAlertLedgers: number = DEFAULT_LAG_ALERT_LEDGERS,
+): Promise<PollOnceResult> {
+  const { sequence: rpcTip } = await rpcServer.getLatestLedger();
+
+  if (state.lastScannedLedger !== undefined) {
+    const lag = computeRpcLag(rpcTip, state.lastScannedLedger, lagAlertLedgers);
+    if (lag.isLagging) {
+      alerter.fire("rpc_lag_high", {
+        lagLedgers: lag.lagLedgers,
+        latestLedger: rpcTip,
+        lastScannedLedger: state.lastScannedLedger,
+        lastIngestedFrom: state.lastScannedLedger,
+      });
+    }
+  }
+
+  const result = await pollOnce(db, rpcServer, contractIds, state.lastScannedLedger);
+  if (result.skippedFrom !== undefined && result.skippedTo !== undefined) {
+    alerter.fire("event_gap_skipped", {
+      fromLedger: result.skippedFrom,
+      toLedger: result.skippedTo,
+    });
+  }
+  state.lastScannedLedger = result.scannedUpTo;
+  return result;
 }
