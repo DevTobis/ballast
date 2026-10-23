@@ -23,6 +23,10 @@ Jobs run one at a time through a shared queue, because they share one account an
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
 Liquidation and margin steps are written to be safe to repeat after a crash.
 
+### Storage TTL Maintenance
+
+Soroban persistent storage entries archive if not extended. `CreditLine::extend_ttl(line)` is an unauthenticated contract entry point that extends instance and persistent entry TTLs (`Line`, `Claimable`, `Liquidation`). Keepers or periodic tasks can call this for dormant lines to ensure they remain accessible without requiring restoration.
+
 ## Run
 
 ```
