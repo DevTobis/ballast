@@ -1,17 +1,53 @@
 import { describe, expect, it, vi } from "vitest";
 import { nativeToScVal } from "@stellar/stellar-sdk";
+import { schema } from "@ballast/db";
 import { pollOnce, computeRpcLag, runIndexerCycle, type IndexerState } from "./poller.js";
 import { withRetry, type RpcClient } from "./rpc.js";
 
 /** Minimal fake of the slice of `Database` (drizzle) that `pollOnce` touches. */
-function fakeDb(opts: { lastLedger: number | null; inserted: unknown[] }) {
+function fakeDb(opts: {
+  lastLedger?: number | null;
+  cursorLedger?: number | null;
+  inserted?: unknown[];
+  cursors?: Array<{ id: string; lastLedger: number }>;
+}) {
+  const inserted = opts.inserted ?? [];
+  const cursors =
+    opts.cursors ??
+    (opts.cursorLedger !== undefined && opts.cursorLedger !== null
+      ? [{ id: "default", lastLedger: opts.cursorLedger }]
+      : []);
+
   return {
     select: () => ({
-      from: () => Promise.resolve([{ maxLedger: opts.lastLedger }]),
+      from: (table: any) => {
+        if (table === schema.indexerCursor) {
+          return {
+            where: () => ({
+              limit: () => Promise.resolve(cursors),
+            }),
+            limit: () => Promise.resolve(cursors),
+          };
+        }
+        return Promise.resolve([{ maxLedger: opts.lastLedger ?? null }]);
+      },
     }),
-    insert: () => ({
-      values: (rows: unknown[]) => {
-        opts.inserted.push(...rows);
+    insert: (table: any) => ({
+      values: (val: any) => {
+        if (table === schema.indexerCursor) {
+          const row = Array.isArray(val) ? val[0] : val;
+          const existing = cursors.find((c) => c.id === row.id);
+          if (existing) {
+            existing.lastLedger = row.lastLedger;
+          } else {
+            cursors.push({ id: row.id, lastLedger: row.lastLedger });
+          }
+          return {
+            onConflictDoUpdate: () => Promise.resolve(),
+          };
+        }
+        const rows = Array.isArray(val) ? val : [val];
+        inserted.push(...rows);
         return Object.assign(Promise.resolve(), { onConflictDoNothing: () => Promise.resolve() });
       },
     }),
@@ -102,6 +138,60 @@ describe("pollOnce", () => {
     JSON.stringify(row.data);
     expect((row.data as { value: string }).value).toBe("1000000");
     expect((row.data as { topics: number[] }).topics).toEqual([42]);
+  });
+
+  it("first run: cold starts and records indexer_cursor at latestLedger", async () => {
+    const cursors: Array<{ id: string; lastLedger: number }> = [];
+    const db = fakeDb({ lastLedger: null, cursors });
+    const rpc = fakeRpc({
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 8000 }),
+      getEvents: vi.fn().mockResolvedValue({ latestLedger: 8000, events: [] }),
+    });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(result.fromLedger).toBe(7000);
+    expect(cursors).toEqual([{ id: "default", lastLedger: 8000 }]);
+  });
+
+  it("warm start without a cursor row: falls back to chain_event max ledger and writes cursor", async () => {
+    const cursors: Array<{ id: string; lastLedger: number }> = [];
+    const db = fakeDb({ lastLedger: 6500, cursors });
+    const getEvents = vi.fn().mockResolvedValue({ latestLedger: 6520, events: [] });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(getEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 6501 }));
+    expect(result.fromLedger).toBe(6501);
+    expect(cursors).toEqual([{ id: "default", lastLedger: 6520 }]);
+  });
+
+  it("warm start with a cursor row: resumes from cursor.lastLedger + 1", async () => {
+    const cursors = [{ id: "default", lastLedger: 9100 }];
+    const db = fakeDb({ lastLedger: 4000, cursors }); // chain_event is older than cursor
+    const getEvents = vi.fn().mockResolvedValue({ latestLedger: 9110, events: [] });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(getEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 9101 }));
+    expect(result.fromLedger).toBe(9101);
+    expect(cursors[0].lastLedger).toBe(9110);
+  });
+
+  it("advances cursor during quiet periods with 0 events returned", async () => {
+    const cursors = [{ id: "default", lastLedger: 10000 }];
+    const db = fakeDb({ lastLedger: null, cursors });
+    const getEvents = vi.fn().mockResolvedValue({ latestLedger: 10025, events: [] });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(result.insertedCount).toBe(0);
+    expect(cursors[0].lastLedger).toBe(10025);
+
+    // Next poll resumes from the updated cursor
+    const nextGetEvents = vi.fn().mockResolvedValue({ latestLedger: 10030, events: [] });
+    await pollOnce(db, fakeRpc({ getEvents: nextGetEvents }), ["C1"]);
+    expect(nextGetEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 10026 }));
+    expect(cursors[0].lastLedger).toBe(10030);
   });
 
   it("resumes from cursorLedger + 1 without querying database max(ledger) when cursorLedger is provided", async () => {

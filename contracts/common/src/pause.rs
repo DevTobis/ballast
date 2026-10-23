@@ -39,8 +39,9 @@
 //!
 //! `repo-dvp::propose` is **not** gated even though the doc comment on [`require_not_paused`] lists
 //! "repo propose/accept" as new risk; tracked in #846. Separately, each contract reads its pause
-//! flags from its own storage while only `Registry::pause` writes one, so the flags cannot currently
-//! be set on the contract that checks them (see #30 and #32).
+//! flags from its own storage while `Registry::pause` writes only Registry's. `repo-dvp` now
+//! exposes its own `pause` and timelocked unpause (#32), so its `Repos` gate works; `exit-desk`
+//! still has no writer for its flag (see #30).
 
 use soroban_sdk::{contracttype, Env};
 
