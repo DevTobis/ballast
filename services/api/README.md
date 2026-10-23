@@ -99,8 +99,10 @@ A manual clear is persistent for the reviewed entity matches (`entNum`s). When s
 
 ## Amount and unit conventions
 
-Request amounts go through `bigintish` (string or number parsed to `BigInt`). Responses that touch
-on-chain values serialise `BigInt` fields as plain integer-digit strings via `bigint-json.ts`.
+Request amounts go through `positiveAmount` (string of digits only or safe positive integer parsed to `BigInt`).
+Zero, negative numbers, empty strings, hex strings, and unsafe floating-point numbers past `Number.MAX_SAFE_INTEGER` are rejected with 400.
+For fields where zero is legal (e.g. `repoTradeActionSchema.contractTradeId`), `nonNegativeAmount` is used.
+Responses that touch on-chain values serialise `BigInt` fields as plain integer-digit strings via `bigint-json.ts`.
 Routes that return raw database rows (positions, reports, webhook payloads) return decimal strings
 instead. The two forms look different and must not be mixed without conversion.
 
@@ -123,9 +125,10 @@ human-readable value = scaled integer / 10_000_000
 
 ### Send amounts as strings, not numbers
 
-**Always send monetary amounts as JSON strings, not bare numbers.** The `bigintish` schema accepts
-both, but JSON numbers are IEEE 754 doubles: integers above 2^53 − 1 (roughly 900 trillion scaled
-units) lose precision silently when the parser reads them. Use the string form in every request:
+**Always send monetary amounts as JSON strings, not bare numbers.** The amount schema accepts
+safe JavaScript integers, but JSON numbers are IEEE 754 doubles: integers above 2^53 − 1 (roughly 900 trillion scaled
+units) lose precision silently when the parser reads them, and numbers exceeding `Number.MAX_SAFE_INTEGER` will be rejected.
+Use the string form in every request:
 
 ```json
 { "amount": "10000000" }

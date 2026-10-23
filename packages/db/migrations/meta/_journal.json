@@ -71,6 +71,13 @@
       "when": 1792424561610,
       "tag": "0009_liquidation_credit_line_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1792605690058,
+      "tag": "0010_issuer_idempotency",
+      "breakpoints": true
     }
   ]
 }
