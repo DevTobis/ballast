@@ -40,6 +40,10 @@
 //!
 //! One live proposal per (lender, token) at a time: an allowance is a single number per
 //! owner/spender pair, so a lender's second `propose` replaces the first one's allowance.
+//! If a proposal is cancelled via `cancel_proposal` by the lender, the allowance is reset to 0
+//! if this was the lender's latest proposal. When a proposal is cancelled by the borrower,
+//! the trade status moves to `Cancelled` preventing acceptance, but the lender's allowance
+//! remains unchanged as the borrower does not hold authorization to modify the lender's allowance.
 //!
 //! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
 //! `default_close` gives the cash lender full title to the pledged RWA units and closes the
@@ -110,6 +114,7 @@ pub enum RepoStatus {
     Settled,
     Unwound,
     Defaulted,
+    Cancelled,
 }
 
 #[contracttype]
@@ -164,8 +169,10 @@ pub struct RepoMarginView {
 enum DataKey {
     Usdc,
     AssetConfig(Address),
+    AssetDisabled(Address),
     Trade(u64),
     CureGrace,
+    LatestProposal(Address),
 }
 
 /// The cure window a margin call opens with: the admin's setting, else the 24h default.
@@ -181,6 +188,19 @@ fn read_asset_config(env: &Env, asset: &Address) -> RepoAssetConfig {
         .instance()
         .get(&DataKey::AssetConfig(asset.clone()))
         .expect("repo-dvp: asset not configured")
+}
+
+fn is_asset_disabled(env: &Env, asset: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetDisabled(asset.clone()))
+        .unwrap_or(false)
+}
+
+fn require_asset_enabled(env: &Env, asset: &Address) {
+    if is_asset_disabled(env, asset) {
+        panic!("repo-dvp: asset is disabled");
+    }
 }
 
 fn read_trade(env: &Env, id: u64) -> RepoTrade {
@@ -361,6 +381,34 @@ impl RepoDvp {
         );
     }
 
+    /// Disables an asset so that new proposals and settlements are refused. Admin only.
+    pub fn disable_asset(env: Env, admin: Address, asset: Address) {
+        require_admin_is(&env, &admin);
+        let _ = read_asset_config(&env, &asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetDisabled(asset.clone()), &true);
+        env.events()
+            .publish((symbol_short!("disable"), asset), ());
+    }
+
+    /// Re-enables a disabled asset. Admin only.
+    pub fn enable_asset(env: Env, admin: Address, asset: Address) {
+        require_admin_is(&env, &admin);
+        let _ = read_asset_config(&env, &asset);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AssetDisabled(asset.clone()));
+        env.events()
+            .publish((symbol_short!("enable"), asset), ());
+    }
+
+    /// Checks whether an asset is currently enabled.
+    pub fn is_asset_enabled(env: Env, asset: Address) -> bool {
+        let _ = read_asset_config(&env, &asset);
+        !is_asset_disabled(&env, &asset)
+    }
+
     /// Mints a trade id and stores the proposed terms (PRD §8 `propose(cash_lender, terms) -> id`,
     /// flattened into explicit params here for clarity).
     pub fn propose(
@@ -376,6 +424,7 @@ impl RepoDvp {
         agreement_hash: BytesN<32>,
     ) -> u64 {
         cash_lender.require_auth();
+        require_asset_enabled(&env, &asset);
         if units <= 0 {
             panic!("repo-dvp: units must be positive");
         }
@@ -385,6 +434,11 @@ impl RepoDvp {
         if maturity_at <= env.ledger().timestamp() {
             panic!("repo-dvp: maturity_at must be in the future");
         }
+        // Refuse before any allowance is granted: a trade in an asset that was never
+        // passed to `configure_asset` would settle leg 1 and then strand the lender
+        // with no margin protection — `call_margin` and `default_close` read this
+        // config and would revert until maturity.
+        read_asset_config(&env, &asset);
 
         // Pre-authorize leg 1 (see the module docs): the lender signs this call, not the
         // borrower's later `accept_and_settle`.
@@ -396,6 +450,9 @@ impl RepoDvp {
         );
 
         let id = timelock::next_id(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::LatestProposal(cash_lender.clone()), &id);
         let trade = RepoTrade {
             id,
             cash_lender,
@@ -419,6 +476,47 @@ impl RepoDvp {
         id
     }
 
+    /// Cancels a proposal that is still in `Proposed` status. Callable by either the cash lender
+    /// or the cash borrower.
+    ///
+    /// If cancelled by the cash lender, the contract's leg-1 USDC allowance is reset to 0 if this
+    /// was the lender's latest proposal. If cancelled by the cash borrower, the trade status moves
+    /// to `Cancelled` (blocking settlement) without modifying the lender's token allowance, as the
+    /// borrower is not authorized to sign for the lender.
+    pub fn cancel_proposal(env: Env, caller: Address, id: u64) {
+        caller.require_auth();
+
+        let mut trade = read_trade(&env, id);
+        if trade.status != RepoStatus::Proposed {
+            panic!("repo-dvp: trade is not in proposed status");
+        }
+        if caller != trade.cash_lender && caller != trade.cash_borrower {
+            panic!("repo-dvp: caller is neither lender nor borrower");
+        }
+
+        if caller == trade.cash_lender {
+            let latest: Option<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::LatestProposal(trade.cash_lender.clone()));
+            if latest == Some(id) {
+                let usdc = read_usdc(&env);
+                token::Client::new(&env, &usdc).approve(
+                    &trade.cash_lender,
+                    &env.current_contract_address(),
+                    &0,
+                    &allowance_expiry(&env, 0, 0),
+                );
+            }
+        }
+
+        trade.status = RepoStatus::Cancelled;
+        write_trade(&env, &trade);
+
+        env.events()
+            .publish((symbol_short!("cancel"), id), caller);
+    }
+
     /// Leg 1, atomic (PRD invariant 7): within this single function, `units` of `asset` move from
     /// `cash_borrower` into this contract, and `cash_amount` USDC moves from `cash_lender`
     /// straight to `cash_borrower` (out of the allowance `propose` granted). Both token calls happen unconditionally,
@@ -429,6 +527,7 @@ impl RepoDvp {
         pause::require_not_paused(&env, &PauseScope::Repos);
 
         let mut trade = read_trade(&env, id);
+        require_asset_enabled(&env, &trade.asset);
         if trade.status != RepoStatus::Proposed {
             panic!("repo-dvp: trade is not in proposed status");
         }
@@ -440,6 +539,9 @@ impl RepoDvp {
         if env.ledger().timestamp() >= trade.maturity_at {
             panic!("repo-dvp: proposal is past its maturity");
         }
+        // Belt and braces for proposals that predate the check in `propose`: never
+        // move either leg for an asset with no margin parameters.
+        read_asset_config(&env, &trade.asset);
 
         let asset_client = token::Client::new(&env, &trade.asset);
         asset_client.transfer(
