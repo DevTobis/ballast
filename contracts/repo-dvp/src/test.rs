@@ -151,6 +151,7 @@ struct Harness {
     env: Env,
     repo: Address,
     admin: Address,
+    pauser: Address,
     keeper: Address,
     price_guard: Address,
     rwa: Address,
@@ -206,6 +207,7 @@ fn setup() -> Harness {
         env,
         repo,
         admin,
+        pauser,
         keeper,
         price_guard,
         rwa,
@@ -720,6 +722,360 @@ fn the_cure_window_has_a_floor_and_only_the_admin_sets_it() {
 }
 
 #[test]
+fn default_at_maturity_exact_fit() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 100 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+
+    let borrower_rwa_before = rwa_balance(&h, &h.cash_borrower);
+    let lender_rwa_before = rwa_balance(&h, &h.cash_lender);
+
+    let grace = RepoDvpClient::new(&h.env, &h.repo).maturity_grace_seconds();
+    h.env.ledger().set_timestamp(maturity + grace);
+
+    RepoDvpClient::new(&h.env, &h.repo).default_at_maturity(&h.cash_lender, &id);
+
+    assert_eq!(rwa_balance(&h, &h.cash_lender) - lender_rwa_before, units);
+    assert_eq!(rwa_balance(&h, &h.cash_borrower), borrower_rwa_before);
+    assert_eq!(rwa_balance(&h, &h.repo), 0);
+
+    let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+    assert_eq!(trade.status, RepoStatus::Defaulted);
+}
+
+#[test]
+fn default_at_maturity_surplus() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 60 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+
+    let borrower_rwa_before = rwa_balance(&h, &h.cash_borrower);
+    let lender_rwa_before = rwa_balance(&h, &h.cash_lender);
+
+    let grace = RepoDvpClient::new(&h.env, &h.repo).maturity_grace_seconds();
+    h.env.ledger().set_timestamp(maturity + grace);
+
+    RepoDvpClient::new(&h.env, &h.repo).default_at_maturity(&h.cash_lender, &id);
+
+    assert_eq!(rwa_balance(&h, &h.cash_lender) - lender_rwa_before, 60 * PRICE_SCALE);
+    assert_eq!(rwa_balance(&h, &h.cash_borrower) - borrower_rwa_before, 40 * PRICE_SCALE);
+    assert_eq!(rwa_balance(&h, &h.repo), 0);
+    assert_eq!(
+        RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+        RepoStatus::Defaulted
+    );
+}
+
+#[test]
+fn default_at_maturity_shortfall() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+
+    let borrower_rwa_before = rwa_balance(&h, &h.cash_borrower);
+    let lender_rwa_before = rwa_balance(&h, &h.cash_lender);
+
+    set_price(&h, 50 * PRICE_SCALE / 100);
+
+    let grace = RepoDvpClient::new(&h.env, &h.repo).maturity_grace_seconds();
+    h.env.ledger().set_timestamp(maturity + grace);
+
+    RepoDvpClient::new(&h.env, &h.repo).default_at_maturity(&h.cash_lender, &id);
+
+    assert_eq!(rwa_balance(&h, &h.cash_lender) - lender_rwa_before, units);
+    assert_eq!(rwa_balance(&h, &h.cash_borrower), borrower_rwa_before);
+    assert_eq!(rwa_balance(&h, &h.repo), 0);
+    assert_eq!(
+        RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+        RepoStatus::Defaulted
+    );
+}
+
+#[test]
+fn default_at_maturity_timing_checks() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    let grace = repo.maturity_grace_seconds();
+
+    h.env.ledger().set_timestamp(maturity - 10);
+    let before_mat = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_lender, &id);
+    }));
+    assert!(before_mat.is_err(), "cannot default before maturity");
+
+    h.env.ledger().set_timestamp(maturity + grace - 1);
+    let during_grace = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_lender, &id);
+    }));
+    assert!(during_grace.is_err(), "cannot default during maturity grace");
+
+    h.env.ledger().set_timestamp(maturity + grace);
+    repo.default_at_maturity(&h.cash_lender, &id);
+    assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
+}
+
+#[test]
+fn default_at_maturity_auth_and_status_checks() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    let not_settled = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_lender, &id);
+    }));
+    assert!(not_settled.is_err(), "cannot default on proposed trade");
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    let grace = repo.maturity_grace_seconds();
+    h.env.ledger().set_timestamp(maturity + grace);
+
+    let stranger = Address::generate(&h.env);
+    let stranger_call = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&stranger, &id);
+    }));
+    assert!(stranger_call.is_err(), "stranger cannot call default_at_maturity");
+
+    let borrower_call = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_borrower, &id);
+    }));
+    assert!(borrower_call.is_err(), "borrower cannot call default_at_maturity");
+
+    repo.default_at_maturity(&h.keeper, &id);
+    assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
+
+    let repeated = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_lender, &id);
+    }));
+    assert!(repeated.is_err(), "cannot default already defaulted trade");
+}
+
+#[test]
+fn default_at_maturity_cannot_be_called_after_unwind() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    h.env.ledger().set_timestamp(maturity);
+    repo.unwind(&h.cash_lender, &id);
+    assert_eq!(repo.trade(&id).status, RepoStatus::Unwound);
+
+    let grace = repo.maturity_grace_seconds();
+    h.env.ledger().set_timestamp(maturity + grace);
+
+    let after_unwind = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_lender, &id);
+    }));
+    assert!(after_unwind.is_err(), "cannot default an unwound trade");
+}
+
+#[test]
+fn default_at_maturity_refuses_when_price_not_usable() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    let grace = repo.maturity_grace_seconds();
+    h.env.ledger().set_timestamp(maturity + grace);
+
+    MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+        &h.rwa,
+        &PRICE_SCALE,
+        &PriceStatus::Degraded,
+        &h.env.ledger().timestamp(),
+    );
+
+    let degraded = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.default_at_maturity(&h.cash_lender, &id);
+    }));
+    assert!(degraded.is_err(), "cannot default on degraded price");
+}
+
+#[test]
+fn maturity_grace_configuration() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    assert_eq!(repo.maturity_grace_seconds(), 24 * 60 * 60);
+
+    let too_short = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.set_maturity_grace(&h.admin, &30);
+    }));
+    assert!(too_short.is_err(), "a 30s maturity grace must be refused");
+
+    let stranger = Address::generate(&h.env);
+    let not_admin = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.set_maturity_grace(&stranger, &3_600);
+    }));
+    assert!(not_admin.is_err(), "only the admin may set maturity grace");
+
+    repo.set_maturity_grace(&h.admin, &120);
+    assert_eq!(repo.maturity_grace_seconds(), 120);
+}
+
+#[test]
+
+fn configure_asset_accepts_valid_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // Standard thresholds from configure-desks.sh
+    repo.configure_asset(
+        &h.admin,
+        &new_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+    );
+
+    // Equal boundaries are valid
+    repo.configure_asset(
+        &h.admin,
+        &new_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 8_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 8_000,
+        },
+    );
+}
+
+#[test]
+fn configure_asset_rejects_zero_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    let res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 0,
+                margin_call_bps: 0,
+                liquidation_bps: 0,
+            },
+        );
+    }));
+    assert!(res.is_err(), "zero thresholds must be rejected");
+}
+
+#[test]
+fn configure_asset_rejects_out_of_order_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // warning > margin_call
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 9_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_500,
+            },
+        );
+    }));
+    assert!(res1.is_err(), "warning > margin_call must be rejected");
+
+    // margin_call > liquidation
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_500,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "margin_call > liquidation must be rejected");
+}
+
+#[test]
+fn configure_asset_rejects_liquidation_exceeding_10000() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    let res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 10_001,
+            },
+        );
+    }));
+    assert!(res.is_err(), "liquidation > 10000 must be rejected");
+    }
+
 fn disabled_asset_blocks_propose_and_accept_and_settle() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
@@ -873,6 +1229,7 @@ mod sac {
             env,
             repo,
             admin,
+            pauser,
             keeper,
             price_guard,
             rwa,
@@ -1021,6 +1378,150 @@ mod sac {
         // One ledger past expiry, SAC treats it as 0.
         h.env.ledger().set_sequence_number(expected_expiry + 1);
         assert_eq!(token_usdc.allowance(&h.cash_borrower, &h.repo), 0);
+    }
+
+    // ── #32: the Repos pause scope has a writer and a timelocked unpause ────
+
+    fn settled_trade(h: &Harness) -> u64 {
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 90 * PRICE_SCALE;
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let id = propose(h, units, cash_amount, 500, maturity);
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+        id
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pausing_repos_stops_accept_and_settle() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let id = propose(&h, 100, 1_000, 500, maturity);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        assert!(RepoDvpClient::new(&h.env, &h.repo).is_paused(&PauseScope::Repos));
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pausing_all_stops_accept_and_settle_too() {
+        let h = setup();
+        let maturity = h.env.ledger().timestamp() + 3_600;
+        let id = propose(&h, 100, 1_000, 500, maturity);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+    }
+
+    #[test]
+    fn unwind_still_works_while_paused() {
+        let h = setup();
+        let id = settled_trade(&h);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let due = total_due(&trade, trade.settled_at.unwrap());
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &(due - trade.cash_amount));
+        h.env.ledger().set_timestamp(trade.maturity_at);
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_lender, &id);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Unwound
+        );
+    }
+
+    #[test]
+    fn margin_cure_and_default_paths_still_work_while_paused() {
+        let h = setup();
+        let id = settled_trade(&h);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+
+        // Drop the price so the trade is in margin-call territory, then walk the
+        // whole enforcement path under a full pause: call, top up, and - after
+        // letting a second call's cure window lapse - default-close.
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        RepoDvpClient::new(&h.env, &h.repo).call_margin(&h.keeper, &id);
+        let called = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        assert!(called.pending_margin_call);
+
+        let extra_units = 500 * PRICE_SCALE;
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &extra_units);
+        RepoDvpClient::new(&h.env, &h.repo).top_up(&h.cash_borrower, &id, &extra_units);
+        assert!(!RepoDvpClient::new(&h.env, &h.repo).trade(&id).pending_margin_call);
+    }
+
+    #[test]
+    fn default_close_still_works_while_paused() {
+        let h = setup();
+        let id = settled_trade(&h);
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::All);
+
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        RepoDvpClient::new(&h.env, &h.repo).call_margin(&h.keeper, &id);
+        let called = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let deadline = called.cure_deadline.expect("margin call opens a cure window");
+
+        h.env.ledger().set_timestamp(deadline + 1);
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(PRICE_SCALE / 2),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+        RepoDvpClient::new(&h.env, &h.repo).default_close(&h.keeper, &id);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Defaulted
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: timelock has not elapsed")]
+    fn unpause_cannot_execute_before_the_timelock() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        let id = RepoDvpClient::new(&h.env, &h.repo).queue_unpause(&h.admin, &PauseScope::Repos);
+        RepoDvpClient::new(&h.env, &h.repo).execute_unpause(&id);
+    }
+
+    #[test]
+    fn executed_unpause_reopens_accept_and_settle_after_48h() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        let unpause = RepoDvpClient::new(&h.env, &h.repo).queue_unpause(&h.admin, &PauseScope::Repos);
+
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
+        RepoDvpClient::new(&h.env, &h.repo).execute_unpause(&unpause);
+        assert!(!RepoDvpClient::new(&h.env, &h.repo).is_paused(&PauseScope::Repos));
+
+        let id = settled_trade(&h);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Settled
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: no such pending unpause")]
+    fn a_cancelled_unpause_cannot_execute() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).pause(&h.pauser, &PauseScope::Repos);
+        let id = RepoDvpClient::new(&h.env, &h.repo).queue_unpause(&h.admin, &PauseScope::Repos);
+        RepoDvpClient::new(&h.env, &h.repo).cancel_unpause(&h.admin, &id);
+        RepoDvpClient::new(&h.env, &h.repo).execute_unpause(&id);
     }
 
     // ── #31: no trade for an asset without margin parameters ────────────────

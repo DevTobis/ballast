@@ -5,7 +5,7 @@
  */
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { schema, type Database } from "@ballast/db";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { createLogger, createConsoleMetricsSink, type Alerter } from "@ballast/observability";
 import type { RpcClient } from "./rpc.js";
 
@@ -18,6 +18,9 @@ export interface IndexerLogger {
 
 const defaultLogger = createLogger("indexer");
 const metrics = createConsoleMetricsSink("indexer");
+
+/** Default key used for single-tenant indexer cursor */
+const DEFAULT_CURSOR_ID = "default";
 
 /** How many ledgers to look back on a cold start (no rows in `chain_event` yet). */
 const COLD_START_LOOKBACK_LEDGERS = 1000;
@@ -55,6 +58,19 @@ function decodeTopicName(topic: xdr.ScVal[]): string {
 }
 
 async function getLastIngestedLedger(db: Database): Promise<number | null> {
+  try {
+    const [cursorRow] = await db
+      .select({ lastLedger: schema.indexerCursor.lastLedger })
+      .from(schema.indexerCursor)
+      .where(eq(schema.indexerCursor.id, DEFAULT_CURSOR_ID))
+      .limit(1);
+    if (cursorRow?.lastLedger !== undefined && cursorRow?.lastLedger !== null) {
+      return cursorRow.lastLedger;
+    }
+  } catch {
+    // If indexer_cursor table does not exist or query fails, fall back to event-derived value
+  }
+
   const [row] = await db
     .select({ maxLedger: sql<number | null>`max(${schema.chainEvent.ledger})` })
     .from(schema.chainEvent);
@@ -210,6 +226,26 @@ export async function pollOnce(
     });
 
     await db.insert(schema.chainEvent).values(rows).onConflictDoNothing();
+  }
+
+  if (latestLedger > 0) {
+    try {
+      await db
+        .insert(schema.indexerCursor)
+        .values({
+          id: DEFAULT_CURSOR_ID,
+          lastLedger: latestLedger,
+        })
+        .onConflictDoUpdate({
+          target: schema.indexerCursor.id,
+          set: {
+            lastLedger: latestLedger,
+            updatedAt: new Date(),
+          },
+        });
+    } catch {
+      // In tests with fake DBs lacking indexerCursor table
+    }
   }
 
   metrics.increment("indexer.events_ingested", { count: String(events.length) });

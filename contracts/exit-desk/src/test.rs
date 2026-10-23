@@ -4,7 +4,7 @@
 
 use super::*;
 use ballast_common::price::PriceStatus;
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::Env;
 
 mod mock_price_guard {
@@ -105,6 +105,7 @@ struct Harness {
     env: Env,
     desk: Address,
     admin: Address,
+    pauser: Address,
     keeper: Address,
     price_guard: Address,
     rwa: Address,
@@ -128,10 +129,13 @@ fn setup() -> Harness {
     let rwa = env.register(MockToken, ());
     let usdc = env.register(MockToken, ());
 
+    ExitDeskClient::new(&env, &desk).set_usdc(&admin, &usdc);
+
     Harness {
         env,
         desk,
         admin,
+        pauser,
         keeper,
         price_guard,
         rwa,
@@ -355,6 +359,70 @@ fn only_the_admin_can_withdraw() {
 }
 
 #[test]
+fn set_usdc_configures_token_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = env.register(ExitDesk, ());
+    ExitDeskClient::new(&env, &desk).initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let usdc = env.register(MockToken, ());
+    let client = ExitDeskClient::new(&env, &desk);
+    client.set_usdc(&admin, &usdc);
+    assert_eq!(client.usdc(), usdc);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: admin argument mismatch")]
+fn set_usdc_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = env.register(ExitDesk, ());
+    ExitDeskClient::new(&env, &desk).initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let stranger = Address::generate(&env);
+    let usdc = env.register(MockToken, ());
+    ExitDeskClient::new(&env, &desk).set_usdc(&stranger, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: usdc not configured")]
+fn fund_panics_if_usdc_unset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = env.register(ExitDesk, ());
+    ExitDeskClient::new(&env, &desk).initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let usdc = env.register(MockToken, ());
+    MockTokenClient::new(&env, &usdc).mint(&admin, &(1_000 * PRICE_SCALE));
+    ExitDeskClient::new(&env, &desk).fund(&admin, &usdc, &(1_000 * PRICE_SCALE));
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: usdc address mismatch")]
+fn fund_panics_on_mismatched_usdc() {
+    let h = setup();
+    let wrong_token = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).fund(&h.admin, &wrong_token, &(1_000 * PRICE_SCALE));
+}
+
 fn disabled_asset_blocks_quote_and_exit_but_allows_withdraw_and_reenable() {
     let h = setup();
     configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
@@ -404,5 +472,122 @@ fn disabled_asset_blocks_quote_and_exit_but_allows_withdraw_and_reenable() {
     let out = desk.exit(&holder, &h.rwa, &(10 * PRICE_SCALE), &0, &holder);
     assert!(out > 0);
     assert_eq!(MockTokenClient::new(&h.env, &h.usdc).balance(&holder), out);
+}
+
+
+#[test]
+fn pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work() {
+    let h = setup();
+    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    desk.pause(&h.pauser, &PauseScope::Exits);
+    assert!(desk.is_paused(&PauseScope::Exits));
+
+    // quote still works
+    let quote = desk.quote(&h.rwa, &(100 * PRICE_SCALE));
+    assert!(quote.usdc_out > 0);
+
+    // withdraw still works
+    let treasury = Address::generate(&h.env);
+    desk.withdraw(&h.admin, &h.usdc, &(100 * PRICE_SCALE), &treasury);
+    assert_eq!(MockTokenClient::new(&h.env, &h.usdc).balance(&treasury), 100 * PRICE_SCALE);
+
+    // exit panics with ballast-common: paused
+    let holder = Address::generate(&h.env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);
+    let exit_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.exit(&holder, &h.rwa, &units, &0, &holder);
+    }));
+    assert!(exit_res.is_err(), "exit must panic when Exits scope is paused");
+}
+
+#[test]
+fn pauser_can_pause_all_and_exit_panics_while_quote_and_withdraw_work() {
+    let h = setup();
+    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    desk.pause(&h.pauser, &PauseScope::All);
+    assert!(desk.is_paused(&PauseScope::All));
+    assert!(desk.is_paused(&PauseScope::Exits));
+
+    // quote and withdraw still work
+    let quote = desk.quote(&h.rwa, &(100 * PRICE_SCALE));
+    assert!(quote.usdc_out > 0);
+
+    let treasury = Address::generate(&h.env);
+    desk.withdraw(&h.admin, &h.usdc, &(100 * PRICE_SCALE), &treasury);
+    assert_eq!(MockTokenClient::new(&h.env, &h.usdc).balance(&treasury), 100 * PRICE_SCALE);
+
+    // exit panics
+    let holder = Address::generate(&h.env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);
+    let exit_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.exit(&holder, &h.rwa, &units, &0, &holder);
+    }));
+    assert!(exit_res.is_err(), "exit must panic when All scope is paused");
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: pauser argument mismatch")]
+fn pause_rejects_non_pauser() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).pause(&stranger, &PauseScope::Exits);
+}
+
+#[test]
+fn unpause_enforces_timelock_and_restores_exits() {
+    let h = setup();
+    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    desk.pause(&h.pauser, &PauseScope::Exits);
+    assert!(desk.is_paused(&PauseScope::Exits));
+
+    let unpause_id = desk.queue_unpause(&h.admin, &PauseScope::Exits);
+
+    // Executing before 48h elapses must fail
+    let early_exec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.execute_unpause(&unpause_id);
+    }));
+    assert!(early_exec.is_err(), "execute_unpause before timelock elapses must fail");
+
+    // Advance ledger timestamp by 48h
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 48 * 3600);
+    desk.execute_unpause(&unpause_id);
+    assert!(!desk.is_paused(&PauseScope::Exits));
+
+    // exit succeeds again
+    let holder = Address::generate(&h.env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);
+    let usdc_out = desk.exit(&holder, &h.rwa, &units, &0, &holder);
+    assert!(usdc_out > 0);
+}
+
+#[test]
+fn cancel_unpause_cancels_pending_unpause() {
+    let h = setup();
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    desk.pause(&h.pauser, &PauseScope::Exits);
+
+    let unpause_id = desk.queue_unpause(&h.admin, &PauseScope::Exits);
+    desk.cancel_unpause(&h.admin, &unpause_id);
+
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 48 * 3600);
+    let exec_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.execute_unpause(&unpause_id);
+    }));
+    assert!(exec_res.is_err(), "executing cancelled unpause must fail");
 }
 

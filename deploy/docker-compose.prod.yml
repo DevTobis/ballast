@@ -70,6 +70,9 @@ services:
   keeper:
     <<: *service
     profiles: ["lending"]
+    # Allow the keeper to finish its in-flight job before Docker sends SIGKILL.
+    # Must be greater than KEEPER_SHUTDOWN_GRACE_MS (default 60 s) plus teardown overhead.
+    stop_grace_period: 70s
     environment:
       NODE_ENV: production
       DATABASE_URL: postgres://ballast:${POSTGRES_PASSWORD}@postgres:5432/ballast

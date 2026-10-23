@@ -7,7 +7,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 
 | Role | Can | Cannot |
 |---|---|---|
-| `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
+| `admin` | configure assets, tighten thresholds immediately, queue loosening changes (48h timelock); set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender; loosen guard parameters without 48h timelock |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral`, `liquidate`, vault `liquidate`, repo `call_margin`/`default_close`, `poke` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
@@ -46,6 +46,15 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
   good value is a sticky `Halted` that only `risk` clears.
+- **Threshold loosening and key rotations require a 48h timelock.** Tightening configuration changes
+  (narrowing `band_bps`, `daily_move_band_bps`, `window_move_band_bps`, reducing `max_staleness_s`,
+  lengthening `window_seconds`, registering an initial issuer key, or enabling NAV signature requirement)
+  take effect immediately via `configure_asset`, `configure_issuer_key`, and
+  `configure_signature_requirement`. In contrast, any loosening changes (widening bands, increasing staleness
+  tolerance, shortening the smoothing window), rotating an already-registered issuer public key, or
+  disabling NAV signature requirement cannot be executed directly; they must be queued via `queue_config`
+  by admin, wait out the 48-hour delay (`ballast_common::timelock`), and then be applied permissionlessly
+  via `execute_config`. Admin can cancel queued changes via `cancel_config`.
 - **A rolling reference bounds slow drift over a window.** `daily_move_band_bps` only compares a
   publish against the immediately preceding one, so a publisher (or a bug) moving the price a little
   on every publish could walk it anywhere over an hour without ever tripping a single-step check. The
@@ -129,6 +138,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   contract between transactions.
 - Quotes are the guarded price less the spread, rounded down (in the desk's favour), and refuse any
   price that is not `Ok`.
+- **Pause.** `pause(pauser, scope)` lets the pauser halt `PauseScope::Exits` or `PauseScope::All` immediately.
+  `exit` is the only gated path; `quote` and `withdraw` remain active while paused (invariant 5).
+  Unpausing requires a 48-hour timelock (`queue_unpause` / `execute_unpause`) by the admin.
+  Note for maintainers: `CreditLine` and `PledgeVault` follow this same localized instance-storage pause pattern
+  for `Draws` and `Pledges`.
 
 ## RepoDvP
 
@@ -139,11 +153,17 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not
   pause-gated. `margin_view` is a free read.
-- **Default.** `default_close` is keeper-only, needs the cure window to have passed, re-evaluates
-  the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
-  guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the
-  collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
-  No USDC moves on default.
+- **Default.** Two routes lead to `Defaulted`:
+  - Margin default (`default_close`): keeper-only, needs the cure window to have passed, re-evaluates
+    the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
+    guarded price with no haircut, capped at the pledge; any remainder returns to the borrower.
+  - Maturity default (`default_at_maturity`): lender or keeper, available once `now >= maturity_at + maturity_grace`
+    (admin-configurable with a minimum floor). Covers unpaid leg 2 where the borrower did not fund repayment.
+    The lender receives `ceil(total_due / price)` units at the guarded price with no haircut, capped at
+    the pledge; any remainder returns to the borrower. If collateral is worth less than total due, the lender
+    takes all units and bears the shortfall. Requires an `Ok` guarded price.
+  - On both default paths, if the collateral is worth less than what is owed the lender takes all of it
+    and bears the shortfall. No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
 
 ## Known limits

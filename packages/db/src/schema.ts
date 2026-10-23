@@ -355,6 +355,13 @@ export const chainEvent = pgTable(
   (t) => [uniqueIndex("chain_event_event_id_uq").on(t.eventId)],
 );
 
+/** Scanned-up-to cursor for the event indexer so quiet periods do not re-request already-scanned ledgers. */
+export const indexerCursor = pgTable("indexer_cursor", {
+  id: text("id").primaryKey(),
+  lastLedger: integer("last_ledger").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // --- Compliance ---
 
 /** One sanctions screening of a party (its legal name and every Stellar account it uses). A
