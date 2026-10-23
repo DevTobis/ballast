@@ -73,11 +73,11 @@ use ballast_common::{
     margin::{self, MarginState, MarginThresholds},
     pause::{self, PauseScope},
     price::{GuardedPrice, PRICE_SCALE},
-    risk, timelock,
+    risk, timelock, ttl,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, MuxedAddress,
+    Env, MuxedAddress, Symbol,
 };
 
 /// Grace period after a margin call before `default_close` may act (PRD §5 Phase 1 "Top-up and
@@ -175,6 +175,12 @@ pub struct RepoMarginView {
 }
 
 #[contracttype]
+struct PendingUnpause {
+    scope: PauseScope,
+    executes_at: u64,
+}
+
+#[contracttype]
 enum DataKey {
     Usdc,
     AssetConfig(Address),
@@ -191,6 +197,8 @@ enum DataKey {
     /// later-settling, earlier-maturing trade can never shorten the window an
     /// earlier trade's keeper unwind still needs.
     BorrowerDueExpiry(Address),
+
+    PendingUnpause(u64),
 
     LatestProposal(Address),
 }
@@ -421,6 +429,77 @@ impl RepoDvp {
         cure_grace(&env)
     }
 
+    /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
+    /// Pause flags live in this contract's own instance storage, which is where
+    /// `accept_and_settle`'s `require_not_paused` reads them; `Registry::pause`
+    /// writes Registry's storage and so cannot gate this contract.
+    pub fn pause(env: Env, pauser: Address, scope: PauseScope) {
+        pauser.require_auth();
+        access::require_pauser(&env);
+        ttl::extend_instance(&env);
+        pause::set_paused(&env, &scope, true);
+        env.events().publish((Symbol::new(&env, "paused"), scope), true);
+    }
+
+    /// Queues an unpause, executable after the 48h timelock (PRD §8) — unlike
+    /// `pause`, lifting a stop is not urgent and deserves the same notice period
+    /// as any other risk-loosening change.
+    pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingUnpause(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingUnpause {
+                scope: scope.clone(),
+                executes_at,
+            },
+        );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events()
+            .publish((Symbol::new(&env, "unpause_queued"), id), (scope, executes_at));
+        id
+    }
+
+    /// Cancels a pending unpause and removes its persistent storage entry. Admin only.
+    pub fn cancel_unpause(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingUnpause(id);
+        let pending: PendingUnpause = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending unpause");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "unpause_cancelled"), id), pending.scope);
+    }
+
+    pub fn execute_unpause(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingUnpause(id);
+        let pending: PendingUnpause = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending unpause");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "repo-dvp: timelock has not elapsed"
+        );
+        pause::set_paused(&env, &pending.scope, false);
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "unpause_executed"), id), pending.scope);
+    }
+
+    pub fn is_paused(env: Env, scope: PauseScope) -> bool {
+        pause::is_paused(&env, &scope)
+    }
+
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -434,6 +513,7 @@ impl RepoDvp {
             haircut_bps as i128 <= BPS_DENOMINATOR,
             "repo-dvp: haircut exceeds 100%"
         );
+        thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
             &RepoAssetConfig {

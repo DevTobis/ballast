@@ -131,6 +131,27 @@ Update `PRICE_PUBLISHER` in `.env.<network>-deploy` before re-running
 The admin itself moves with the two-step `propose_admin` / `accept_admin` pair; every other role
 uses `queue_role_change` / `execute_role_change`.
 
+## Rotating roles on `Registry`
+
+`Registry` exposes the identical role-rotation interface (`roles`, `propose_admin`, `accept_admin`,
+`pending_admin`, `queue_role_change`, `execute_role_change`, `pending_role_change`), so the same
+`stellar contract invoke` sequence works against `$REGISTRY_CID`. For example, to rotate the
+`pauser` role without redeploying `Registry`:
+
+```bash
+# 1. As admin: queue the new pauser. Prints the change id.
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  queue_role_change --role '"Pauser"' --new_address "$NEW_PAUSER"
+
+# 2. After 48h, apply it and inspect the updated roles.
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  execute_role_change --id "$CHANGE_ID"
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- roles
+```
+
+To transfer the `Registry` admin role, run `propose_admin --new_admin "$NEW_ADMIN"` signed by the
+current admin, then `accept_admin` signed by the proposed successor.
+
 ## Timelocked contract upgrades (`Registry` and `PriceGuard`)
 
 `Registry` and `PriceGuard` implement timelocked in-place contract upgrades (`ballast_common::upgrade`) using Soroban's `env.deployer().update_current_contract_wasm(...)`. This enables upgrading contract logic and storage layouts without losing deployed state (`LastGood`, configured assets, latches, haircut configs) and avoids rewiring all six protocol contracts.

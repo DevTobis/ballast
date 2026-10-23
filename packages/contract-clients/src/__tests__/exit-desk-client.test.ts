@@ -24,6 +24,12 @@ describe("ExitDeskClient", () => {
     expect(result).toBeDefined();
   });
 
+  it("setUsdc() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.setUsdc(source, asset);
+    expect(typeof xdr).toBe("string");
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
   it("exit() returns non-empty unsigned XDR", async () => {
     const xdr = await client.exit(source, asset, 1_000n, 950_000n, source);
     expect(typeof xdr).toBe("string");
