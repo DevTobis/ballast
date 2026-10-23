@@ -6,7 +6,7 @@
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { schema, type Database } from "@ballast/db";
 import { sql } from "drizzle-orm";
-import { createConsoleMetricsSink } from "@ballast/observability";
+import { createConsoleMetricsSink, type Alerter } from "@ballast/observability";
 import type { RpcClient } from "./rpc.js";
 
 const metrics = createConsoleMetricsSink("indexer");
@@ -19,6 +19,12 @@ const PAGE_SIZE = 100;
 
 /** Stellar RPC rejects a `getEvents` filter naming more than this many contracts. */
 const MAX_CONTRACT_IDS_PER_FILTER = 5;
+
+/** Approximate ledger close time in seconds on Stellar. */
+export const LEDGER_CLOSE_SECONDS = 5;
+
+/** Default threshold (in ledgers) before rpc_lag_high alert is raised (60s / 5s). */
+export const DEFAULT_LAG_ALERT_LEDGERS = 12;
 
 /** Recursively replaces `bigint`s with strings so the result is safe to store in a jsonb column. */
 function toJsonSafe(value: unknown): unknown {
@@ -51,25 +57,59 @@ export interface PollOnceResult {
   fromLedger: number;
   insertedCount: number;
   latestLedger: number;
+  scannedUpTo: number;
+}
+
+export interface IndexerState {
+  lastScannedLedger?: number;
+}
+
+export interface LagCheckResult {
+  lagLedgers: number;
+  isLagging: boolean;
 }
 
 /**
- * Fetches events for `contractIds` since the last-ingested ledger (or `latestLedger - 1000` on a
- * cold start) and inserts one `chain_event` row per event.
+ * Computes lag between current RPC tip and the last scanned ledger sequence.
+ * During quiet periods when contracts emit no events, lastScannedLedger advances
+ * with the chain tip so no false lag alert is raised.
+ */
+export function computeRpcLag(
+  rpcTip: number,
+  lastScannedLedger?: number,
+  thresholdLedgers: number = DEFAULT_LAG_ALERT_LEDGERS,
+): LagCheckResult {
+  if (lastScannedLedger === undefined) {
+    return { lagLedgers: 0, isLagging: false };
+  }
+  const lagLedgers = Math.max(0, rpcTip - lastScannedLedger);
+  return {
+    lagLedgers,
+    isLagging: lagLedgers > thresholdLedgers,
+  };
+}
+
+/**
+ * Fetches events for `contractIds` since `cursorLedger + 1` (or the last-ingested ledger, or
+ * `latestLedger - 1000` on a cold start) and inserts one `chain_event` row per event.
  */
 export async function pollOnce(
   db: Database,
   rpcServer: RpcClient,
   contractIds: string[],
+  cursorLedger?: number,
 ): Promise<PollOnceResult> {
-  const lastIngested = await getLastIngestedLedger(db);
-
   let startLedger: number;
-  if (lastIngested !== null) {
-    startLedger = lastIngested + 1;
+  if (cursorLedger !== undefined) {
+    startLedger = cursorLedger + 1;
   } else {
-    const { sequence } = await rpcServer.getLatestLedger();
-    startLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
+    const lastIngested = await getLastIngestedLedger(db);
+    if (lastIngested !== null) {
+      startLedger = lastIngested + 1;
+    } else {
+      const { sequence } = await rpcServer.getLatestLedger();
+      startLedger = Math.max(1, sequence - COLD_START_LOOKBACK_LEDGERS);
+    }
   }
 
   // Drain every page before returning. The next poll resumes from `max(ledger) + 1`, so stopping
@@ -108,5 +148,39 @@ export async function pollOnce(
   metrics.increment("indexer.events_ingested", { count: String(events.length) });
   metrics.gauge("indexer.latest_ledger", latestLedger);
 
-  return { fromLedger: startLedger, insertedCount: events.length, latestLedger };
+  const scannedUpTo = Math.max(cursorLedger ?? 0, latestLedger);
+  return { fromLedger: startLedger, insertedCount: events.length, latestLedger, scannedUpTo };
+}
+
+/**
+ * Executes a single indexer cycle:
+ * 1. Inspects RPC tip and verifies RPC lag against the previous cycle's scanned ledger.
+ * 2. Runs `pollOnce` with the in-memory cursor to avoid re-requesting old ledgers on quiet chains.
+ * 3. Advances `state.lastScannedLedger` to the newly scanned ledger tip.
+ */
+export async function runIndexerCycle(
+  db: Database,
+  rpcServer: RpcClient,
+  contractIds: string[],
+  state: IndexerState,
+  alerter: Alerter,
+  lagAlertLedgers: number = DEFAULT_LAG_ALERT_LEDGERS,
+): Promise<PollOnceResult> {
+  const { sequence: rpcTip } = await rpcServer.getLatestLedger();
+
+  if (state.lastScannedLedger !== undefined) {
+    const lag = computeRpcLag(rpcTip, state.lastScannedLedger, lagAlertLedgers);
+    if (lag.isLagging) {
+      alerter.fire("rpc_lag_high", {
+        lagLedgers: lag.lagLedgers,
+        latestLedger: rpcTip,
+        lastScannedLedger: state.lastScannedLedger,
+        lastIngestedFrom: state.lastScannedLedger,
+      });
+    }
+  }
+
+  const result = await pollOnce(db, rpcServer, contractIds, state.lastScannedLedger);
+  state.lastScannedLedger = result.scannedUpTo;
+  return result;
 }

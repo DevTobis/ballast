@@ -40,6 +40,32 @@ export async function checkParty(
   }
   if (latest && now.getTime() - latest.checkedAt.getTime() < SCREENING_TTL_MS) return null;
 
+  // Retrieve past manual clears and their reviewed matches to avoid re-flagging known false positives
+  const allChecks = await db
+    .select()
+    .from(schema.complianceCheck)
+    .where(and(eq(schema.complianceCheck.partyId, partyId), eq(schema.complianceCheck.kind, "sanctions")))
+    .orderBy(desc(schema.complianceCheck.checkedAt));
+
+  const reviewedEntNums = new Set<string>();
+  for (let i = 0; i < allChecks.length; i++) {
+    const c = allChecks[i];
+    if (c.result === "clear" && c.listSource?.startsWith("manual review by ")) {
+      // Find the match check that immediately preceded this manual clear
+      for (let j = i + 1; j < allChecks.length; j++) {
+        const prior = allChecks[j];
+        if (prior.result === "match" && Array.isArray(prior.matches)) {
+          for (const m of prior.matches as any[]) {
+            if (m && typeof m.entNum === "string") {
+              reviewedEntNums.add(m.entNum);
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+
   const accounts = await db.select().from(schema.partyAccount).where(eq(schema.partyAccount.partyId, partyId));
   let result;
   try {
@@ -52,13 +78,16 @@ export async function checkParty(
     throw err;
   }
 
-  const hit = result.matches.length > 0;
+  // Filter out matches that have already been reviewed and cleared manually
+  const unreviewedMatches = result.matches.filter((m) => !reviewedEntNums.has(m.entNum));
+  const hit = unreviewedMatches.length > 0;
+
   await db.insert(schema.complianceCheck).values({
     partyId,
     kind: "sanctions",
     result: hit ? "match" : "clear",
     matches: result.matches,
-    listSource: result.listSource,
+    listSource: hit ? result.listSource : reviewedEntNums.size > 0 && result.matches.length > 0 ? `${result.listSource} (reviewed matches ignored)` : result.listSource,
     listLoadedAt: result.listLoadedAt,
     checkedAt: now,
   });
@@ -66,7 +95,7 @@ export async function checkParty(
     await db.insert(schema.auditLog).values({
       actor: "compliance",
       action: "sanctions.match",
-      payload: { partyId, matches: result.matches },
+      payload: { partyId, matches: unreviewedMatches },
     });
     return { status: 403, error: "compliance hold: sanctions screening needs review" };
   }

@@ -15,15 +15,17 @@ pledge events in its nightly reconciliation.
 
 ## How it polls
 
-Each cycle resumes from `max(ledger) + 1`. On an empty table it starts `1000` ledgers behind the
-latest. Contract ids are split into filters of at most 5 (the RPC's limit), and pages of 100 are
-drained before the cycle ends. Rows carry the RPC event id, which has a unique index, so re-reading a
-range inserts nothing twice. `data` holds `{ topics, value }` decoded with `scValToNative`, with
-bigints stored as strings. RPC calls are retried 4 times with exponential backoff.
+Each cycle resumes from the previous cycle's scanned ledger cursor + 1 (or `max(ledger) + 1` from
+the database on initial startup; on an empty table it starts `1000` ledgers behind the latest).
+Contract ids are split into filters of at most 5 (the RPC's limit), and pages of 100 are drained
+before the cycle ends. Rows carry the RPC event id, which has a unique index, so re-reading a range
+inserts nothing twice. `data` holds `{ topics, value }` decoded with `scValToNative`, with bigints
+stored as strings. RPC calls are retried 4 times with exponential backoff.
 
-If the cycle's start ledger is more than `INDEXER_LAG_ALERT_SECONDS / 5` ledgers behind the chain tip,
-it fires an `rpc_lag_high` alert (logged, and posted to `ALERT_WEBHOOK_URL` if set). A failed cycle is
-logged and retried on the next tick. It stops after the current cycle on `SIGTERM`.
+If the chain tip is more than `INDEXER_LAG_ALERT_SECONDS / 5` ledgers ahead of what has been scanned,
+it fires an `rpc_lag_high` alert (logged, and posted to `ALERT_WEBHOOK_URL` if set). Because lag is
+computed from the scanned ledger cursor rather than event rows, quiet periods on chain emit no false lag
+alerts. A failed cycle is logged and retried on the next tick. It stops after the current cycle on `SIGTERM`.
 
 ## Run
 
@@ -59,7 +61,8 @@ The two `INDEXER_*` variables are not listed in `.env.example`.
 
 `pnpm --filter @ballast/service-indexer test` (vitest, no network or database; both are faked).
 Covers cold start at `latest - 1000`, the 5-contract filter split, warm start at `max(ledger) + 1`
-with one row per event, and `withRetry` success and exhaustion.
+with one row per event, cursor resumption without database queries, quiet-chain lag immunity,
+lag alert firing on stalled scans, and `withRetry` success and exhaustion.
 
 ## Known limits
 
