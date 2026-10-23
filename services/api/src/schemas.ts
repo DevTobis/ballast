@@ -1,7 +1,17 @@
 import { z } from "zod";
 
 /** Loose numeric-string -> bigint coercion for request bodies (JSON has no bigint literal). */
-const bigintish = z.union([z.string(), z.number()]).transform((v) => BigInt(v));
+const bigintish = z.union([z.string(), z.number()]).transform((v, ctx) => {
+  try {
+    return BigInt(v);
+  } catch {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "expected a valid numeric string or number for integer conversion",
+    });
+    return z.NEVER;
+  }
+});
 const hexBuffer = z.string().transform((hex) => Buffer.from(hex.replace(/^0x/, ""), "hex"));
 
 export const openCreditLineSchema = z.object({
