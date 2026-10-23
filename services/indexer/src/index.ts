@@ -2,7 +2,7 @@ import { createDatabase } from "@ballast/db";
 import { loadNetworkConfig } from "@ballast/network-config";
 import { createLogger, createConsoleAlerter } from "@ballast/observability";
 import { createRpcClient } from "./rpc.js";
-import { pollOnce } from "./poller.js";
+import { pollOnce, runIndexerCycle, type IndexerState } from "./poller.js";
 
 const logger = createLogger("indexer");
 const alerter = createConsoleAlerter("indexer");
@@ -38,19 +38,18 @@ async function main() {
     stopped = true;
   });
 
+  const state: IndexerState = {};
+
   while (!stopped) {
     try {
-      const result = await pollOnce(db, rpcServer, contractIds);
-      logger.info(result, "indexer: poll complete");
-
-      const lagLedgers = result.latestLedger - result.fromLedger;
-      if (lagLedgers > LAG_ALERT_LEDGERS) {
-        alerter.fire("rpc_lag_high", {
-          lagLedgers,
-          latestLedger: result.latestLedger,
-          lastIngestedFrom: result.fromLedger,
-        });
+      const result = await runIndexerCycle(db, rpcServer, contractIds, state, alerter, LAG_ALERT_LEDGERS);
+      if (result.skippedFrom !== undefined && result.skippedTo !== undefined) {
+        logger.warn(
+          { fromLedger: result.skippedFrom, toLedger: result.skippedTo },
+          "indexer: events skipped because the resume cursor is older than the RPC retention window",
+        );
       }
+      logger.info(result, "indexer: poll complete");
     } catch (err) {
       logger.error({ err }, "indexer: poll failed");
     }

@@ -183,4 +183,44 @@ describe("issuer-gateway internal endpoints", () => {
     }
     expect(auditRows).toHaveLength(0);
   });
+
+  it("does not change HTTP response on audit insert failure, and logs failure at error level with issuer result", async () => {
+    const errorSpy = vi.fn();
+    const mockLogger = {
+      error: errorSpy,
+      info: vi.fn(),
+      warn: vi.fn(),
+      debug: vi.fn(),
+    };
+    const throwingDb = {
+      insert: () => ({
+        values: () => Promise.reject(new Error("disk full or connection reset")),
+      }),
+    } as any;
+
+    const app = buildServer(throwingDb, TOKEN, mockLogger as any);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/issuers/franklin/lien-freeze",
+      headers: AUTH,
+      payload: { assetCode: "BENJI", holderAddress: "GHOLDER", units: "1000000" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ lienRef: "lien-1" });
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "issuer.lien_freeze",
+        payload: expect.objectContaining({
+          issuerCode: "franklin",
+          assetCode: "BENJI",
+          holderAddress: "GHOLDER",
+          units: "1000000",
+          result: expect.objectContaining({ lienRef: "lien-1" }),
+        }),
+      }),
+      expect.stringContaining("audit log insert failed"),
+    );
+  });
 });
