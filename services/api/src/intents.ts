@@ -257,13 +257,27 @@ export async function settleIntent(
   contracts: ContractClients,
   intent: IntentRow,
 ): Promise<SettleResult> {
+  return (await settle(db, chain, contracts, intent)).result;
+}
+
+/**
+ * `settleIntent`, also saying whether the network answered NOT_FOUND for the transaction. A
+ * `pending` result alone doesn't say that: a lost claim race re-reads the row, which can still be
+ * pending if the winner's book update failed.
+ */
+async function settle(
+  db: Database,
+  chain: ChainGateway,
+  contracts: ContractClients,
+  intent: IntentRow,
+): Promise<{ result: SettleResult; notFound: boolean }> {
   if (intent.status !== "pending") {
-    return result(intent, intent.status as SettleResult["status"], intent.ledger);
+    return { result: result(intent, intent.status as SettleResult["status"], intent.ledger), notFound: false };
   }
 
   const outcome = await chain.outcome(intent.txHash);
   if (outcome.status === "NOT_FOUND") {
-    return result(intent, "pending", null);
+    return { result: result(intent, "pending", null), notFound: true };
   }
 
   const next = outcome.status === "SUCCESS" ? "settled" : "failed";
@@ -336,10 +350,10 @@ export async function settleIntent(
 
     if (!settleRes) {
       const current = (await findIntent(db, intent.txHash)) ?? intent;
-      return result(current, current.status as SettleResult["status"], current.ledger);
+      return { result: result(current, current.status as SettleResult["status"], current.ledger), notFound: false };
     }
 
-    return settleRes;
+    return { result: settleRes, notFound: false };
   } catch (err) {
     await recordSettleError(db, intent, err);
     throw err;
@@ -367,18 +381,22 @@ export async function sweepPendingIntents(
   const pending = await db.select().from(schema.txIntent).where(eq(schema.txIntent.status, "pending"));
 
   for (const intent of pending) {
-    // One intent the RPC chokes on must not stop the sweep reaching the others; it stays
-    // pending (and is retried next sweep) until it settles or ages out below.
+    // One intent the RPC chokes on, or whose book update fails, must not stop the sweep reaching
+    // the others. It stays pending and is retried next sweep: a throw says nothing about whether
+    // the transaction landed, so only a NOT_FOUND answer on this pass can write it off. NOT_FOUND
+    // also covers a transaction older than the RPC's retention window, so a success that went
+    // unswept for that long is still expired here.
     let status: SettleResult["status"] = "pending";
+    let notFound = false;
     try {
-      status = (await settleIntent(db, chain, contracts, intent)).status;
+      ({ result: { status }, notFound } = await settle(db, chain, contracts, intent));
     } catch {
       tally.errors++;
     }
 
     if (status === "settled") tally.settled++;
     else if (status === "failed") tally.failed++;
-    else if (status === "pending" && now - intent.createdAt.getTime() > INTENT_EXPIRY_MS) {
+    else if (notFound && now - intent.createdAt.getTime() > INTENT_EXPIRY_MS) {
       const claimed = await db
         .update(schema.txIntent)
         .set({ status: "expired", settledAt: new Date(now) })

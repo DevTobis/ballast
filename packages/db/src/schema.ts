@@ -355,6 +355,13 @@ export const chainEvent = pgTable(
   (t) => [uniqueIndex("chain_event_event_id_uq").on(t.eventId)],
 );
 
+/** Scanned-up-to cursor for the event indexer so quiet periods do not re-request already-scanned ledgers. */
+export const indexerCursor = pgTable("indexer_cursor", {
+  id: text("id").primaryKey(),
+  lastLedger: integer("last_ledger").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // --- Compliance ---
 
 /** One sanctions screening of a party (its legal name and every Stellar account it uses). A
@@ -398,6 +405,29 @@ export const payoutForward = pgTable("payout_forward", {
   quoteId: uuid("quote_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// --- Issuer gateway ---
+
+/** One row per `Idempotency-Key` the issuer gateway has seen on a lien-freeze or redeem, so a
+ * retried request returns the first result instead of creating a second lien or redemption at the
+ * issuer. The key is scoped to (issuer, route): the same key on another issuer or route is unrelated. */
+export const issuerIdempotency = pgTable(
+  "issuer_idempotency",
+  {
+    issuerCode: text("issuer_code").notNull(),
+    route: text("route").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    /** sha256 of the request's parameters; a reuse of the key with other parameters is refused. */
+    requestHash: text("request_hash").notNull(),
+    /** `in_flight` while the issuer call runs, `completed` once `response` holds its result. A
+     * failed call deletes the row, so the key can be retried. */
+    status: text("status").notNull().default("in_flight"),
+    response: jsonb("response"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.issuerCode, t.route, t.idempotencyKey] })],
+);
 
 // --- Institution API keys ---
 

@@ -310,6 +310,7 @@ impl CreditLine {
         ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
+        thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
             &AssetConfig {
@@ -396,6 +397,11 @@ impl CreditLine {
     }
 
     /// Names the `PledgeVault` allowed to report collateral through `sync_from_vault`. Admin only.
+    ///
+    /// The `admin` argument is intentionally unused: authorization is enforced against the *stored*
+    /// admin via `access::require_admin`, so passing a different address (or an address with no
+    /// stored role) cannot bypass or substitute for the real admin's signature. This mirrors the
+    /// `let _ = admin;` pattern used by the other admin-gated setters in this contract.
     pub fn set_vault(env: Env, admin: Address, vault: Address) {
         ttl::extend_instance(&env);
         let _ = admin;
@@ -898,6 +904,7 @@ mod test {
         #[allow(dead_code)]
         price_guard: mock_price_guard::MockPriceGuardClient<'static>,
         admin: Address,
+        keeper: Address,
         lender: Address,
         borrower: Address,
         asset: Address,
@@ -941,6 +948,7 @@ mod test {
             token,
             price_guard,
             admin,
+            keeper,
             lender,
             borrower,
             asset,
@@ -1418,6 +1426,127 @@ mod test {
         }));
         assert!(result.is_err(), "only the configured vault may report collateral");
         assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+    }
+
+    // ── #22: liquidate error paths, one exact message each ──────────────────
+
+    /// A line in confirmed-breach state: crashed price, double poke, later ledger —
+    /// everything `liquidate` requires except the call itself.
+    fn breached_line(h: &Harness, crash: i128) -> u64 {
+        let id = open_and_fund(h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+        h.price_guard.set_price(&crash, &PriceStatus::Ok);
+        h.credit_line.poke(&id);
+        h.env.ledger().set_sequence_number(h.env.ledger().sequence() + 2);
+        id
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: no confirmed breach flagged")]
+    fn liquidate_without_a_poke_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+        // The price has crashed, but nobody ever flagged it on the line.
+        h.price_guard.set_price(&(PRICE_SCALE / 2), &PriceStatus::Ok);
+        h.credit_line.liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+    }
+
+    #[test]
+    fn liquidate_after_the_price_recovers_panics_and_leaves_the_line_open() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = breached_line(&h, PRICE_SCALE / 2);
+        // The breach was flagged, but the price recovered before anyone liquidated.
+        h.price_guard.set_price(&PRICE_SCALE, &PriceStatus::Ok);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+        }));
+        let message = *result.expect_err("recovered price must refuse liquidation")
+            .downcast::<String>()
+            .expect("panic carries its message");
+        assert!(
+            message.contains("credit-line: breach is no longer confirmed"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Open);
+    }
+
+    #[test]
+    fn liquidate_with_a_degraded_price_panics_and_leaves_the_line_open() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = breached_line(&h, PRICE_SCALE / 2);
+        // Same crashed value, but the guard now reports it Degraded.
+        h.price_guard.set_price(&(PRICE_SCALE / 2), &PriceStatus::Degraded);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+        }));
+        let message = *result.expect_err("a degraded price must refuse liquidation")
+            .downcast::<String>()
+            .expect("panic carries its message");
+        assert!(
+            message.contains("credit-line: price status is not Ok"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Open);
+    }
+
+    #[test]
+    fn liquidating_twice_panics_and_keeps_the_first_liquidation() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+        }));
+        let message = *result.expect_err("a second liquidation must be refused")
+            .downcast::<String>()
+            .expect("panic carries its message");
+        assert!(
+            message.contains("credit-line: line is not open"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
+    }
+
+    #[test]
+    fn a_non_keeper_cannot_liquidate_while_the_real_keeper_can() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = breached_line(&h, PRICE_SCALE / 2);
+
+        // Mock only an outsider's authorization: `liquidate` authenticates the
+        // stored keeper, so this must not suffice.
+        let outsider = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &outsider,
+            invoke: &MockAuthInvoke {
+                contract: &h.credit_line.address,
+                fn_name: "liquidate",
+                args: (outsider.clone(), id, LiquidationRoute::Transfer).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.liquidate(&outsider, &id, &LiquidationRoute::Transfer);
+        }));
+        assert!(result.is_err(), "an outsider's own auth must not liquidate");
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Open);
+
+        // The stored keeper's authorization does suffice.
+        h.env.mock_auths(&[MockAuth {
+            address: &h.keeper,
+            invoke: &MockAuthInvoke {
+                contract: &h.credit_line.address,
+                fn_name: "liquidate",
+                args: (h.keeper.clone(), id, LiquidationRoute::Transfer).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        h.credit_line.liquidate(&h.keeper, &id, &LiquidationRoute::Transfer);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
     }
 
     #[test]

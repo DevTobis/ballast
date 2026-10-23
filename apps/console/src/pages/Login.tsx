@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, Navigate, useNavigate } from "react-router-dom";
 import { isAllowed, isConnected } from "@stellar/freighter-api";
 import { useAuth } from "../lib/auth.tsx";
 import { Panel } from "../components/Panel.tsx";
@@ -8,9 +8,11 @@ import { Button } from "../components/Button.tsx";
 type WalletState = "checking" | "not-installed" | "ready";
 
 export function Login() {
-  const { login, loading, error } = useAuth();
+  const { session, login, loading, error } = useAuth();
   const navigate = useNavigate();
   const [walletState, setWalletState] = useState<WalletState>("checking");
+
+  if (session) return <Navigate to="/" replace />;
 
   useEffect(() => {
     let cancelled = false;

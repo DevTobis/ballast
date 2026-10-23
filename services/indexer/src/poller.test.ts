@@ -1,17 +1,53 @@
 import { describe, expect, it, vi } from "vitest";
 import { nativeToScVal } from "@stellar/stellar-sdk";
+import { schema } from "@ballast/db";
 import { pollOnce, computeRpcLag, runIndexerCycle, type IndexerState } from "./poller.js";
 import { withRetry, type RpcClient } from "./rpc.js";
 
 /** Minimal fake of the slice of `Database` (drizzle) that `pollOnce` touches. */
-function fakeDb(opts: { lastLedger: number | null; inserted: unknown[] }) {
+function fakeDb(opts: {
+  lastLedger?: number | null;
+  cursorLedger?: number | null;
+  inserted?: unknown[];
+  cursors?: Array<{ id: string; lastLedger: number }>;
+}) {
+  const inserted = opts.inserted ?? [];
+  const cursors =
+    opts.cursors ??
+    (opts.cursorLedger !== undefined && opts.cursorLedger !== null
+      ? [{ id: "default", lastLedger: opts.cursorLedger }]
+      : []);
+
   return {
     select: () => ({
-      from: () => Promise.resolve([{ maxLedger: opts.lastLedger }]),
+      from: (table: any) => {
+        if (table === schema.indexerCursor) {
+          return {
+            where: () => ({
+              limit: () => Promise.resolve(cursors),
+            }),
+            limit: () => Promise.resolve(cursors),
+          };
+        }
+        return Promise.resolve([{ maxLedger: opts.lastLedger ?? null }]);
+      },
     }),
-    insert: () => ({
-      values: (rows: unknown[]) => {
-        opts.inserted.push(...rows);
+    insert: (table: any) => ({
+      values: (val: any) => {
+        if (table === schema.indexerCursor) {
+          const row = Array.isArray(val) ? val[0] : val;
+          const existing = cursors.find((c) => c.id === row.id);
+          if (existing) {
+            existing.lastLedger = row.lastLedger;
+          } else {
+            cursors.push({ id: row.id, lastLedger: row.lastLedger });
+          }
+          return {
+            onConflictDoUpdate: () => Promise.resolve(),
+          };
+        }
+        const rows = Array.isArray(val) ? val : [val];
+        inserted.push(...rows);
         return Object.assign(Promise.resolve(), { onConflictDoNothing: () => Promise.resolve() });
       },
     }),
@@ -22,6 +58,9 @@ function fakeDb(opts: { lastLedger: number | null; inserted: unknown[] }) {
 function fakeRpc(overrides: Partial<RpcClient> = {}): RpcClient {
   return {
     getLatestLedger: vi.fn().mockResolvedValue({ sequence: 5000 }),
+    getHealth: vi
+      .fn()
+      .mockResolvedValue({ latestLedger: 5000, oldestLedger: 1, ledgerRetentionWindow: 120960 }),
     getEvents: vi.fn().mockResolvedValue({ latestLedger: 5000, events: [] }),
     ...overrides,
   };
@@ -101,6 +140,140 @@ describe("pollOnce", () => {
     expect((row.data as { topics: number[] }).topics).toEqual([42]);
   });
 
+  it("stores an undecodable event with raw XDR, logs a warning with event id and ledger, and does not block later events", async () => {
+    const inserted: Array<{ eventId: string; ledger: number; txHash: string; contract: string; topic: string; data: any }> = [];
+    const db = fakeDb({ lastLedger: 5000, inserted });
+
+    const goodTopic = [nativeToScVal("draw", { type: "symbol" })];
+    const goodValue = nativeToScVal(500_000n, { type: "i128" });
+
+    // Poison event with value that makes scValToNative throw
+    const badValue = {
+      toXDR: () => "cG9pc29uLXhkcg==",
+      get type(): never {
+        throw new Error("unsupported ScVal type");
+      },
+    } as any;
+
+    const warnSpy = vi.fn();
+    const mockLogger = {
+      warn: warnSpy,
+      info: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const getEvents = vi.fn().mockResolvedValue({
+      latestLedger: 5010,
+      events: [
+        {
+          id: "0000005001-0000000001",
+          ledger: 5001,
+          txHash: "hash-bad",
+          contractId: "CCONTRACT1",
+          topic: [nativeToScVal("unknown_type", { type: "symbol" })],
+          value: badValue,
+        },
+        {
+          id: "0000005001-0000000002",
+          ledger: 5001,
+          txHash: "hash-good",
+          contractId: "CCONTRACT1",
+          topic: goodTopic,
+          value: goodValue,
+        },
+      ],
+    });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["CCONTRACT1"], undefined, mockLogger);
+
+    expect(result.insertedCount).toBe(2);
+    expect(inserted).toHaveLength(2);
+
+    // First event is stored as undecodable
+    const badRow = inserted[0];
+    expect(badRow.eventId).toBe("0000005001-0000000001");
+    expect(badRow.ledger).toBe(5001);
+    expect(badRow.topic).toBe("undecodable");
+    expect(badRow.data).toMatchObject({
+      raw: "cG9pc29uLXhkcg==",
+    });
+    expect(badRow.data.error).toBeDefined();
+
+    // Logger warned with eventId and ledger
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: "0000005001-0000000001",
+        ledger: 5001,
+      }),
+      expect.stringContaining("undecodable event"),
+    );
+
+    // Second event was NOT blocked and decoded properly
+    const goodRow = inserted[1];
+    expect(goodRow.eventId).toBe("0000005001-0000000002");
+    expect(goodRow.ledger).toBe(5001);
+    expect(goodRow.topic).toBe("draw");
+    expect(goodRow.data).toMatchObject({
+      value: "500000",
+    });
+  });
+
+  it("first run: cold starts and records indexer_cursor at latestLedger", async () => {
+    const cursors: Array<{ id: string; lastLedger: number }> = [];
+    const db = fakeDb({ lastLedger: null, cursors });
+    const rpc = fakeRpc({
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 8000 }),
+      getEvents: vi.fn().mockResolvedValue({ latestLedger: 8000, events: [] }),
+    });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(result.fromLedger).toBe(7000);
+    expect(cursors).toEqual([{ id: "default", lastLedger: 8000 }]);
+  });
+
+  it("warm start without a cursor row: falls back to chain_event max ledger and writes cursor", async () => {
+    const cursors: Array<{ id: string; lastLedger: number }> = [];
+    const db = fakeDb({ lastLedger: 6500, cursors });
+    const getEvents = vi.fn().mockResolvedValue({ latestLedger: 6520, events: [] });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(getEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 6501 }));
+    expect(result.fromLedger).toBe(6501);
+    expect(cursors).toEqual([{ id: "default", lastLedger: 6520 }]);
+  });
+
+  it("warm start with a cursor row: resumes from cursor.lastLedger + 1", async () => {
+    const cursors = [{ id: "default", lastLedger: 9100 }];
+    const db = fakeDb({ lastLedger: 4000, cursors }); // chain_event is older than cursor
+    const getEvents = vi.fn().mockResolvedValue({ latestLedger: 9110, events: [] });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(getEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 9101 }));
+    expect(result.fromLedger).toBe(9101);
+    expect(cursors[0].lastLedger).toBe(9110);
+  });
+
+  it("advances cursor during quiet periods with 0 events returned", async () => {
+    const cursors = [{ id: "default", lastLedger: 10000 }];
+    const db = fakeDb({ lastLedger: null, cursors });
+    const getEvents = vi.fn().mockResolvedValue({ latestLedger: 10025, events: [] });
+    const rpc = fakeRpc({ getEvents });
+
+    const result = await pollOnce(db, rpc, ["C1"]);
+    expect(result.insertedCount).toBe(0);
+    expect(cursors[0].lastLedger).toBe(10025);
+
+    // Next poll resumes from the updated cursor
+    const nextGetEvents = vi.fn().mockResolvedValue({ latestLedger: 10030, events: [] });
+    await pollOnce(db, fakeRpc({ getEvents: nextGetEvents }), ["C1"]);
+    expect(nextGetEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 10026 }));
+    expect(cursors[0].lastLedger).toBe(10030);
+  });
+
   it("resumes from cursorLedger + 1 without querying database max(ledger) when cursorLedger is provided", async () => {
     const selectSpy = vi.fn(() => ({
       from: () => Promise.resolve([{ maxLedger: 100 }]),
@@ -126,6 +299,33 @@ describe("pollOnce", () => {
     expect(result.fromLedger).toBe(501);
     expect(result.latestLedger).toBe(550);
     expect(result.scannedUpTo).toBe(550);
+  });
+
+  it("clamps a resume cursor older than the RPC retention window instead of retrying forever", async () => {
+    const db = fakeDb({ lastLedger: 1000, inserted: [] });
+    const oldestLedger = 1200;
+
+    // Mirrors Stellar RPC: a startLedger below the retained range is rejected outright.
+    const getEvents = vi.fn(async (args: { startLedger: number }) => {
+      if (args.startLedger < oldestLedger) {
+        throw new Error(`startLedger must be within the ledger range: ${oldestLedger} - 5000`);
+      }
+      return { latestLedger: 5000, events: [] };
+    });
+    const rpc = fakeRpc({
+      getEvents,
+      getHealth: vi
+        .fn()
+        .mockResolvedValue({ latestLedger: 5000, oldestLedger, ledgerRetentionWindow: 120960 }),
+    });
+
+    const result = await pollOnce(db, rpc, ["CCONTRACT1"]);
+
+    expect(getEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: oldestLedger }));
+    expect(result.fromLedger).toBe(oldestLedger);
+    expect(result.skippedFrom).toBe(1001);
+    expect(result.skippedTo).toBe(1199);
+    expect(result.scannedUpTo).toBe(5000);
   });
 });
 
@@ -202,6 +402,25 @@ describe("runIndexerCycle", () => {
       lastIngestedFrom: 5000,
     });
     expect(state.lastScannedLedger).toBe(5025);
+  });
+
+  it("fires event_gap_skipped when the resume cursor is older than the RPC retention window", async () => {
+    const db = fakeDb({ lastLedger: 5000, inserted: [] });
+    const alerter = { fire: vi.fn() };
+    const rpc = fakeRpc({
+      getHealth: vi
+        .fn()
+        .mockResolvedValue({ latestLedger: 5000, oldestLedger: 4800, ledgerRetentionWindow: 120960 }),
+    });
+    const state: IndexerState = { lastScannedLedger: 4700 };
+
+    await runIndexerCycle(db, rpc, ["CCONTRACT1"], state, alerter, 10000);
+
+    expect(alerter.fire).toHaveBeenCalledWith("event_gap_skipped", {
+      fromLedger: 4701,
+      toLedger: 4799,
+    });
+    expect(state.lastScannedLedger).toBe(5000);
   });
 });
 

@@ -75,8 +75,22 @@
     {
       "idx": 10,
       "version": "7",
-      "when": 1792604217243,
-      "tag": "0010_payout_forward_booking",
+      "when": 1792605690058,
+      "tag": "0010_issuer_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1792771766999,
+      "tag": "0011_indexer_cursor",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1792783874569,
+      "tag": "0012_payout_forward_booking",
       "breakpoints": true
     }
   ]

@@ -1,5 +1,5 @@
 {
-  "id": "b52b498e-1292-4b43-a413-11fcb49fc22b",
+  "id": "1c2bad7c-2e5c-41c9-a580-07316adbf0d0",
   "prevId": "aef91b0e-1e40-473b-8aa5-e450cc2054a9",
   "version": "7",
   "dialect": "postgresql",
@@ -833,6 +833,78 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.issuer_idempotency": {
+      "name": "issuer_idempotency",
+      "schema": "",
+      "columns": {
+        "issuer_code": {
+          "name": "issuer_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "route": {
+          "name": "route",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_hash": {
+          "name": "request_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'in_flight'"
+        },
+        "response": {
+          "name": "response",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "issuer_idempotency_issuer_code_route_idempotency_key_pk": {
+          "name": "issuer_idempotency_issuer_code_route_idempotency_key_pk",
+          "columns": [
+            "issuer_code",
+            "route",
+            "idempotency_key"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.journal_entry": {
       "name": "journal_entry",
       "schema": "",
@@ -1342,19 +1414,6 @@
         "tx_hash": {
           "name": "tx_hash",
           "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "ref_id": {
-          "name": "ref_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "quote_id": {
-          "name": "quote_id",
-          "type": "uuid",
           "primaryKey": false,
           "notNull": false
         },

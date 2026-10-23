@@ -43,6 +43,12 @@ async function main() {
   while (!stopped) {
     try {
       const result = await runIndexerCycle(db, rpcServer, contractIds, state, alerter, LAG_ALERT_LEDGERS);
+      if (result.skippedFrom !== undefined && result.skippedTo !== undefined) {
+        logger.warn(
+          { fromLedger: result.skippedFrom, toLedger: result.skippedTo },
+          "indexer: events skipped because the resume cursor is older than the RPC retention window",
+        );
+      }
       logger.info(result, "indexer: poll complete");
     } catch (err) {
       logger.error({ err }, "indexer: poll failed");
