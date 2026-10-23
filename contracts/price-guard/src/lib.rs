@@ -1386,6 +1386,8 @@ mod test {
     /// NAV remains fixed at 1.0, while an independent feed steps up +0.1% per publish to +5%, then
     /// drops back down. With a 50 bps band, no step beyond +0.5% may be Ok, the published value
     /// must never exceed the NAV by more than the band, and the guard must not Halt on the way back down.
+    /// With the NAV and this one feed as the only sources, an Ok price is their average, so it
+    /// moves at half the feed's step; Degraded steps hold the last good price.
     #[test]
     fn scripted_replay_ustry_manipulation_2026_02_22() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
@@ -1407,24 +1409,24 @@ mod test {
 
         let steps = [
             Step { step: 0, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
-            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
-            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
-            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 30_000 },
-            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
-            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
-            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
-            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
-            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
-            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 5_000 },
+            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 15_000 },
+            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
             Step { step: 19, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
         ];
 
