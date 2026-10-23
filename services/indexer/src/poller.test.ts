@@ -22,6 +22,9 @@ function fakeDb(opts: { lastLedger: number | null; inserted: unknown[] }) {
 function fakeRpc(overrides: Partial<RpcClient> = {}): RpcClient {
   return {
     getLatestLedger: vi.fn().mockResolvedValue({ sequence: 5000 }),
+    getHealth: vi
+      .fn()
+      .mockResolvedValue({ latestLedger: 5000, oldestLedger: 1, ledgerRetentionWindow: 120960 }),
     getEvents: vi.fn().mockResolvedValue({ latestLedger: 5000, events: [] }),
     ...overrides,
   };
@@ -127,6 +130,33 @@ describe("pollOnce", () => {
     expect(result.latestLedger).toBe(550);
     expect(result.scannedUpTo).toBe(550);
   });
+
+  it("clamps a resume cursor older than the RPC retention window instead of retrying forever", async () => {
+    const db = fakeDb({ lastLedger: 1000, inserted: [] });
+    const oldestLedger = 1200;
+
+    // Mirrors Stellar RPC: a startLedger below the retained range is rejected outright.
+    const getEvents = vi.fn(async (args: { startLedger: number }) => {
+      if (args.startLedger < oldestLedger) {
+        throw new Error(`startLedger must be within the ledger range: ${oldestLedger} - 5000`);
+      }
+      return { latestLedger: 5000, events: [] };
+    });
+    const rpc = fakeRpc({
+      getEvents,
+      getHealth: vi
+        .fn()
+        .mockResolvedValue({ latestLedger: 5000, oldestLedger, ledgerRetentionWindow: 120960 }),
+    });
+
+    const result = await pollOnce(db, rpc, ["CCONTRACT1"]);
+
+    expect(getEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: oldestLedger }));
+    expect(result.fromLedger).toBe(oldestLedger);
+    expect(result.skippedFrom).toBe(1001);
+    expect(result.skippedTo).toBe(1199);
+    expect(result.scannedUpTo).toBe(5000);
+  });
 });
 
 describe("computeRpcLag", () => {
@@ -202,6 +232,25 @@ describe("runIndexerCycle", () => {
       lastIngestedFrom: 5000,
     });
     expect(state.lastScannedLedger).toBe(5025);
+  });
+
+  it("fires event_gap_skipped when the resume cursor is older than the RPC retention window", async () => {
+    const db = fakeDb({ lastLedger: 5000, inserted: [] });
+    const alerter = { fire: vi.fn() };
+    const rpc = fakeRpc({
+      getHealth: vi
+        .fn()
+        .mockResolvedValue({ latestLedger: 5000, oldestLedger: 4800, ledgerRetentionWindow: 120960 }),
+    });
+    const state: IndexerState = { lastScannedLedger: 4700 };
+
+    await runIndexerCycle(db, rpc, ["CCONTRACT1"], state, alerter, 10000);
+
+    expect(alerter.fire).toHaveBeenCalledWith("event_gap_skipped", {
+      fromLedger: 4701,
+      toLedger: 4799,
+    });
+    expect(state.lastScannedLedger).toBe(5000);
   });
 });
 
