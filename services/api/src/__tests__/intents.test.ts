@@ -195,20 +195,45 @@ describe("sweepPendingIntents", () => {
     expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(true);
   });
 
-  it("keeps going past an intent the network errors on, and still ages it out", async () => {
-    const broken = intent({ txHash: "bad", createdAt: new Date(Date.now() - INTENT_EXPIRY_MS - 1000) });
+  it("keeps going past an intent the network errors on, and leaves it pending however old", async () => {
+    const broken = intent({ txHash: "bad", createdAt: new Date(Date.now() - 100 * INTENT_EXPIRY_MS) });
     const fine = intent({ txHash: "good" });
-    const { db } = makeDb(new Map([[schema.txIntent, [broken, fine]]]));
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [broken, fine]]]));
     const chain = {
       outcome: vi.fn(async (hash: string) => {
-        if (hash === "bad") throw new Error("unexpected hash length");
+        if (hash === "bad") throw new Error("RPC unavailable");
         return { status: "SUCCESS", ledger: 5, returnValue: 1n };
       }),
     } as unknown as ChainGateway;
 
     const tally = await sweepPendingIntents(db, chain, noContracts);
 
-    expect(tally).toEqual({ settled: 1, failed: 0, expired: 1, errors: 1 });
+    expect(tally).toEqual({ settled: 1, failed: 0, expired: 0, errors: 1 });
+    expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(false);
+    expect(updated).not.toContainEqual({ table: schema.creditLine, set: { status: "failed" } });
+  });
+
+  it("retries a stale intent whose book update failed instead of expiring it", async () => {
+    const stale = intent({ createdAt: new Date(Date.now() - INTENT_EXPIRY_MS - 1000) });
+    const { db, updated } = makeDb(new Map([[schema.txIntent, [stale]]]));
+    const chain = chainWith({ status: "SUCCESS", ledger: 12, returnValue: 7n });
+    const update = db.update as any;
+    let linesDown = true;
+    db.update = ((table: unknown) => {
+      if (table === schema.creditLine && linesDown) throw new Error("DB connection lost during line update");
+      return update(table);
+    }) as any;
+
+    const first = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(first).toEqual({ settled: 0, failed: 0, expired: 0, errors: 1 });
+    expect(updated.some((u) => u.table === schema.txIntent && u.set.status === "expired")).toBe(false);
+    expect(updated).not.toContainEqual({ table: schema.creditLine, set: { status: "failed" } });
+
+    linesDown = false;
+    const second = await sweepPendingIntents(db, chain, noContracts);
+
+    expect(second).toEqual({ settled: 1, failed: 0, expired: 0, errors: 0 });
   });
 
   it("leaves a recent unsubmitted transaction pending", async () => {
