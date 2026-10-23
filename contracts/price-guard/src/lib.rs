@@ -71,6 +71,8 @@ struct AssetGuardConfig {
     band_bps: u32,
     daily_move_band_bps: u32,
     max_staleness_s: u64,
+    window_seconds: u64,
+    window_move_band_bps: u32,
 }
 
 #[contracttype]
@@ -93,6 +95,8 @@ enum DataKey {
     /// live computation comes back `Degraded`/`Halted` (PRD §6.4: "existing positions keep the
     /// last good price").
     LastGood(Address),
+    RollingReference(Address),
+    RollingReferenceUpdated(Address),
     /// Set once a `Halted` status is observed; cleared only by `confirm_halt_cleared`. While set,
     /// `guarded_price` reports `Halted` regardless of what a fresh read would otherwise say.
     Halted(Address),
@@ -340,6 +344,9 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
 /// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
 ///
+/// For an odd source count, the median is the middle value. For an even source count, the median
+/// is the average of the two middle values rounded down (conservative collateral valuation).
+///
 /// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
 /// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
 /// stick and the baseline would never move until some unrelated transaction happened to call it;
@@ -398,7 +405,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         alloc_free_sort::SortBuf::from(&fresh_values);
     plain_values.sort();
     let len = plain_values.len();
-    let median_value = plain_values.get(len / 2);
+    let median_value = if len % 2 == 1 {
+        plain_values.get(len / 2)
+    } else {
+        (plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2
+    };
 
     let mut as_array: [i128; 8] = [0; 8];
     for (i, slot) in as_array.iter_mut().enumerate().take(len) {
@@ -440,6 +451,58 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                 };
             }
         }
+    }
+
+    // Rolling reference: catches slow cumulative drift that stays inside `daily_move_band_bps` on
+    // each individual step. The reference is refreshed at most once per `window_seconds`, so a
+    // publisher ramping the price a little on every publish eventually trips the window band even
+    // though every single step passed the daily band.
+    let rolling_ref: Option<i128> = env
+        .storage()
+        .instance()
+        .get(&DataKey::RollingReference(asset.clone()));
+    let rolling_ref_ts: Option<u64> = env
+        .storage()
+        .instance()
+        .get(&DataKey::RollingReferenceUpdated(asset.clone()));
+
+    if let Some(reference) = rolling_ref {
+        if reference > 0 {
+            let drift_bps = (((median_value - reference).abs()) * 10_000) / reference;
+            if drift_bps > config.window_move_band_bps as i128 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Halted(asset.clone()), &true);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                // Report the last good value, like every other Halted path, not the older reference.
+                let held = last_good.unwrap_or(reference);
+                env.events().publish(
+                    (Symbol::new(env, "halt_latched"), asset.clone()),
+                    (held, median_value),
+                );
+                check_and_emit_status_change(env, &asset, PriceStatus::Halted, held);
+                return GuardedPrice {
+                    asset,
+                    value: held,
+                    status: PriceStatus::Halted,
+                    ts: now,
+                    sources: fresh_sources,
+                };
+            }
+        }
+    }
+
+    // Refresh the rolling reference only once per window. Leaving it in place between refreshes is
+    // what makes a slow ramp accumulate against a fixed baseline instead of chasing the price.
+    if rolling_ref_ts.map_or(true, |ts| now.saturating_sub(ts) >= config.window_seconds) {
+        env.storage()
+            .instance()
+            .set(&DataKey::RollingReference(asset.clone()), &median_value);
+        env.storage()
+            .instance()
+            .set(&DataKey::RollingReferenceUpdated(asset.clone()), &now);
     }
 
     env.storage()
@@ -569,6 +632,8 @@ impl PriceGuard {
         asset: Address,
         band_bps: u32,
         daily_move_band_bps: u32,
+        window_seconds: u64,
+        window_move_band_bps: u32,
         max_staleness_s: u64,
     ) {
         admin.require_auth();
@@ -579,6 +644,8 @@ impl PriceGuard {
             &AssetGuardConfig {
                 band_bps,
                 daily_move_band_bps,
+                window_seconds,
+                window_move_band_bps,
                 max_staleness_s,
             },
         );
@@ -588,7 +655,13 @@ impl PriceGuard {
         );
         env.events().publish(
             (Symbol::new(&env, "configure_asset"), asset),
-            (band_bps, daily_move_band_bps, max_staleness_s),
+            (
+                band_bps,
+                daily_move_band_bps,
+                window_seconds,
+                window_move_band_bps,
+                max_staleness_s,
+            ),
         );
     }
 
@@ -710,6 +783,12 @@ impl PriceGuard {
     /// 3. Otherwise, if the new median moved more than `daily_move_band_bps` against the last
     ///    good value -> `Halted` (sticky, until `confirm_halt_cleared`), value = last good.
     /// 4. Otherwise -> `Ok`, value = the new median, and this becomes the new "last good".
+    ///
+    /// Median rule:
+    /// - For an odd number of fresh sources: middle value after sorting (`len / 2`).
+    /// - For an even number of fresh sources: average of the two middle values rounded down
+    ///   (`(plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2`), providing conservative
+    ///   valuation for collateral.
     pub fn guarded_price(env: Env, asset: Address) -> GuardedPrice {
         evaluate(&env, asset)
     }
@@ -742,6 +821,15 @@ impl PriceGuard {
             new_last_good = pending;
             env.storage()
                 .instance()
+                .set(&DataKey::RollingReference(asset.clone()), &pending);
+            env.storage()
+                .instance()
+                .set(
+                    &DataKey::RollingReferenceUpdated(asset.clone()),
+                    &env.ledger().timestamp(),
+                );
+            env.storage()
+                .instance()
                 .remove(&DataKey::PendingHaltValue(asset.clone()));
         } else if let Some(last) = env
             .storage()
@@ -764,9 +852,31 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
+    /// Default rolling window used by most tests: 24h, with a 1% (100 bp) window band. A publisher
+    /// ramping the price a little on every publish trips this eventually; ordinary yield (a few bp
+    /// per day) stays well inside it.
+    const DEFAULT_WINDOW_SECONDS: u64 = 86_400;
+    const DEFAULT_WINDOW_MOVE_BAND_BPS: u32 = 100;
+
     fn setup_with_admin(
         band_bps: u32,
         daily_move_band_bps: u32,
+        max_staleness_s: u64,
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
+        setup_with_admin_and_window(
+            band_bps,
+            daily_move_band_bps,
+            DEFAULT_WINDOW_SECONDS,
+            DEFAULT_WINDOW_MOVE_BAND_BPS,
+            max_staleness_s,
+        )
+    }
+
+    fn setup_with_admin_and_window(
+        band_bps: u32,
+        daily_move_band_bps: u32,
+        window_seconds: u64,
+        window_move_band_bps: u32,
         max_staleness_s: u64,
     ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
@@ -788,6 +898,8 @@ mod test {
             &asset,
             &band_bps,
             &daily_move_band_bps,
+            &window_seconds,
+            &window_move_band_bps,
             &max_staleness_s,
         );
 
@@ -1270,6 +1382,84 @@ mod test {
         }
     }
 
+    /// Replay of the 2026-02-22 YieldBlox / USTRY manipulation path (PRD §11, Backlog B-0082).
+    /// NAV remains fixed at 1.0, while an independent feed steps up +0.1% per publish to +5%, then
+    /// drops back down. With a 50 bps band, no step beyond +0.5% may be Ok, the published value
+    /// must never exceed the NAV by more than the band, and the guard must not Halt on the way back down.
+    #[test]
+    fn scripted_replay_ustry_manipulation_2026_02_22() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let mut now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+
+        struct Step {
+            step: u32,
+            feed_value: i128,
+            expected_status: PriceStatus,
+            expected_value: i128,
+        }
+
+        let max_allowed = SCALE + (SCALE * 50) / 10_000;
+
+        let steps = [
+            Step { step: 0, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 30_000 },
+            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
+            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
+            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 50_000 },
+            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 50_000 },
+            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 40_000 },
+            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 19, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+        ];
+
+        assert!(steps.len() >= 15, "table must cover at least 15 steps");
+
+        for s in steps.iter() {
+            now += 10;
+            env.ledger().set_timestamp(now);
+            client.publish_source(&publisher, &asset, &feed_name, &s.feed_value, &now);
+
+            let price = client.guarded_price(&asset);
+            assert_eq!(
+                price.status, s.expected_status,
+                "step {}: feed {} expected status {:?}, got {:?}",
+                s.step, s.feed_value, s.expected_status, price.status
+            );
+            assert_eq!(
+                price.value, s.expected_value,
+                "step {}: feed {} expected value {}, got {}",
+                s.step, s.feed_value, s.expected_value, price.value
+            );
+            assert!(
+                price.value <= max_allowed,
+                "step {}: price {} must never exceed NAV by more than band ({})",
+                s.step, price.value, max_allowed
+            );
+            assert_ne!(
+                price.status,
+                PriceStatus::Halted,
+                "step {}: guard must not Halt on the way back down",
+                s.step
+            );
+        }
+    }
+
     #[test]
     fn one_fresh_source_can_never_set_a_price_however_large_the_move() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
@@ -1313,10 +1503,36 @@ mod test {
         assert_eq!((price.status, price.value), (PriceStatus::Ok, jumped));
     }
 
-    /// Yield accrues steadily; the baseline has to follow it or ordinary drift eventually looks like a
-    /// jump. Each step here is under the 1% band, the total is not, and nobody reads the price in between.
+    /// Ordinary yield must never trip the guard. One basis point an hour for a full day is 24 bp in
+    /// total: every step is under the daily band, and the total stays inside the 100 bp window band.
     #[test]
     fn steady_drift_in_small_steps_never_halts() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let mut now = env.ledger().timestamp();
+        let mut value = SCALE;
+        client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
+
+        for _ in 0..24 {
+            now += 3_600;
+            env.ledger().set_timestamp(now);
+            value = value * 10_001 / 10_000; // +1 bp per hour
+            client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+            client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
+        }
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok, "realistic yield drift must not halt");
+        assert_eq!(price.value, value);
+    }
+
+    /// The other side of the same coin: a publisher ramping the price a little on every publish.
+    /// Each step passes the daily band (so the old consecutive check alone would never fire), but
+    /// the cumulative move against the rolling reference trips the window band and halts.
+    #[test]
+    fn a_slow_ramp_beyond_the_window_band_halts() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
@@ -1324,16 +1540,20 @@ mod test {
         let mut value = SCALE;
         client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
-        for _ in 0..4 {
-            value = value * 1_006 / 1_000; // +0.6% per step, +2.4% in total
+        // +0.9% per publish: inside the 1% daily band on every step, +2.7% by the third publish.
+        for _ in 0..3 {
+            value = value * 1_009 / 1_000;
             client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
             client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
         }
 
         let price = client.guarded_price(&asset);
-        assert_eq!(price.status, PriceStatus::Ok, "drift in small steps must not halt");
-        assert_eq!(price.value, value);
+        assert_eq!(price.status, PriceStatus::Halted, "slow ramp must trip the window band");
+        // The second step (+1.8% against the reference) trips it; the value held is the last good
+        // one, the first step's, the same as for a daily-band halt.
+        assert_eq!(price.value, SCALE * 1_009 / 1_000);
     }
 
     #[test]
@@ -1529,7 +1749,7 @@ mod test {
         };
 
         // 1. configure_asset event
-        client.configure_asset(&admin, &asset, &50, &100, &3600);
+        client.configure_asset(&admin, &asset, &50, &100, &86_400, &100, &3600);
         let events = env.events().all();
         assert!(has_event(&events, "configure_asset"), "configure_asset event must be emitted");
 
@@ -1584,19 +1804,20 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "configure_asset",
-                args: (stranger.clone(), new_asset.clone(), 60u32, 120u32, 1800u64).into_val(&env),
+                args: (stranger.clone(), new_asset.clone(), 60u32, 120u32, 86_400u64, 100u32, 1800u64)
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         }]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_asset(&stranger, &new_asset, &60, &120, &1800);
+            client.configure_asset(&stranger, &new_asset, &60, &120, &86_400, &100, &1800);
         }));
         assert!(result.is_err(), "only the stored admin may configure an asset");
 
         // Scoped auths cannot be built for generated contract addresses, so the real admin's
         // success path runs under mock_all_auths like the rest of this module.
         env.mock_all_auths();
-        client.configure_asset(&admin, &new_asset, &60, &120, &1800);
+        client.configure_asset(&admin, &new_asset, &60, &120, &86_400, &100, &1800);
     }
 
     #[test]
@@ -1789,6 +2010,84 @@ mod test {
             assert_eq!(config.band_bps, 50);
             assert_eq!(config.daily_move_band_bps, 10_000);
         });
+    }
+
+    #[test]
+    fn median_of_two_sources_averages_middle_rounded_down() {
+        // Band of 100 bps (1%), daily move band 10,000 bps (100%).
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // 1.0000000 and 1.0050000 (diff is 50 bps, within 100 bps band).
+        let val1 = SCALE; // 10_000_000
+        let val2 = SCALE + 50_000; // 10_050_000 (1.005)
+        let expected = (val1 + val2) / 2; // 10_025_000 (1.0025)
+
+        client.publish_nav(&publisher, &asset, &code, &val1, &now, &sig);
+        let feed_name = feed(&env);
+        client.publish_source(&publisher, &asset, &feed_name, &val2, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+    }
+
+    #[test]
+    fn median_of_four_sources_averages_middle_two_rounded_down() {
+        // Band of 100 bps, daily move band 10,000 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Four sorted values: 10_000_000, 10_020_000, 10_040_001, 10_050_000.
+        // Middle two: 10_020_000 and 10_040_001.
+        // Sum = 20_060_001. Average rounded down = 10_030_000.
+        let v1 = SCALE; // 10_000_000
+        let v2 = SCALE + 20_000; // 10_020_000
+        let v3 = SCALE + 40_001; // 10_040_001
+        let v4 = SCALE + 50_000; // 10_050_000
+        let expected = (v2 + v3) / 2;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        let s4 = Symbol::new(&env, "feed_4");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+        client.publish_source(&publisher, &asset, &s4, &v4, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+        assert_eq!(price.value, 10_030_000);
+    }
+
+    #[test]
+    fn median_of_odd_sources_returns_middle_value() {
+        // Band of 100 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Three sorted values: 10_000_000, 10_030_000, 10_060_000.
+        // Middle is 10_030_000.
+        let v1 = SCALE;
+        let v2 = SCALE + 30_000;
+        let v3 = SCALE + 60_000;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, v2);
     }
 
     mod invariants;

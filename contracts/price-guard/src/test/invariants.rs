@@ -165,7 +165,15 @@ fn execute_and_assert_invariants(
     daily_move_band_bps: u32,
     max_staleness_s: u64,
 ) {
-    let (env, client, publisher, risk, asset) = setup(band_bps, daily_move_band_bps, max_staleness_s);
+    // The reference model has no rolling window, so the window band is disabled here (u32::MAX);
+    // the window check has its own scenario tests.
+    let (env, client, _admin, publisher, risk, asset) = setup_with_admin_and_window(
+        band_bps,
+        daily_move_band_bps,
+        DEFAULT_WINDOW_SECONDS,
+        u32::MAX,
+        max_staleness_s,
+    );
     let start_time = 10_000u64;
     env.ledger().with_mut(|l| l.timestamp = start_time);
 

@@ -9,6 +9,7 @@
 #
 # Usage:
 #   scripts/deploy-mainnet-prices.sh --dry-run     # print every command, send nothing
+#   scripts/deploy-mainnet-prices.sh --help        # print usage
 #   CONFIRM_MAINNET=deploy-prices scripts/deploy-mainnet-prices.sh
 #
 # Prerequisites (this script refuses to create keys on mainnet):
@@ -17,7 +18,8 @@
 #     Use hardware/KMS-backed or multisig accounts for admin and pauser. The price publisher key
 #     is the NAV attestor: keep it in Vault/KMS for the running service (the CLI identity is only
 #     used here to derive its public key; the service signs through packages/operator-signing).
-#   - Override the defaults below with PRICE_BAND_BPS, DAILY_MOVE_BAND_BPS, MAX_STALENESS_S.
+#   - Override the defaults below with PRICE_BAND_BPS, DAILY_MOVE_BAND_BPS, WINDOW_SECONDS,
+#     WINDOW_MOVE_BAND_BPS, MAX_STALENESS_S.
 #
 # Output: .env.mainnet-deploy at the repo root (contract ids and role addresses, no secrets).
 
@@ -29,12 +31,54 @@ OUT_FILE=".env.${NETWORK}-deploy"
 ASSETS_FILE=${ASSETS_FILE:-scripts/shadow-assets.json}
 PRICE_BAND_BPS=${PRICE_BAND_BPS:-50}
 DAILY_MOVE_BAND_BPS=${DAILY_MOVE_BAND_BPS:-100}
+# Rolling reference: a cumulative move beyond WINDOW_MOVE_BAND_BPS within WINDOW_SECONDS halts.
+WINDOW_SECONDS=${WINDOW_SECONDS:-86400}
+WINDOW_MOVE_BAND_BPS=${WINDOW_MOVE_BAND_BPS:-100}
 # RedStone's RWA feeds update every 1-2h; the issuer NAV every few minutes.
 MAX_STALENESS_S=${MAX_STALENESS_S:-21600}
 HAIRCUT_BASE_BPS=${HAIRCUT_BASE_BPS:-500}
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/deploy-mainnet-prices.sh [OPTIONS]
+
+Deploys only the price layer (`registry` and `price-guard`) to Stellar mainnet.
+
+Options:
+  --dry-run       Print every command without submitting transactions
+  -h, --help      Show this help message and exit
+
+Environment:
+  CONFIRM_MAINNET=deploy-prices  Required for live deployment
+EOF
+}
+
 DRY_RUN=false
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "!!! Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$DRY_RUN" == false && "${CONFIRM_MAINNET:-}" == "deploy-prices" ]]; then
+  if [[ "${DRYRUN:-}" =~ ^(1|true|yes)$ || "${DRY_RUN:-}" =~ ^(1|true|yes)$ ]]; then
+    echo "!!! Refusing live deployment: dry-run environment variable detected but --dry-run flag was not passed." >&2
+    exit 2
+  fi
+fi
 
 log() { echo ">>> $*"; }
 
@@ -126,6 +170,7 @@ for row in "${ROWS[@]}"; do
 
   run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_asset \
     --admin "$ADMIN" --asset "$SAC" --band_bps "$PRICE_BAND_BPS" --daily_move_band_bps "$DAILY_MOVE_BAND_BPS" \
+    --window_seconds "$WINDOW_SECONDS" --window_move_band_bps "$WINDOW_MOVE_BAND_BPS" \
     --max_staleness_s "$MAX_STALENESS_S" >/dev/null
 
   # No issuer signs NAV; the publisher key signs what the service read from the issuer's API.

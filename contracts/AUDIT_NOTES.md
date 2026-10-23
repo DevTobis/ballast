@@ -21,6 +21,13 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
   good value is a sticky `Halted` that only `risk` clears.
+- **A rolling reference bounds slow drift over a window.** `daily_move_band_bps` only compares a
+  publish against the immediately preceding one, so a publisher (or a bug) moving the price a little
+  on every publish could walk it anywhere over an hour without ever tripping a single-step check. The
+  contract also keeps a `RollingReference` per asset, refreshed at most once per `window_seconds`
+  (default 24h), and halts when the median differs from it by more than `window_move_band_bps`. Both
+  are per-asset settings on `configure_asset`. The defaults (24h, 100 bp) leave ordinary yield drift,
+  a few bp per day, well inside the band while still catching a ramp of the kind described here.
 - **The guard is evaluated and persisted on every publish**, not only when something reads it. A
   Soroban read is a simulation and stores nothing, so evaluating only on reads meant the halt latch
   and the `LastGood` baseline moved only when an unrelated transaction happened to call

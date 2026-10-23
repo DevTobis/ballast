@@ -61,7 +61,8 @@ log "  new PriceGuard: $NEW (was $PRICE_GUARD_CID)"
 inv --id "$NEW" -- initialize --admin "$ADMIN" --pauser "$PAUSER" --keeper "$KEEPER" \
   --price_publisher "$PRICE_PUBLISHER" --risk "$RISK" >/dev/null
 inv --id "$NEW" -- configure_asset --admin "$ADMIN" --asset "$RWA_SAC" \
-  --band_bps 50 --daily_move_band_bps 100 --max_staleness_s 21600 >/dev/null
+  --band_bps 50 --daily_move_band_bps 100 \
+  --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s 21600 >/dev/null
 
 # The deploy file is what configure-nav-key.sh and configure-desks.sh read, so it changes first.
 set_var "$DEPLOY_FILE" PRICE_GUARD_CID "$NEW"

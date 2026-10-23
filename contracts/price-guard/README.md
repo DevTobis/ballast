@@ -14,7 +14,7 @@ To support real-time monitoring (PRD §11 alerts for `Degraded` and `Halted` sta
 
 | Event Name | Topics Tuple | Data Payload | Emitted By | Description |
 |---|---|---|---|---|
-| `configure_asset` | `(Symbol("configure_asset"), asset: Address)` | `(band_bps: u32, daily_move_band_bps: u32, max_staleness_s: u64)` | `configure_asset` | Emitted when an asset's guard thresholds and staleness bounds are configured or updated. |
+| `configure_asset` | `(Symbol("configure_asset"), asset: Address)` | `(band_bps: u32, daily_move_band_bps: u32, window_seconds: u64, window_move_band_bps: u32, max_staleness_s: u64)` | `configure_asset` | Emitted when an asset's guard thresholds and staleness bounds are configured or updated. |
 | `configure_issuer_key` | `(Symbol("configure_issuer_key"), asset: Address)` | `issuer_pubkey: BytesN<32>` | `configure_issuer_key` | Emitted when an asset's Ed25519 issuer public key is registered or rotated. |
 | `configure_signature_requirement` | `(Symbol("configure_signature_requirement"),)` | `required: bool` | `configure_signature_requirement` | Emitted when the global signature verification toggle is flipped. |
 | `nav_published` | `(Symbol("nav_published"), asset: Address)` | `(source: Symbol, value: i128, ts: u64)` | `publish_nav` | Emitted when an issuer-signed NAV reading is published. |

@@ -210,6 +210,7 @@ export const liquidation = pgTable("liquidation", {
   id: uuid("id").primaryKey().defaultRandom(),
   creditLineId: uuid("credit_line_id")
     .notNull()
+    .unique()
     .references(() => creditLine.id),
   route: liquidationRouteEnum("route").notNull(),
   units: money("units").notNull(),
