@@ -8,7 +8,8 @@
  * This endpoint moves the operator's own USDC, so it is locked down three ways: every request must
  * carry the shared `x-internal-token`, the server listens on loopback unless told otherwise, and
  * what a request may ask for is bounded by the operator's `PayoutPolicy` (approved destinations,
- * the configured USDC, a per-payout cap), with each first-leg transaction payable once.
+ * the configured USDC, a per-payout cap), with each first-leg transaction checked on-chain and
+ * payable once.
  */
 import Fastify, { type FastifyInstance } from "fastify";
 import { z } from "zod";
@@ -20,6 +21,7 @@ import {
   requireInternalToken,
 } from "@ballast/network-config";
 import { createLogger } from "@ballast/observability";
+import { rpc } from "@stellar/stellar-sdk";
 import {
   DuplicatePayoutError,
   PayoutRefusedError,
@@ -28,6 +30,12 @@ import {
   type PayoutPolicy,
 } from "./hop.js";
 import { OperatorPayoutSigner, type PayoutSigner } from "./signer.js";
+import {
+  FirstLegRefusedError,
+  FirstLegUnavailableError,
+  RpcFirstLegVerifier,
+  type FirstLegVerifier,
+} from "./firstLeg.js";
 
 const forwardBody = z.object({
   fromContractPayoutTxHash: z.string().min(1),
@@ -42,7 +50,7 @@ const forwardBody = z.object({
 export function buildServer(
   db: Database,
   signer: PayoutSigner,
-  options: { internalToken: string; policy: PayoutPolicy },
+  options: { internalToken: string; policy: PayoutPolicy; verifier: FirstLegVerifier },
 ): FastifyInstance {
   const app = Fastify({ logger: false });
   requireInternalToken(app, options.internalToken);
@@ -55,6 +63,7 @@ export function buildServer(
       const result = await forwardPayout(
         db,
         signer,
+        options.verifier,
         {
           fromContractPayoutTxHash: body.fromContractPayoutTxHash,
           toAnchorAccount: body.toAnchorAccount,
@@ -69,6 +78,8 @@ export function buildServer(
     } catch (err) {
       if (err instanceof PayoutRefusedError) return reply.status(403).send({ error: err.message });
       if (err instanceof DuplicatePayoutError) return reply.status(409).send({ error: err.message });
+      if (err instanceof FirstLegRefusedError) return reply.status(422).send({ error: err.message });
+      if (err instanceof FirstLegUnavailableError) return reply.status(503).send({ error: err.message });
       req.log.error({ err }, "payout-hop: forward failed");
       return reply.status(502).send({ error: err instanceof Error ? err.message : "unknown error" });
     }
@@ -85,7 +96,12 @@ async function main() {
   const network = loadNetworkConfig();
   const signer = await OperatorPayoutSigner.create(logger, network.rpcUrl, network.networkPassphrase);
 
-  const app = buildServer(db, signer, { internalToken, policy });
+  const verifier = new RpcFirstLegVerifier(
+    new rpc.Server(network.rpcUrl, { allowHttp: network.rpcUrl.startsWith("http://") }),
+    network.networkPassphrase,
+  );
+
+  const app = buildServer(db, signer, { internalToken, policy, verifier });
   const port = Number(process.env.PAYOUT_HOP_PORT ?? 3002);
   const host = internalBindHost("payout-hop");
 

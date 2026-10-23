@@ -14,31 +14,63 @@ const { runCureExpiryJob } = await import("./cureExpiry.js");
  * Table-keyed fake DB: `select().from(table)` resolves to that table's fixture rows however it's
  * chained (`where`/`orderBy`/`limit` don't filter), and `insert`/`update` calls are recorded.
  */
-function makeDb(rows: Map<unknown, unknown[]>) {
+function makeDb(
+  rows: Map<unknown, unknown[]>,
+  options?: { onWrite?: (action: string, table: unknown) => void; throwOnTable?: unknown },
+) {
   const inserted: Array<{ table: unknown; values: any }> = [];
   const updated: Array<{ table: unknown; set: any }> = [];
-  const chain = (data: unknown[]): any => {
+  const chain = (table: unknown): any => {
+    const data = rows.get(table) ?? [];
     const promise: any = Promise.resolve(data);
-    promise.where = () => chain(data);
-    promise.orderBy = () => chain(data);
-    promise.limit = () => chain(data);
+    promise.where = () => chain(table);
+    promise.orderBy = () => chain(table);
+    promise.limit = () => chain(table);
     return promise;
   };
-  const db = {
-    select: () => ({ from: (table: unknown) => chain(rows.get(table) ?? []) }),
+  const createTx = (txRows: Map<unknown, unknown[]>, txInserted: any[], txUpdated: any[]) => ({
+    select: () => ({ from: (table: unknown) => chain(table) }),
     insert: (table: unknown) => ({
       values: async (values: unknown) => {
-        inserted.push({ table, values });
+        if (options?.throwOnTable === table) {
+          throw new Error(`simulated failure writing to table`);
+        }
+        options?.onWrite?.("insert", table);
+        txInserted.push({ table, values });
+        const list = txRows.get(table) ?? [];
+        list.push(values);
+        txRows.set(table, list);
       },
     }),
     update: (table: unknown) => ({
       set: (set: unknown) => ({
         where: async () => {
-          updated.push({ table, set });
+          if (options?.throwOnTable === table) {
+            throw new Error(`simulated failure updating table`);
+          }
+          options?.onWrite?.("update", table);
+          txUpdated.push({ table, set });
         },
       }),
     }),
-  } as any;
+  });
+
+  const db: any = {
+    ...createTx(rows, inserted, updated),
+    transaction: async (fn: any) => {
+      const stageRows = new Map(Array.from(rows.entries()).map(([k, v]) => [k, [...v]]));
+      const stageInserted: any[] = [];
+      const stageUpdated: any[] = [];
+      const tx = createTx(stageRows, stageInserted, stageUpdated);
+      const res = await fn(tx);
+      for (const [k, v] of stageRows.entries()) {
+        rows.set(k, v);
+      }
+      inserted.push(...stageInserted);
+      updated.push(...stageUpdated);
+      return res;
+    },
+  };
   return { db, inserted, updated };
 }
 
@@ -237,5 +269,52 @@ describe("runCureExpiryJob", () => {
 
     expect(result.errors).toEqual([{ id: "line-1", message: "rpc down" }]);
     expect(inserted).toHaveLength(0);
+  });
+
+  it("commits all three DB writes or none do when transaction fails on the last write", async () => {
+    const { db, inserted, updated } = makeDb(
+      fixtures([{ toState: "Liquidation", createdAt: longAgo() }]),
+      { throwOnTable: schema.creditLine },
+    );
+    const c = clients(
+      { state: "Liquidation", priceStatus: "Ok" },
+      { status: "Open", breachLedger: 100, pledgedUnits: 1_500_000_000n, asset: "CASSET" },
+    );
+
+    const result = await run(db, c);
+
+    expect(result.errors).toEqual([
+      { id: "line-1", message: "simulated failure updating table" },
+    ]);
+    expect(inserted).toHaveLength(0);
+    expect(updated).toHaveLength(0);
+  });
+
+  it("leaves exactly one liquidation row for the line on a second run after a simulated crash", async () => {
+    const marginEvents = [{ toState: "Liquidation", createdAt: new Date() }];
+    const fixs = fixtures(marginEvents);
+    fixs.set(schema.liquidation, [
+      {
+        id: "liq-1",
+        creditLineId: "line-1",
+        route: "transfer",
+        units: "150.0000000",
+        txHashes: ["hash-1"],
+        completedAt: new Date(),
+      },
+    ]);
+
+    const { db, inserted, updated } = makeDb(fixs);
+    const c = clients(
+      { state: "Liquidation", priceStatus: "Ok" },
+      { status: "Liquidating", breachLedger: 100, asset: "CASSET" },
+      0n,
+    );
+
+    const result = await run(db, c);
+    expect(result).toEqual({ processed: 1, skipped: 0, errors: [] });
+    expect(inserted.filter((i) => i.table === schema.liquidation)).toHaveLength(0);
+    expect(updated).toContainEqual({ table: schema.creditLine, set: { status: "liquidating" } });
+    expect(fixs.get(schema.liquidation)).toHaveLength(1);
   });
 });

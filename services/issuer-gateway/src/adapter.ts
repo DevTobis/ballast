@@ -37,6 +37,7 @@ export interface IssuerAdapter {
     assetCode: string,
     holderAddress: string,
     units: bigint,
+    options?: IssuerRequestOptions,
   ): Promise<{ lienRef: string }>;
 
   /** Releases a previously placed lien (e.g. on repayment, or after a cured margin call). */
@@ -47,5 +48,15 @@ export interface IssuerAdapter {
     assetCode: string,
     units: bigint,
     destination: string,
+    options?: IssuerRequestOptions,
   ): Promise<{ redemptionRef: string; expectedSettlementAt: number }>;
+}
+
+/** Per-call options for the requests that create a lasting obligation at the issuer. */
+export interface IssuerRequestOptions {
+  /**
+   * The caller's `Idempotency-Key`, passed on to the issuer as the same header so an issuer that
+   * honours it can drop a duplicate the gateway could not (e.g. a retry after a timeout).
+   */
+  idempotencyKey?: string;
 }
