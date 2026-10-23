@@ -2,11 +2,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { Keypair } from "@stellar/stellar-sdk";
 
-const { fireSpy, simulateReadMock } = vi.hoisted(() => ({ fireSpy: vi.fn(), simulateReadMock: vi.fn() }));
+const { fireSpy, simulateReadMock, loggerErrorSpy } = vi.hoisted(() => ({
+  fireSpy: vi.fn(),
+  simulateReadMock: vi.fn(),
+  loggerErrorSpy: vi.fn(),
+}));
 
 vi.mock("@ballast/observability", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@ballast/observability")>();
-  return { ...actual, createConsoleAlerter: () => ({ fire: fireSpy }) };
+  return {
+    ...actual,
+    createConsoleAlerter: () => ({ fire: fireSpy }),
+    createLogger: () => ({
+      error: loggerErrorSpy,
+      info: vi.fn(),
+      warn: vi.fn(),
+      debug: vi.fn(),
+    }),
+  };
 });
 vi.mock("@ballast/contract-clients", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@ballast/contract-clients")>();
@@ -112,6 +125,7 @@ const sendSigner = {
 
 beforeEach(() => {
   fireSpy.mockClear();
+  loggerErrorSpy.mockClear();
   sendSigner.sign.mockClear();
   stubRedstone();
   stubIssuerHttp();
@@ -227,7 +241,7 @@ describe("runPriceUpdateCycle", () => {
     expect(fireSpy).toHaveBeenCalledWith("price_halted", expect.objectContaining({ assetId: "asset-1", status: "Halted" }));
   });
 
-  it("skips an asset with an unknown issuer code without failing the others", async () => {
+  it("skips an asset with an unknown issuer code, alerts, and continues to the others", async () => {
     const db = makeDb();
     const client = makeClient();
     const submit = vi.fn().mockResolvedValue({ hash: "h", status: "SUCCESS" });
@@ -236,6 +250,40 @@ describe("runPriceUpdateCycle", () => {
     await runPriceUpdateCycle(db as any, client as any, sendSigner as any, [bad, makeAsset()], submit, TEST_ENV);
 
     expect(client.publishNav).toHaveBeenCalledTimes(1);
+    expect(fireSpy).toHaveBeenCalledWith(
+      "price_degraded",
+      expect.objectContaining({
+        assetId: "asset-bad",
+        code: "CETES",
+        reason: expect.stringContaining('no issuer NAV adapter for issuer code "not-a-real-issuer"'),
+      }),
+    );
+    expect(loggerErrorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ assetId: "asset-bad", code: "CETES" }),
+      expect.stringContaining("cycle failed for asset CETES"),
+    );
+  });
+
+  it("alerts on any unhandled exception in the per-asset loop body", async () => {
+    const db = makeDb();
+    const client = makeClient();
+    client.guardedPrice.mockRejectedValueOnce(new Error("publisher key revoked"));
+    const submit = vi.fn().mockResolvedValue({ hash: "h", status: "SUCCESS" });
+
+    await runPriceUpdateCycle(db as any, client as any, sendSigner as any, [makeAsset()], submit, TEST_ENV);
+
+    expect(fireSpy).toHaveBeenCalledWith(
+      "price_degraded",
+      expect.objectContaining({
+        assetId: "asset-1",
+        code: "CETES",
+        reason: "publisher key revoked",
+      }),
+    );
+    expect(loggerErrorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ assetId: "asset-1", code: "CETES" }),
+      expect.stringContaining("cycle failed for asset CETES"),
+    );
   });
 
   it("fails the whole cycle loudly when no RedStone feed is configured", async () => {

@@ -17,6 +17,28 @@ All `POST`, under `/internal/issuers/:code/` where `:code` is `spiko`, `etherfus
 | `lien-release` | `assetCode`, `lienRef` | `issuer.lien_release` |
 | `redeem` | `assetCode`, `units`, `destination` | `issuer.redeem` |
 
+### Idempotency keys (lien-freeze, redeem)
+
+A lien or a redemption is a lasting obligation at the issuer, so a caller that times out and retries
+must not create a second one. Send an `Idempotency-Key` header (1-255 printable ASCII characters, no
+spaces) on `lien-freeze` and `redeem`:
+
+- The first request claims `(issuer code, route, key)` in `issuer_idempotency` before calling the issuer,
+  then stores the issuer's result. The issuer code is matched case-insensitively.
+- A later request with the same key and the same parameters gets that stored result with
+  `Idempotent-Replayed: true`. The issuer is not called and no audit row is written.
+- The same key with different parameters is `422`. `units` is compared as a number, so `"01000"` equals
+  `"1000"`. The same key on another issuer or route is unrelated.
+- While the first request is still waiting on the issuer, the same key gets `409`; retry later.
+- If the issuer call fails, the claim is released and the same key can be retried.
+- The key is also sent to the issuer as an `Idempotency-Key` header, so an issuer that honours it can drop
+  a duplicate the gateway cannot see (a retry after a timeout that did reach it). Whether any issuer
+  honours it is unknown, like the rest of these back-office endpoints.
+- A malformed key is `400`. The audit row of a keyed request records `idempotencyKey`.
+
+**Requests without the header behave exactly as before:** every request reaches the issuer, and nothing
+is stored or forwarded. The other three routes ignore the header.
+
 ## Adapters
 
 There is no mock mode. An issuer is served only when `<ISSUER>_API_BASE_URL` and `<ISSUER>_API_KEY` are
@@ -26,6 +48,9 @@ returns 500. Adapters are built per request, so issuers can be configured indepe
 - SEP-8 follows the Stellar Regulated Assets protocol: the adapter POSTs `{ tx }` to
   `<ISSUER>_SEP8_APPROVAL_SERVER_URL` (default `<base URL>/sep8`) and maps `success`, `revised`,
   `rejected` and `pending` onto the interface.
+- Outbound HTTP requests have a 15-second timeout by default, including reading the response body.
+  Timeout errors name the issuer and adapter operation. Requests are not automatically retried:
+  a timeout does not establish whether the issuer processed the request.
 - Authorisation, liens and redemptions call `POST /v1/authorizations`, `POST /v1/liens`,
   `DELETE /v1/liens/:ref` and `POST /v1/redemptions` with a bearer key. **These endpoints are guesses**:
   none of the three issuers publishes such an API. They are marked TODO in the adapters and must be
@@ -54,12 +79,14 @@ pnpm --filter @ballast/service-issuer-gateway build && pnpm --filter @ballast/se
 |---|---|
 | `INTERNAL_API_TOKEN` | shared secret for the header above |
 | `ISSUER_GATEWAY_PORT` (3001), `ISSUER_GATEWAY_HOST` (127.0.0.1) | listen address |
-| `DATABASE_URL` | Postgres, for `audit_log` |
+| `ISSUER_GATEWAY_TIMEOUT_MS` (15000) | per-request issuer API and SEP-8 HTTP timeout in milliseconds, including the response body; integer from 1 to 2147483647 (invalid values fail before the request) |
+| `DATABASE_URL` | Postgres, for `audit_log` and `issuer_idempotency` |
 | `SPIKO_`, `ETHERFUSE_`, `FRANKLIN_` + `API_BASE_URL`, `API_KEY`, `SEP8_APPROVAL_SERVER_URL` | per-issuer back office (nine variables) |
 
 ## Source map
 
 - `src/index.ts`: Fastify routes and audit logging.
+- `src/idempotency.ts`: `Idempotency-Key` parsing and `runIdempotent` (claim, call once, store, replay).
 - `src/registry.ts`: `getAdapter`, env-driven selection.
 - `src/adapter.ts`: the `IssuerAdapter` interface.
 - `src/adapters/`: `spikoAdapter.ts`, `etherfuseAdapter.ts`, `franklinAdapter.ts`, and `liveShared.ts`
@@ -73,6 +100,18 @@ unconfigured or unknown issuer, and 401 without the token before any issuer is c
 `src/__tests__/liveAdapters.test.ts` covers fail-fast config checks, request shapes, error text on
 non-2xx, the SEP-8 status mapping and URL override, and `getAdapter`. The stubbed responses are the
 shapes the adapters expect, not recordings of a real issuer.
+`src/__tests__/liveShared.test.ts` covers stalled fetches and response bodies, timeout configuration,
+issuer/operation diagnostics, and the absence of automatic POST retries.
+`src/idempotency.test.ts` drives both keyed routes through the real adapters against an in-memory
+`issuer_idempotency` table. It covers:
+- a replay returns the first result with one issuer call, and the key is forwarded;
+- 422 for changed parameters, and equal `units` written differently counting as the same request;
+- scoping by issuer and route;
+- unchanged behaviour without a key;
+- releasing the key after an issuer failure;
+- 409 while the first request is in flight;
+- a failed store or release being logged without hiding the issuer's answer;
+- 400 for malformed keys.
 
 ## Known limits
 
@@ -80,3 +119,10 @@ shapes the adapters expect, not recordings of a real issuer.
 - The back-office endpoints above are unverified; only the SEP-8 leg follows a published protocol.
 - Failures surface as bare 500s, and the audit row is written after the adapter call returns, so a failed
   issuer call leaves no audit row.
+- If the database fails to store a keyed result after the issuer succeeded, or to release a key after the
+  issuer failed, the key stays `in_flight`: every later request with it gets `409` until the
+  `issuer_idempotency` row is removed by hand. Both cases are logged at error level. Stored keys are
+  never expired.
+- A request whose issuer call timed out after reaching the issuer releases its key, so a retry with the
+  same key does reach the issuer again. Only an issuer that honours the forwarded `Idempotency-Key`
+  prevents a duplicate in that case.

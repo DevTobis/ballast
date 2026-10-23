@@ -176,6 +176,64 @@ describe("checkParty", () => {
     expect(screen).toHaveBeenCalledTimes(1);
   });
 
+  it("does not hold a party after 25 hours if the match was cleared manually, but holds if a new match appears", async () => {
+    const t0 = new Date("2026-10-08T10:00:00Z");
+    const t1 = new Date("2026-10-08T11:00:00Z"); // cleared manually 1h later
+    const t25 = new Date("2026-10-09T12:00:00Z"); // 25 hours later (26h after t0)
+
+    const matchHistory = [
+      {
+        partyId: "p1",
+        kind: "sanctions",
+        result: "clear",
+        matches: [],
+        listSource: "manual review by alice: different entity, same name",
+        checkedAt: t1,
+      },
+      {
+        partyId: "p1",
+        kind: "sanctions",
+        result: "match",
+        matches: [{ type: "name", listed: "ACME CORP", entNum: "999" }],
+        listSource: "OFAC SDN",
+        checkedAt: t0,
+      },
+    ];
+
+    const { db, checks } = gateDb(approved, matchHistory);
+
+    // Screener still returns the same false positive match (entNum 999)
+    const screenerSameMatch: SanctionsScreener = {
+      screen: async () => ({
+        matches: [{ type: "name", listed: "ACME CORP", entNum: "999" }],
+        listSource: "OFAC SDN",
+        listLoadedAt: t25,
+      }),
+    };
+
+    // After 25 hours, gate should re-screen but pass because entNum 999 was cleared manually
+    expect(await checkParty(db, screenerSameMatch, "p1", t25)).toBeNull();
+    expect(checks[0].result).toBe("clear");
+
+    // If a brand new match (entNum 1000) appears, party must be held again
+    // Must be at least SCREENING_TTL_MS after the previous check at t25
+    const t26 = new Date(t25.getTime() + SCREENING_TTL_MS + 1000);
+    const screenerNewMatch: SanctionsScreener = {
+      screen: async () => ({
+        matches: [
+          { type: "name", listed: "ACME CORP", entNum: "999" },
+          { type: "name", listed: "OTHER ENTITY", entNum: "1000" },
+        ],
+        listSource: "OFAC SDN",
+        listLoadedAt: t26,
+      }),
+    };
+
+    const hold = await checkParty(db, screenerNewMatch, "p1", t26);
+    expect(hold).toMatchObject({ status: 403, error: expect.stringContaining("needs review") });
+    expect(checks[0].result).toBe("match");
+  });
+
   it("answers 503, not a pass, when the sanctions list cannot be loaded", async () => {
     const { db } = gateDb(approved);
     const broken: SanctionsScreener = { screen: async () => { throw new ScreeningUnavailableError("sanctions list unavailable: down"); } };
