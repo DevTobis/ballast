@@ -216,7 +216,7 @@ pub fn require_admin_or_keeper(env: &Env, caller: &Address) -> Address {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{contract, contractimpl, testutils::Address as _};
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _, IntoVal};
 
     /// Exposes each helper as an entry point so its auth check runs inside a real invocation.
     #[contract]

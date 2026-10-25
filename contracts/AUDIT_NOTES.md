@@ -7,36 +7,11 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 
 | Role | Can | Cannot |
 |---|---|---|
-| `admin` | configure assets, tighten thresholds immediately, queue loosening changes (48h timelock); set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender; loosen guard parameters without 48h timelock |
+| `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral`, `liquidate`, vault `liquidate`, repo `call_margin`/`default_close`, `poke` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
-
-### Admin function delays
-
-PRD §6.2 promises a 48-hour timelock on parameter changes. The actual delay depends on the
-contract:
-
-**Registry**
-
-| Function | Delay | Notes |
-|---|---|---|
-| `register_asset` | immediate | New asset only; no existing positions to protect |
-| `queue_param` / `execute_param` | **48h timelock** | Changes to an existing asset's haircut/band/other params |
-| `cancel_param` | immediate | Removes a pending queued change before it executes |
-| `queue_role_change` / `execute_role_change` | **48h timelock** | Rotates `pauser`, `keeper`, `price_publisher`, or `risk` |
-| `propose_admin` / `accept_admin` | no delay (two-step) | Admin key transfer; requires both current and new admin to sign; no timelock |
-
-**PriceGuard**
-
-| Function | Delay | Notes |
-|---|---|---|
-| `configure_asset` | **immediate** | Sets band, daily-move, window, and staleness thresholds — gap vs. PRD §6.2; see Known limits |
-| `configure_issuer_key` | **immediate** | Registers the Ed25519 public key used to verify NAV signatures — gap vs. PRD §6.2 |
-| `configure_signature_requirement` | **immediate** | Toggles NAV signature enforcement globally — gap vs. PRD §6.2 |
-| `queue_role_change` / `execute_role_change` | **48h timelock** | Rotates `price_publisher`, `pauser`, `keeper`, or `risk` |
-| `propose_admin` / `accept_admin` | no delay (two-step) | Admin key transfer; requires both current and new admin to sign; no timelock |
 
 The keeper is trusted for **timing and completeness**, not for **value**: every amount a settlement
 uses comes from the contract's own state or from the PriceGuard, never from a keeper-supplied number.
@@ -46,15 +21,6 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
   good value is a sticky `Halted` that only `risk` clears.
-- **Threshold loosening and key rotations require a 48h timelock.** Tightening configuration changes
-  (narrowing `band_bps`, `daily_move_band_bps`, `window_move_band_bps`, reducing `max_staleness_s`,
-  lengthening `window_seconds`, registering an initial issuer key, or enabling NAV signature requirement)
-  take effect immediately via `configure_asset`, `configure_issuer_key`, and
-  `configure_signature_requirement`. In contrast, any loosening changes (widening bands, increasing staleness
-  tolerance, shortening the smoothing window), rotating an already-registered issuer public key, or
-  disabling NAV signature requirement cannot be executed directly; they must be queued via `queue_config`
-  by admin, wait out the 48-hour delay (`ballast_common::timelock`), and then be applied permissionlessly
-  via `execute_config`. Admin can cancel queued changes via `cancel_config`.
 - **A rolling reference bounds slow drift over a window.** `daily_move_band_bps` only compares a
   publish against the immediately preceding one, so a publisher (or a bug) moving the price a little
   on every publish could walk it anywhere over an hour without ever tripping a single-step check. The
@@ -83,11 +49,6 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   `propose_admin` / `accept_admin` pair. A publisher rotation preserves `LastGood`, a `Halted` latch,
   asset configs and issuer keys; it does not automatically re-register the NAV attestor key, so
   `configure_issuer_key` must be called too when the publisher is the attestor.
-- **Admin key has no rotation delay.** The `propose_admin` / `accept_admin` handshake is a
-  safety guard against typos — it requires the named successor to accept — but it carries no
-  timelock. A compromised admin key can be replaced immediately with no notice period. Non-admin
-  roles (`price_publisher`, `pauser`, `keeper`, `risk`) do have the 48h queue before the new
-  address takes effect.
 - `max_staleness_s` is per asset; RedStone's RWA feeds update every 1-2 hours, so values under that
   make the guard refuse to lend.
 
@@ -138,25 +99,29 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   contract between transactions.
 - Quotes are the guarded price less the spread, rounded down (in the desk's favour), and refuse any
   price that is not `Ok`.
-- **Pause.** `pause(pauser, scope)` lets the pauser halt `PauseScope::Exits` or `PauseScope::All` immediately.
-  `exit` is the only gated path; `quote` and `withdraw` remain active while paused (invariant 5).
-  Unpausing requires a 48-hour timelock (`queue_unpause` / `execute_unpause`) by the admin.
-  Note for maintainers: `CreditLine` and `PledgeVault` follow this same localized instance-storage pause pattern
-  for `Draws` and `Pledges`.
 
 ## RepoDvP
 
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
   `propose` replaces the first one's allowance.
-- **Borrower leg-2 allowance is additive.** A SEP-41 `approve` replaces the (owner, spender)
-  allowance, and a borrower may hold several settled trades, so `accept_and_settle` approves the
-  sum of the borrower's outstanding leg-2 due ceilings (tracked in contract storage, added on
-  settle, released on `unwind`/`default_close`), with the expiry never shortened below what an
-  earlier trade still needs. Consequences an auditor should know: each ceiling is sized at
-  `proposed_at`, so a trade settled later than proposed leaves a small unconsumed residue in the
-  live allowance until the next settle re-approves the accurate sum or the allowance expires; a
-  defaulted trade's whole unconsumed share behaves the same way, because shrinking the live
-  allowance would need the borrower's own signature.
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
-  deadline
+  deadline, and clears the call when the position is back under the band. `top_up` (borrower)
+  adds collateral and clears the call in the same transaction if that is enough; it is not
+  pause-gated. `margin_view` is a free read.
+- **Default.** `default_close` is keeper-only, needs the cure window to have passed, re-evaluates
+  the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
+  guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the
+  collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
+  No USDC moves on default.
+- Yield on the pledged RWA during the term is not passed through.
+
+## Known limits
+
+- Real RWAs cannot be held by these contracts unless the issuer allows it (`AUTH_REQUIRED`
+  issuers must authorise the vault's trustline). Etherfuse's issuer sets `auth_revocable` and
+  `clawback_enabled`, so it can freeze or claw back tokens held in the vault; price that in.
+- Events use `env.events().publish`, which soroban-sdk deprecates in favour of `#[contractevent]`;
+  moving changes the encoding and needs the indexer and ledger readers updated together.
+- No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
+  scripts in `scripts/` exercise them on testnet.
