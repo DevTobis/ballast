@@ -397,14 +397,28 @@ export async function sweepPendingIntents(
     if (status === "settled") tally.settled++;
     else if (status === "failed") tally.failed++;
     else if (notFound && now - intent.createdAt.getTime() > INTENT_EXPIRY_MS) {
-      const claimed = await db
-        .update(schema.txIntent)
-        .set({ status: "expired", settledAt: new Date(now) })
-        .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
-        .returning();
-      if (claimed.length > 0) {
-        await applyFailure(db, intent);
-        tally.expired++;
+      // The claim and the book update share a transaction, as in `settle`: a crash between them
+      // would otherwise leave the intent `expired` with its line or pledge still `pending`, and
+      // no later sweep would revisit it.
+      const expire = async (txDb: Database): Promise<boolean> => {
+        const claimed = await txDb
+          .update(schema.txIntent)
+          .set({ status: "expired", settledAt: new Date(now) })
+          .where(and(eq(schema.txIntent.txHash, intent.txHash), eq(schema.txIntent.status, "pending")))
+          .returning();
+        if (claimed.length === 0) return false;
+        await applyFailure(txDb, intent);
+        return true;
+      };
+      try {
+        const wroteOff =
+          typeof db.transaction === "function"
+            ? await db.transaction(async (trx) => expire(trx as unknown as Database))
+            : await expire(db);
+        if (wroteOff) tally.expired++;
+      } catch {
+        // Rolled back: the intent is still pending and the next sweep tries again.
+        tally.errors++;
       }
     }
   }
