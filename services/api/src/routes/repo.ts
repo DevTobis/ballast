@@ -4,7 +4,7 @@ import { schema, type Database } from "@ballast/db";
 import { scaledToDecimalString } from "@ballast/domain-types";
 import type { ChainGateway } from "../chain.js";
 import type { ContractClients } from "../contract-clients.js";
-import { recordIntent } from "../intents.js";
+import { recordIntent, withTransaction } from "../intents.js";
 import { repoProposalSchema, repoTopUpSchema, repoTradeActionSchema } from "../schemas.js";
 import { requireAsset, requireStellarAccount } from "./helpers.js";
 
@@ -31,28 +31,31 @@ export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts
       agreementHash: body.agreementHash,
     });
 
-    const [row] = await db
-      .insert(schema.repoTrade)
-      .values({
-        cashLenderId: body.cashLenderId,
-        cashBorrowerId: body.cashBorrowerId,
-        assetId: asset.id,
-        units: scaledToDecimalString(body.units),
-        cashAmount: scaledToDecimalString(body.cashAmount),
-        rateBps: body.rateBps,
-        kind: body.kind,
-        startLedger: 0,
-        maturityAt: new Date(body.maturityAt),
-        agreementHash: body.agreementHash.toString("hex"),
-        status: "proposed",
-      })
-      .returning();
+    const { row, txHash } = await withTransaction(db, async (trx) => {
+      const [row] = await trx
+        .insert(schema.repoTrade)
+        .values({
+          cashLenderId: body.cashLenderId,
+          cashBorrowerId: body.cashBorrowerId,
+          assetId: asset.id,
+          units: scaledToDecimalString(body.units),
+          cashAmount: scaledToDecimalString(body.cashAmount),
+          rateBps: body.rateBps,
+          kind: body.kind,
+          startLedger: 0,
+          maturityAt: new Date(body.maturityAt),
+          agreementHash: body.agreementHash.toString("hex"),
+          status: "proposed",
+        })
+        .returning();
 
-    const txHash = await recordIntent(db, chain, {
-      xdr,
-      kind: "repo.propose",
-      refId: row.id,
-      partyId: request.partyId,
+      const txHash = await recordIntent(trx, chain, {
+        xdr,
+        kind: "repo.propose",
+        refId: row.id,
+        partyId: request.partyId,
+      });
+      return { row, txHash };
     });
     return reply.code(201).send({ xdr, txHash, tradeId: row.id });
   });

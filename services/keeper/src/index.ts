@@ -5,6 +5,7 @@ import { checkOperatorBalance, createConsoleAlerter, createLogger } from "@balla
 import { CreditLineClient, PledgeVaultClient, RepoDvpClient } from "@ballast/contract-clients";
 import { createOperatorSigner } from "@ballast/operator-signing";
 import { executeJobWithLock, PostgresLockProvider, type LockProvider } from "./lock.js";
+import { createJobQueue } from "./jobQueue.js";
 import { runRepoUnwindJob } from "./jobs/repoUnwind.js";
 import { runRepoMarginJob } from "./jobs/repoMargin.js";
 import { runCureExpiryJob } from "./jobs/cureExpiry.js";
@@ -33,12 +34,25 @@ const repoDvpClient = new RepoDvpClient({
 
 // Every job signs with the one keeper account, and a Stellar account's transactions must land in
 // sequence-number order — two jobs building transactions at the same moment would both take the
-// same number and one would be rejected. So jobs queue up behind each other.
+// same number and one would be rejected. So jobs queue up behind each other (see jobQueue.ts, which
+// also drops a tick whose previous run is still going and abandons a job that never settles).
 // Across multiple keeper instances or rolling restarts, a Postgres session-level advisory lock
 // prevents duplicate job execution and sequence conflicts.
-let queue: Promise<void> = Promise.resolve();
 const rawSql = createRawClient();
 const defaultLockProvider = new PostgresLockProvider(rawSql);
+
+// A job still running after this long is abandoned so the queue can move on. A non-numeric or
+// non-positive value falls back to the default rather than firing every job's deadline at once.
+const DEFAULT_JOB_TIMEOUT_MS = 10 * 60 * 1000;
+const configuredTimeout = Number(process.env.KEEPER_JOB_TIMEOUT_MS ?? DEFAULT_JOB_TIMEOUT_MS);
+const JOB_TIMEOUT_MS =
+  Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : DEFAULT_JOB_TIMEOUT_MS;
+
+const jobQueue = createJobQueue({
+  timeoutMs: JOB_TIMEOUT_MS,
+  logger,
+  onTimeout: (job) => alerter.fire("keeper_job_timeout", { job, timeoutMs: JOB_TIMEOUT_MS }),
+});
 
 // Set to true once shutdown is initiated; prevents new ticks from entering the queue.
 let shuttingDown = false;
@@ -52,10 +66,7 @@ export function runJob(
     logger.info({ job: name }, "keeper: shutdown in progress — skipping new job");
     return Promise.resolve();
   }
-  queue = queue.then(async () => {
-    await execute(name, fn, lockProvider);
-  });
-  return queue;
+  return jobQueue.run(name, () => execute(name, fn, lockProvider));
 }
 
 export function execute(
@@ -129,7 +140,7 @@ async function shutdown(signal: string): Promise<void> {
   // 2. Wait for the running job (if any) to finish, bounded by the grace period.
   const gracePeriod = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS));
   const winner = await Promise.race([
-    queue.then(() => "queue" as const),
+    jobQueue.idle().then(() => "queue" as const),
     gracePeriod.then(() => "timeout" as const),
   ]);
 

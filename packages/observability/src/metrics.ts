@@ -34,6 +34,7 @@ export type AlertKind =
   | "reconciliation_break"
   | "event_gap_skipped"
   | "rpc_lag_high"
+  | "keeper_job_timeout"
   | "payout_unbooked";
 
 export interface Alerter {
