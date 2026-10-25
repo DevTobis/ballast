@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { signTransaction } from "@stellar/freighter-api";
 import { api, type BuiltTx, type TxResult } from "../lib/api.ts";
 import { useAuth } from "../lib/auth.tsx";
-import { shortAddress } from "../lib/format.ts";
+import { networkPassphrase, txExplorerUrl } from "../lib/explorer.ts";
 import { Button } from "./Button.tsx";
 
-type Phase = "ready" | "signing" | "submitting" | "pending" | "settled" | "failed";
+type Phase = "ready" | "signing" | "submitting" | "pending" | "settled" | "failed" | "expired";
 
 const PHASE_LABEL: Record<Phase, string> = {
   ready: "UNSIGNED TRANSACTION READY",
@@ -14,6 +14,7 @@ const PHASE_LABEL: Record<Phase, string> = {
   pending: "SUBMITTED / NOT CLOSED YET",
   settled: "SETTLED ON-CHAIN",
   failed: "FAILED ON-CHAIN",
+  expired: "EXPIRED / NEVER SIGNED",
 };
 
 /**
@@ -29,6 +30,10 @@ export function XdrOutput({ tx, onDismiss }: { tx: BuiltTx; onDismiss: () => voi
   const [result, setResult] = useState<TxResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  // The "COPIED" reset must not fire into an unmounted panel.
+  useEffect(() => () => clearTimeout(copyTimer.current), []);
 
   function apply(next: TxResult) {
     setResult(next);
@@ -42,7 +47,7 @@ export function XdrOutput({ tx, onDismiss }: { tx: BuiltTx; onDismiss: () => voi
     try {
       const signed = await signTransaction(tx.xdr, {
         address: session.stellarAccount,
-        networkPassphrase: import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE,
+        networkPassphrase: networkPassphrase(),
       });
       if (signed.error) throw new Error(signed.error.message ?? "wallet declined to sign");
       setPhase("submitting");
@@ -64,13 +69,21 @@ export function XdrOutput({ tx, onDismiss }: { tx: BuiltTx; onDismiss: () => voi
   }
 
   async function copy() {
-    await navigator.clipboard.writeText(tx.xdr);
+    try {
+      await navigator.clipboard.writeText(tx.xdr);
+    } catch {
+      // Clipboard access can be denied (insecure context, permissions); the XDR stays selectable.
+      setError("Could not copy to the clipboard. Select the XDR above and copy it by hand.");
+      return;
+    }
     setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    clearTimeout(copyTimer.current);
+    copyTimer.current = setTimeout(() => setCopied(false), 1500);
   }
 
   const busy = phase === "signing" || phase === "submitting";
-  const tone = phase === "failed" ? "border-accent text-accent" : "border-ok text-ok";
+  const tone = phase === "failed" || phase === "expired" ? "border-accent text-accent" : "border-ok text-ok";
+  const explorerUrl = txExplorerUrl(tx.txHash);
 
   return (
     <div className={`border bg-bg p-3 ${tone.split(" ")[0]}`} aria-live="polite">
@@ -85,8 +98,18 @@ export function XdrOutput({ tx, onDismiss }: { tx: BuiltTx; onDismiss: () => voi
 
       <dl className="mb-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs uppercase tracking-wider">
         <dt className="text-fg-dim">TX</dt>
-        <dd className="truncate text-fg">
-          <samp>{shortAddress(tx.txHash)}</samp>
+        <dd className="break-all text-fg">
+          <samp>{tx.txHash}</samp>
+          {explorerUrl && (
+            <a
+              href={explorerUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="ml-2 text-fg-dim underline hover:text-fg"
+            >
+              view on explorer
+            </a>
+          )}
         </dd>
         {result?.ledger != null && (
           <>
@@ -114,6 +137,7 @@ export function XdrOutput({ tx, onDismiss }: { tx: BuiltTx; onDismiss: () => voi
         <p className="text-xs text-fg-dim">
           {phase === "settled" && "Books updated. Dismiss to refresh positions."}
           {phase === "failed" && "The network rejected this transaction; nothing moved."}
+          {phase === "expired" && "This transaction was never signed in time; nothing moved. Build it again."}
           {phase === "pending" && "Sent, but no verdict yet. Check again in a few seconds."}
           {(phase === "ready" || busy) && "Signed in your wallet. Your key never reaches Ballast."}
         </p>
@@ -125,7 +149,9 @@ export function XdrOutput({ tx, onDismiss }: { tx: BuiltTx; onDismiss: () => voi
             </Button>
           )}
           {phase === "pending" && <Button onClick={recheck}>CHECK STATUS</Button>}
-          {(phase === "settled" || phase === "failed") && <Button onClick={onDismiss}>DONE</Button>}
+          {(phase === "settled" || phase === "failed" || phase === "expired") && (
+            <Button onClick={onDismiss}>DONE</Button>
+          )}
         </div>
       </div>
     </div>

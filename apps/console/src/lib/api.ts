@@ -1,3 +1,5 @@
+import { notifyUnauthorized } from "./unauthorized.ts";
+
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 
 export class ApiError extends Error {
@@ -21,6 +23,10 @@ async function request<T>(path: string, token: string | null, init?: RequestInit
     },
   });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401 && token) {
+    notifyUnauthorized();
+    throw new ApiError(401, "Your session expired. Log in again.", body);
+  }
   if (!res.ok) {
     throw new ApiError(res.status, body.error ?? body.message ?? `request to ${path} failed with ${res.status}`, body);
   }
@@ -235,7 +241,7 @@ export interface TxResult {
   txHash: string;
   kind: string;
   refId: string | null;
-  status: "pending" | "settled" | "failed";
+  status: "pending" | "settled" | "failed" | "expired";
   ledger: number | null;
 }
 

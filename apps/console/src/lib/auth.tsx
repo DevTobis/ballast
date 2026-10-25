@@ -1,6 +1,8 @@
-import { createContext, useContext, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { requestAccess, signTransaction } from "@stellar/freighter-api";
 import { api } from "./api.ts";
+import { setUnauthorizedHandler } from "./unauthorized.ts";
+import { networkPassphrase } from "./explorer.ts";
 
 interface Session {
   token: string;
@@ -20,19 +22,49 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 const STORAGE_KEY = "ballast.console.session";
 
+/**
+ * The stored value is user-writable and its shape can change between releases, so it is checked
+ * before use: anything that is not three non-empty strings is discarded rather than rendered.
+ */
+export function parseSession(raw: string): Session | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (typeof value !== "object" || value === null) return null;
+    const { token, partyId, stellarAccount } = value as Record<string, unknown>;
+    if (
+      typeof token !== "string" || !token ||
+      typeof partyId !== "string" || !partyId ||
+      typeof stellarAccount !== "string" || !stellarAccount
+    ) {
+      return null;
+    }
+    return { token, partyId, stellarAccount };
+  } catch {
+    return null;
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    try {
-      return JSON.parse(raw);
-    } catch {
-      localStorage.removeItem(STORAGE_KEY);
-      return null;
-    }
+    const restored = parseSession(raw);
+    if (!restored) localStorage.removeItem(STORAGE_KEY);
+    return restored;
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // A 401 on any authenticated call means the token lapsed: drop the session so the shell sends
+  // the user back to the login page instead of every panel failing with a raw error.
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setSession(null);
+      localStorage.removeItem(STORAGE_KEY);
+      setError("Your session expired. Log in again.");
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
 
   /**
    * Real SEP-10 flow: connect Freighter for the account -> fetch a challenge transaction ->
@@ -52,7 +84,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       const signed = await signTransaction(transaction, {
         address: stellarAccount,
-        networkPassphrase: import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE,
+        networkPassphrase: networkPassphrase(),
       });
       if (signed.error) throw new Error(signed.error.message);
 
