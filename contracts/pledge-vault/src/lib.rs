@@ -78,6 +78,7 @@ pub trait PriceGuardInterface {
 #[contractclient(name = "CreditLineClient")]
 pub trait CreditLineInterface {
     fn ltv(env: Env, line: u64) -> LtvView;
+    fn debt_of(env: Env, line: u64) -> i128;
     fn borrower_of(env: Env, line: u64) -> Address;
     fn asset_of(env: Env, line: u64) -> Address;
     fn sync_from_vault(env: Env, vault: Address, line: u64, asset: Address, units: i128);
@@ -352,24 +353,30 @@ impl PledgeVault {
             "pledge-vault: release exceeds pledged units"
         );
 
-        let guarded: GuardedPrice =
-            PriceGuardClient::new(&env, &config.price_guard).guarded_price(&asset);
-        assert!(
-            guarded.is_usable_for_new_risk(),
-            "pledge-vault: price status is not Ok"
-        );
-
-        let ltv_view: LtvView = CreditLineClient::new(&env, &config.credit_line).ltv(&line);
-
         let remaining_units = position.units - units;
-        let new_collateral_value =
-            risk::collateral_value(remaining_units, guarded.value, config.haircut_bps);
-        let new_ltv_bps = risk::ltv_bps(ltv_view.debt, new_collateral_value);
-        let state = margin::classify(new_ltv_bps, &config.thresholds);
-        assert!(
-            matches!(state, MarginState::Healthy | MarginState::Warning),
-            "pledge-vault: release would leave the credit line unhealthy"
-        );
+
+        // With nothing owed there is no risk to price, so a degraded or halted price must not
+        // trap collateral (PRD invariant 5: exits that reduce risk cannot depend on conditions the
+        // borrower does not control). Any debt keeps the full price and LTV check.
+        if CreditLineClient::new(&env, &config.credit_line).debt_of(&line) > 0 {
+            let guarded: GuardedPrice =
+                PriceGuardClient::new(&env, &config.price_guard).guarded_price(&asset);
+            assert!(
+                guarded.is_usable_for_new_risk(),
+                "pledge-vault: price status is not Ok"
+            );
+
+            let ltv_view: LtvView = CreditLineClient::new(&env, &config.credit_line).ltv(&line);
+
+            let new_collateral_value =
+                risk::collateral_value(remaining_units, guarded.value, config.haircut_bps);
+            let new_ltv_bps = risk::ltv_bps(ltv_view.debt, new_collateral_value);
+            let state = margin::classify(new_ltv_bps, &config.thresholds);
+            assert!(
+                matches!(state, MarginState::Healthy | MarginState::Warning),
+                "pledge-vault: release would leave the credit line unhealthy"
+            );
+        }
 
         if position.mode == CustodyMode::Escrow {
             let token_client = token::Client::new(&env, &asset);
@@ -614,6 +621,10 @@ mod test {
                 env.storage().instance().set(&DataKey::Borrower, &borrower);
             }
 
+            pub fn debt_of(env: Env, _line: u64) -> i128 {
+                env.storage().instance().get(&DataKey::Debt).unwrap_or(0)
+            }
+
             pub fn ltv(env: Env, _line: u64) -> LtvView {
                 let debt: i128 = env.storage().instance().get(&DataKey::Debt).unwrap_or(0);
                 LtvView {
@@ -779,6 +790,42 @@ mod test {
         // liquidation (>9000 bps) -> must panic.
         h.vault
             .release(&h.borrower, &1, &h.asset, &(950 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn release_with_no_debt_works_on_a_degraded_price() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Degraded);
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 0);
+        assert_eq!(h.token.balance(&h.borrower), 1_000 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn release_with_no_debt_works_on_a_halted_price() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Halted);
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: price status is not Ok")]
+    fn release_with_debt_still_needs_a_usable_price() {
+        let h = setup(500, 100 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Degraded);
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
     }
 
     #[test]

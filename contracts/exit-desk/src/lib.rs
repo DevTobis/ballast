@@ -205,9 +205,10 @@ impl ExitDesk {
         desk_inventory_cap: i128,
     ) {
         require_admin_is(&env, &admin);
+        // A 100% spread makes every exit pay nothing, which is a misconfiguration, not a price.
         assert!(
-            spread_bps as i128 <= BPS_DENOMINATOR,
-            "exit-desk: spread exceeds 100%"
+            (spread_bps as i128) < BPS_DENOMINATOR,
+            "exit-desk: spread must be below 100%"
         );
         assert!(
             per_holder_daily_cap > 0,
@@ -352,6 +353,13 @@ impl ExitDesk {
         pause::require_not_paused(&env, &PauseScope::Exits);
 
         let quote = compute_quote(&env, &asset, units);
+        // Rounding is a floor, so a dust amount quotes (as a read) to zero. Taking the holder's
+        // RWA for nothing, while using up their daily cap and the desk's inventory room, is never
+        // what a caller meant, whatever `min_usdc_out` they passed.
+        assert!(
+            quote.usdc_out > 0,
+            "exit-desk: usdc_out is zero, amount too small to exit"
+        );
         if quote.usdc_out < min_usdc_out {
             panic!("exit-desk: usdc_out below min_usdc_out (slippage)");
         }

@@ -295,6 +295,45 @@ fn exit_panics_on_slippage() {
 }
 
 #[test]
+#[should_panic(expected = "exit-desk: usdc_out is zero")]
+fn exit_rejects_a_dust_amount_that_would_pay_zero() {
+    let h = setup();
+    configure(&h, 25, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let holder = Address::generate(&h.env);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &1);
+
+    // One stroop at a 25 bps spread floors to a zero payout, and min_usdc_out = 0 allows it.
+    ExitDeskClient::new(&h.env, &h.desk).exit(&holder, &h.rwa, &1, &0, &holder);
+}
+
+#[test]
+fn quote_for_a_dust_amount_still_returns_zero_as_a_read() {
+    let h = setup();
+    configure(&h, 25, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+
+    let quote = ExitDeskClient::new(&h.env, &h.desk).quote(&h.rwa, &1);
+
+    assert_eq!(quote.usdc_out, 0);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: spread must be below 100%")]
+fn configure_asset_rejects_a_full_spread() {
+    let h = setup();
+    configure(&h, 10_000, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+}
+
+#[test]
+fn configure_asset_accepts_the_largest_spread_below_100_percent() {
+    let h = setup();
+    configure(&h, 9_999, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+}
+
+#[test]
 fn the_admin_can_take_the_usdc_float_back_out() {
     let h = setup();
     configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
