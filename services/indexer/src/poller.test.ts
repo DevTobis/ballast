@@ -327,6 +327,29 @@ describe("pollOnce", () => {
     expect(result.skippedTo).toBe(1199);
     expect(result.scannedUpTo).toBe(5000);
   });
+
+  it("records the lost ledger range in chain_event_gap", async () => {
+    const inserted: unknown[] = [];
+    const db = fakeDb({ lastLedger: 1000, inserted });
+    const rpc = fakeRpc({
+      getHealth: vi
+        .fn()
+        .mockResolvedValue({ latestLedger: 5000, oldestLedger: 1200, ledgerRetentionWindow: 120960 }),
+    });
+
+    await pollOnce(db, rpc, ["CCONTRACT1"]);
+
+    expect(inserted).toEqual([{ fromLedger: 1001, toLedger: 1199 }]);
+  });
+
+  it("records no gap when the resume cursor is still within RPC retention", async () => {
+    const inserted: unknown[] = [];
+    const db = fakeDb({ lastLedger: 1000, inserted });
+
+    await pollOnce(db, fakeRpc(), ["CCONTRACT1"]);
+
+    expect(inserted).toEqual([]);
+  });
 });
 
 describe("computeRpcLag", () => {

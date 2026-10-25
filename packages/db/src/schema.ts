@@ -355,6 +355,22 @@ export const chainEvent = pgTable(
   (t) => [uniqueIndex("chain_event_event_id_uq").on(t.eventId)],
 );
 
+/**
+ * A detected gap in indexed ledgers (e.g. after an outage exceeding RPC retention).
+ * Stores the range of lost ledgers so a future backfill from the S3 data lake knows what to fetch.
+ */
+export const chainEventGap = pgTable(
+  "chain_event_gap",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    fromLedger: integer("from_ledger").notNull(),
+    toLedger: integer("to_ledger").notNull(),
+    detectedAt: timestamp("detected_at", { withTimezone: true }).notNull().defaultNow(),
+    status: text("status").notNull().default("open"),
+  },
+  (t) => [uniqueIndex("chain_event_gap_range_uq").on(t.fromLedger, t.toLedger)],
+);
+
 /** Scanned-up-to cursor for the event indexer so quiet periods do not re-request already-scanned ledgers. */
 export const indexerCursor = pgTable("indexer_cursor", {
   id: text("id").primaryKey(),

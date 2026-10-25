@@ -124,7 +124,8 @@ export function computeRpcLag(
  * The resume cursor can fall outside the RPC's retention window when the indexer has been idle
  * longer than the node keeps history. `getEvents` rejects that `startLedger` outright, so the
  * cursor would never advance. We clamp it to the oldest ledger the node still has and report the
- * skipped range; those events are gone and the caller must surface the gap.
+ * skipped range and record it in `chain_event_gap`; those events are gone and the caller must
+ * surface the gap.
  */
 export async function pollOnce(
   db: Database,
@@ -156,6 +157,12 @@ export async function pollOnce(
       from: String(skippedFrom),
       to: String(skippedTo),
     });
+    // Keep the lost range for a later backfill from the data lake. The unique range index makes a
+    // retried cycle (e.g. `getEvents` failing after this point) record it only once.
+    await db
+      .insert(schema.chainEventGap)
+      .values({ fromLedger: skippedFrom, toLedger: skippedTo })
+      .onConflictDoNothing();
   }
 
   // Drain every page before returning. The next poll resumes from `max(ledger) + 1`, so stopping
