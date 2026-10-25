@@ -115,8 +115,8 @@ pub fn propose_admin(env: &Env, new_admin: &Address) {
 }
 
 /// Step 2 of a two-step admin transfer: the proposed successor accepts. Consumes the proposal, so
-/// it cannot be replayed after the transfer. The current admin must also authorize, so a transfer
-/// needs both signatures.
+/// it cannot be replayed after the transfer. The current admin already signed in `propose_admin`,
+/// so a transfer needs both signatures.
 pub fn accept_admin(env: &Env) {
     let pending: PendingAdmin = env
         .storage()
@@ -126,7 +126,6 @@ pub fn accept_admin(env: &Env) {
     pending.new_admin.require_auth();
 
     let mut roles = read_roles(env);
-    roles.admin.require_auth();
     roles.admin = pending.new_admin;
     write_roles(env, &roles);
     env.storage().instance().remove(&RolesKey::PendingAdmin);
@@ -353,11 +352,11 @@ mod test {
 
     #[test]
     #[should_panic]
-    fn accept_admin_without_current_admin_auth_fails() {
+    fn propose_admin_without_current_admin_auth_fails() {
         let env = Env::default();
         let (client, _roles) = setup(&env);
         let new_admin = Address::generate(&env);
-        // Only the proposed successor authorizes; the current admin does not.
+        // Only the proposed successor authorizes; the current admin does not, so propose fails.
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
             address: &new_admin,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
