@@ -12,28 +12,61 @@ import { Panel } from "../components/Panel.tsx";
 import { Button } from "../components/Button.tsx";
 import { MarginBadge, PriceStatusBadge } from "../components/StatusBadge.tsx";
 import { XdrOutput } from "../components/XdrOutput.tsx";
-import { bpsToPercent, formatDecimalString, formatScaledBigintString, toScaled } from "../lib/format.ts";
+import { usePolling } from "../lib/usePolling.ts";
+import {
+  bpsToPercent,
+  formatDecimalString,
+  formatDuration,
+  formatScaledBigintString,
+  toScaled,
+} from "../lib/format.ts";
+
+/** Riskiest first, so the line that needs attention is the one at the top of the list. */
+const RISK_ORDER: Record<CreditLineDetail["marginState"], number> = {
+  Liquidation: 0,
+  MarginCall: 1,
+  Warning: 2,
+  Healthy: 3,
+};
+
+/** How often open positions refresh on their own. */
+const REFRESH_MS = 15_000;
 
 export function BorrowerView() {
   const { session } = useAuth();
   const [positions, setPositions] = useState<PositionsResult | null>(null);
   const [details, setDetails] = useState<Record<string, CreditLineDetail>>({});
   const [assets, setAssets] = useState<AssetSummary[]>([]);
+  const [lineErrors, setLineErrors] = useState<Record<string, string>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function reload() {
+  // `silent` refreshes in the background without flashing the loading state over the list.
+  async function reload(silent = false) {
     if (!session) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const pos = await api.positions(session.token, session.partyId);
       setPositions(pos);
       const mine = pos.creditLines.filter((l) => l.borrowerId === session.partyId);
-      const entries = await Promise.all(mine.map((l) => api.creditLine(session.token, l.id)));
-      setDetails(Object.fromEntries(entries.map((d) => [d.id, d])));
+      // One bad line must not hide the detail of every other line.
+      const results = await Promise.allSettled(mine.map((l) => api.creditLine(session.token, l.id)));
+      const loaded: Record<string, CreditLineDetail> = {};
+      const failed: Record<string, string> = {};
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") loaded[r.value.id] = r.value;
+        else failed[mine[i].id] = r.reason instanceof Error ? r.reason.message : "could not load";
+      });
+      // A line whose refresh failed keeps its last good detail rather than blanking.
+      setDetails((prev) => ({
+        ...Object.fromEntries(Object.entries(prev).filter(([id]) => id in failed)),
+        ...loaded,
+      }));
+      setLineErrors(failed);
       const { assets } = await api.assets(session.token);
       setAssets(assets);
+      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "failed to load positions");
     } finally {
@@ -46,8 +79,14 @@ export function BorrowerView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.partyId]);
 
+  usePolling(() => reload(true), REFRESH_MS, Boolean(session));
+
   if (!session) return null;
-  const myLines = positions?.creditLines.filter((l) => l.borrowerId === session.partyId) ?? [];
+  const myLines = [...(positions?.creditLines.filter((l) => l.borrowerId === session.partyId) ?? [])].sort(
+    (a, b) =>
+      (details[a.id] ? RISK_ORDER[details[a.id].marginState] : 4) -
+      (details[b.id] ? RISK_ORDER[details[b.id].marginState] : 4),
+  );
   const myPledges = positions?.pledges ?? [];
   const selected = selectedId ? details[selectedId] : null;
 
@@ -62,19 +101,33 @@ export function BorrowerView() {
         <div className="flex flex-col divide-y divide-line">
           {myLines.map((line) => {
             const d = details[line.id];
+            const failure = lineErrors[line.id];
             return (
-              <button
-                key={line.id}
-                onClick={() => setSelectedId(line.id)}
-                className={`flex items-center justify-between py-2 text-left text-xs hover:text-fg ${
-                  selectedId === line.id ? "text-fg" : "text-fg-dim"
-                }`}
-              >
-                <span>
-                  LINE / {line.id.slice(0, 8)} <span className="text-fg-dim">{line.loanCcy}</span>
-                </span>
-                {d ? <MarginBadge state={d.marginState} /> : <span>...</span>}
-              </button>
+              <div key={line.id} className="flex items-center justify-between gap-2">
+                <button
+                  onClick={() => setSelectedId(line.id)}
+                  className={`flex flex-1 items-center justify-between gap-3 py-2 text-left text-xs hover:text-fg ${
+                    selectedId === line.id ? "text-fg" : "text-fg-dim"
+                  }`}
+                >
+                  <span>
+                    LINE / {line.id.slice(0, 8)} <span className="text-fg-dim">{line.loanCcy}</span>
+                    {d && (
+                      <span className="ml-2 text-fg-dim">
+                        {formatScaledBigintString(d.drawn)} / {formatScaledBigintString(d.limit)} / LTV{" "}
+                        {bpsToPercent(d.ltvBps)}
+                      </span>
+                    )}
+                  </span>
+                  {d ? <MarginBadge state={d.marginState} /> : failure ? null : <span>...</span>}
+                </button>
+                {failure && (
+                  <span className="flex items-center gap-2 text-xs text-accent">
+                    could not load
+                    <Button onClick={() => reload()}>Retry</Button>
+                  </span>
+                )}
+              </div>
             );
           })}
         </div>
@@ -113,12 +166,18 @@ function BorrowerLineDetail({
   const [drawAmount, setDrawAmount] = useState("");
   const [drawTo, setDrawTo] = useState(session?.stellarAccount ?? "");
   const [repayAmount, setRepayAmount] = useState("");
-  const [pledgeAssetId, setPledgeAssetId] = useState(assets[0]?.id ?? "");
+  // Assets can arrive after this panel mounts, so the default is derived rather than copied into state.
+  const [chosenAssetId, setChosenAssetId] = useState("");
+  const pledgeAssetId = chosenAssetId || assets[0]?.id || "";
   const [pledgeUnits, setPledgeUnits] = useState("");
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Distance to 100% LTV, the point where debt equals collateral value. The healthy threshold is
+  // set per asset on-chain and is not part of this response, so it is not claimed here.
   const headroom = 10_000 - detail.ltvBps;
+  // A second built transaction would replace the one still waiting for a signature or a verdict.
+  const txOpen = tx !== null;
 
   async function withBusy(fn: () => Promise<void>) {
     setBusy(true);
@@ -145,7 +204,7 @@ function BorrowerLineDetail({
           </div>
         </div>
         <p className="mt-3 text-xs text-fg-dim">
-          Headroom before the healthy threshold: <span className="text-fg">{bpsToPercent(Math.max(headroom, 0))}</span>
+          Headroom to 100% LTV: <span className="text-fg">{bpsToPercent(Math.max(headroom, 0))}</span>
         </p>
         <div className="mt-3 grid grid-cols-2 gap-3 border-t border-line pt-3 text-xs sm:grid-cols-4">
           <Stat
@@ -160,6 +219,11 @@ function BorrowerLineDetail({
             <div className="text-fg-dim uppercase tracking-wider">Oracle</div>
             {detail.priceStatus ? <PriceStatusBadge status={detail.priceStatus} /> : <span className="text-fg-dim">--</span>}
           </div>
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-3 border-t border-line pt-3 text-xs sm:grid-cols-4">
+          <Stat label="APR" value={bpsToPercent(detail.rateBps)} />
+          <Stat label="Fee" value={bpsToPercent(detail.feeBps)} />
+          <Stat label="Cure window" value={formatDuration(detail.cureWindowS)} />
         </div>
         {!detail.contractLineId && (
           <p className="mt-3 text-xs text-fg-dim">
@@ -183,7 +247,7 @@ function BorrowerLineDetail({
             className="flex-1 border border-line bg-bg px-2 py-1.5 text-xs outline-none focus:border-fg"
           />
           <Button
-            disabled={busy || !drawAmount || !drawTo}
+            disabled={busy || txOpen || !drawAmount || !drawTo}
             onClick={() =>
               withBusy(async () => {
                 if (!session) return;
@@ -206,7 +270,7 @@ function BorrowerLineDetail({
             className="flex-1 border border-line bg-bg px-2 py-1.5 text-xs outline-none focus:border-fg"
           />
           <Button
-            disabled={busy || !repayAmount}
+            disabled={busy || txOpen || !repayAmount}
             onClick={() =>
               withBusy(async () => {
                 if (!session) return;
@@ -224,7 +288,7 @@ function BorrowerLineDetail({
         <div className="flex flex-col gap-2 sm:flex-row">
           <select
             value={pledgeAssetId}
-            onChange={(e) => setPledgeAssetId(e.target.value)}
+            onChange={(e) => setChosenAssetId(e.target.value)}
             className="border border-line bg-bg px-2 py-1.5 text-xs outline-none focus:border-fg"
           >
             {assets.map((a) => (
@@ -240,7 +304,7 @@ function BorrowerLineDetail({
             className="flex-1 border border-line bg-bg px-2 py-1.5 text-xs outline-none focus:border-fg"
           />
           <Button
-            disabled={busy || !pledgeUnits || !pledgeAssetId}
+            disabled={busy || txOpen || !pledgeUnits || !pledgeAssetId}
             onClick={() =>
               withBusy(async () => {
                 if (!session) return;
@@ -267,7 +331,7 @@ function BorrowerLineDetail({
                   {p.status} / {formatDecimalString(p.units)} units
                 </span>
                 <Button
-                  disabled={busy || p.status !== "active"}
+                  disabled={busy || txOpen || p.status !== "active"}
                   onClick={() =>
                     withBusy(async () => {
                       if (!session) return;
@@ -285,6 +349,9 @@ function BorrowerLineDetail({
       </Panel>
 
       {actionError && <p className="text-xs text-accent">ERROR: {actionError}</p>}
+      {txOpen && (
+        <p className="text-xs text-fg-dim">Finish or dismiss the open transaction below before building another.</p>
+      )}
       {tx && (
         <XdrOutput
           key={tx.txHash}
