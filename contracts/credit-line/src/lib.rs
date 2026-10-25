@@ -521,7 +521,12 @@ impl CreditLine {
 
     /// PRD §8 invariant 5 ("pausing cannot move funds"): deliberately *not* gated by
     /// `require_not_paused` — repayment must always work while `Draws` (or any scope) is paused.
-    pub fn repay(env: Env, payer: Address, line: u64, amount: i128) {
+    ///
+    /// `amount` is a cap: `min(amount, owed)` is applied (interest first, then principal) and
+    /// only that is transferred. It returns the amount applied. A borrower who wants to clear the
+    /// line signs a figure at or above the debt and interest accrued before inclusion cannot strand
+    /// dust or make the call panic.
+    pub fn repay(env: Env, payer: Address, line: u64, amount: i128) -> i128 {
         ttl::extend_instance(&env);
         payer.require_auth();
         assert!(amount > 0, "credit-line: amount must be positive");
@@ -532,7 +537,14 @@ impl CreditLine {
         state.accrued_interest += interest_delta(&state, now);
         state.last_accrual_ts = now;
 
-        let mut remaining = amount;
+        // `amount` is a cap, not an exact figure: the borrower signs it some time before the
+        // ledger closes, and interest keeps accruing in between. Applying `min(amount, owed)`
+        // lets "pay everything, up to X" clear a line instead of leaving dust or panicking.
+        let owed = state.accrued_interest + state.drawn;
+        assert!(owed > 0, "credit-line: nothing owed");
+        let applied = amount.min(owed);
+
+        let mut remaining = applied;
         let pay_interest = remaining.min(state.accrued_interest);
         state.accrued_interest -= pay_interest;
         remaining -= pay_interest;
@@ -543,20 +555,19 @@ impl CreditLine {
         state.drawn -= pay_principal;
         remaining -= pay_principal;
 
-        assert_eq!(remaining, 0, "credit-line: repayment exceeds amount owed");
+        assert_eq!(remaining, 0, "credit-line: repayment bookkeeping mismatch");
 
         let config = read_asset_config(&env, &state.asset);
         token::Client::new(&env, &config.usdc).transfer(
             &payer,
             muxed(&env.current_contract_address()),
-            &amount,
+            &applied,
         );
 
         write_line(&env, line, &state);
+        applied
     }
 
-    /// Pure read (no auth): PRD §8 `{ debt, collateral_value, ltv_bps, state, price_status }`.
-    /// This is what `PledgeVault::release` cross-calls.
     pub fn ltv(env: Env, line: u64) -> LtvView {
         ttl::extend_instance(&env);
         let state = read_line(&env, line);
@@ -775,6 +786,16 @@ impl CreditLine {
     pub fn line(env: Env, line: u64) -> Line {
         ttl::extend_instance(&env);
         read_line(&env, line)
+    }
+
+    /// What the borrower owes right now: principal plus interest accrued to this ledger. Unlike
+    /// `ltv` it reads no price, so a caller that only needs to know whether anything is owed (the
+    /// vault, deciding whether a release puts anything at risk) cannot be blocked by a degraded or
+    /// halted price feed.
+    pub fn debt_of(env: Env, line: u64) -> i128 {
+        ttl::extend_instance(&env);
+        let state = read_line(&env, line);
+        state.drawn + state.accrued_interest + interest_delta(&state, env.ledger().timestamp())
     }
 
     /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
@@ -1159,6 +1180,49 @@ mod test {
         // Principal is untouched: the full 1,000 is still undrawn and withdrawable.
         h.credit_line.withdraw_undrawn(&h.lender, &id, &(1_000 * PRICE_SCALE));
         assert_eq!(h.token.balance(&h.credit_line.address), 0);
+    }
+
+    #[test]
+    fn repay_applies_only_what_is_owed_when_amount_is_larger() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        // One year at 10% on 500 is 50 of interest, so 550 is owed.
+        h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(100 * PRICE_SCALE));
+        let before = h.token.balance(&h.borrower);
+
+        let applied = h.credit_line.repay(&h.borrower, &id, &(1_000 * PRICE_SCALE));
+
+        assert_eq!(applied, 550 * PRICE_SCALE);
+        assert_eq!(before - h.token.balance(&h.borrower), 550 * PRICE_SCALE);
+        let after = h.credit_line.line(&id);
+        assert_eq!(after.drawn, 0);
+        assert_eq!(after.accrued_interest, 0);
+        assert_eq!(h.credit_line.claimable_interest(&id), 50 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn repay_of_an_exact_amount_still_applies_in_full() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        let applied = h.credit_line.repay(&h.borrower, &id, &(200 * PRICE_SCALE));
+
+        assert_eq!(applied, 200 * PRICE_SCALE);
+        assert_eq!(h.credit_line.line(&id).drawn, 300 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: nothing owed")]
+    fn repay_on_a_cleared_line_is_rejected() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.repay(&h.borrower, &id, &(1 * PRICE_SCALE));
     }
 
     #[test]

@@ -210,7 +210,8 @@ All events are emitted during the transaction that executes the state transition
 | Zero/Negative amount | `"exit-desk: amount must be positive"` | `fund` or `withdraw` called with `amount <= 0`. |
 | Unconfigured asset | `"exit-desk: asset not configured"` | Asset was not initialized via `configure_asset`. |
 | Bad Price Status | `"exit-desk: price is not Ok, refusing to quote"` | PriceGuard returned `Degraded` or `Halted`. |
-| Excessive Spread | `"exit-desk: spread exceeds 100%"` | Configured `spread_bps > 10_000`. |
+| Excessive Spread | `"exit-desk: spread must be below 100%"` | Configured `spread_bps >= 10_000`. |
+| Zero payout | `"exit-desk: usdc_out is zero, amount too small to exit"` | `exit` for an amount whose floored payout is `0`. `quote` still returns, with `usdc_out = 0`. |
 | Cap validation | `"...cap must be positive"` | Daily or inventory cap configured with value `0`. |
 | Token mismatch | `"exit-desk: usdc address mismatch"` | Subsequent `fund` calls used a different USDC token. |
 | Unfunded USDC | `"exit-desk: usdc not funded/configured yet"` | `exit` called before `fund` configured the USDC token. |
