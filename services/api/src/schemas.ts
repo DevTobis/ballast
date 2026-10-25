@@ -123,7 +123,8 @@ export const exitQuoteRequestSchema = z.object({
 });
 
 export const exitExecuteSchema = z.object({
-  minUsdcOut: positiveAmount,
+  // Optional: omitted means "no worse than the quote". See `EXIT_MIN_OUT_FLOOR_BPS` in routes/exit.ts.
+  minUsdcOut: positiveAmount.optional(),
   to: z.string(),
 });
 

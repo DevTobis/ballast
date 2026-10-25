@@ -186,7 +186,7 @@ Decimal strings appear only where routes return raw database rows without going 
 | Endpoint | Request Amount(s) | Internal Handling | Response Amount(s) & Format |
 | --- | --- | --- | --- |
 | `POST /v1/exit/quotes` | `units` (`bigintish`, scaled) | Passed to contract quote call; on-chain `price` and `usdcOut` returned as `BigInt`; all stored via `scaledToDecimalString` | `units`, `price`, `usdcOut` (scaled-integer strings via `decimalStringToScaled`); `spreadBps` (bps); `expiresAt` (ISO date) |
-| `POST /v1/exit/quotes/:id/execute` | `minUsdcOut` (`bigintish`, scaled), `to` (address) | Passed to contract as `BigInt`; stored `quote.units` converted via `decimalStringToScaled`; `minUsdcOut.toString()` in audit log | `xdr`, `txHash`, `quoteId` (no monetary fields) |
+| `POST /v1/exit/quotes/:id/execute` | `minUsdcOut` (`bigintish`, scaled, optional: defaults to the quoted payout; below 99% of it is a 400), `to` (address). A second execute while one is pending for the quote is a 409. | Passed to contract as `BigInt`; stored `quote.units` converted via `decimalStringToScaled`; `minUsdcOut.toString()` in audit log | `xdr`, `txHash`, `quoteId` (no monetary fields) |
 
 ### Repo endpoints
 

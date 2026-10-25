@@ -61,6 +61,7 @@ repo-unwind and repo-margin schedules to every minute for local work.
 - `KEEPER_SYNC_COLLATERAL_CRON`, `KEEPER_CURE_EXPIRY_CRON`, `KEEPER_REPO_UNWIND_CRON`,
   `KEEPER_REPO_MARGIN_CRON`, `KEEPER_INTEREST_ACCRUAL_CRON`, `KEEPER_BALANCE_CRON`: cron overrides.
 - `ALERT_WEBHOOK_URL`, `ALERT_COOLDOWN_S`, `OPERATOR_MIN_XLM`: low-balance alert delivery and threshold.
+- `KEEPER_JOB_TIMEOUT_MS` (default `600000`, 10 minutes): a job still running after this long is abandoned, an error is logged and a `keeper_job_timeout` alert fires, so a stalled RPC or Vault connection cannot hold up every later job (liquidation included). The abandoned promise is ignored if it settles later. A non-numeric or non-positive value falls back to the default. A tick whose previous run of the same job is still queued or running is skipped and logged (`skipped, previous run still in progress`) rather than queued again.
 - `KEEPER_SHUTDOWN_GRACE_MS` (default `60000`): milliseconds to wait for the in-flight job to finish after SIGTERM/SIGINT before closing the DB and exiting. The `stop_grace_period` in `deploy/docker-compose.prod.yml` is set to 70 s to comfortably exceed this default.
 
 ## Source map

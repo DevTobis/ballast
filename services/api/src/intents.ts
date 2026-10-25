@@ -38,6 +38,18 @@ export interface IntentArgs {
 
 type IntentRow = typeof schema.txIntent.$inferSelect;
 
+/**
+ * Runs `fn` in one database transaction when the handle supports it, so a route that creates or
+ * flips a business row and then records its intent either does both or neither. A pending row with
+ * no intent behind it is never settled, expired or cleaned up: it stays in `/v1/positions` forever.
+ */
+export async function withTransaction<T>(db: Database, fn: (trx: Database) => Promise<T>): Promise<T> {
+  if (typeof db.transaction === "function") {
+    return db.transaction(async (trx) => fn(trx as unknown as Database));
+  }
+  return fn(db);
+}
+
 export async function recordIntent(db: Database, chain: ChainGateway, args: IntentArgs): Promise<string> {
   const txHash = chain.txHash(args.xdr);
   await db.insert(schema.txIntent).values({
@@ -113,7 +125,10 @@ async function applySuccess(
           .set({
             proceeds: scaledToDecimalString(BigInt(record.recovered)),
             shortfall: scaledToDecimalString(BigInt(record.shortfall)),
-            txHashes: [...(liquidation.txHashes ?? []), intent.txHash],
+            // Idempotent: a retried settlement must not list the same hash twice.
+            txHashes: (liquidation.txHashes ?? []).includes(intent.txHash)
+              ? (liquidation.txHashes ?? [])
+              : [...(liquidation.txHashes ?? []), intent.txHash],
             completedAt: new Date(),
           })
           .where(eq(schema.liquidation.id, liquidation.id));
