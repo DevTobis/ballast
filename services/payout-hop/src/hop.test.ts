@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Account, Keypair, MemoID, MemoText, Networks, type Transaction } from "@stellar/stellar-sdk";
+import { Param, SQL } from "drizzle-orm";
 import { schema } from "@ballast/db";
+import type { Alerter } from "@ballast/observability";
 import {
   DuplicatePayoutError,
   PayoutRefusedError,
@@ -9,13 +11,21 @@ import {
   type ForwardPayoutArgs,
   type PayoutPolicy,
 } from "./hop.js";
+import { bookPendingPayouts } from "./repair.js";
 import type { PayoutSigner } from "./signer.js";
+import {
+  FirstLegRefusedError,
+  FirstLegUnavailableError,
+  type FirstLegExpectation,
+  type FirstLegVerifier,
+} from "./firstLeg.js";
 
 const OPERATOR = Keypair.random().publicKey();
 const ANCHOR = Keypair.random().publicKey();
 const OTHER_ANCHOR = Keypair.random().publicKey();
 const USDC_ISSUER = Keypair.random().publicKey();
 const UNIT = 10_000_000n;
+const QUOTE_ID = "9d1f8f2a-1234-4a3b-9c00-abcdefabcdef";
 
 const policy: PayoutPolicy = { allowedDestinations: new Set([ANCHOR]), usdcIssuer: USDC_ISSUER, maxAmount: 10_000n * UNIT };
 
@@ -35,51 +45,124 @@ function fakeSigner(status = "PENDING"): PayoutSigner & { submittedTx: Transacti
   return signer;
 }
 
+/** Accepts every first leg; the first-leg tests below swap in one that refuses or is down. */
+const verified: FirstLegVerifier = { verify: async () => {} };
+
+function fakeAlerter(): Alerter & { fire: ReturnType<typeof vi.fn> } {
+  return { fire: vi.fn() };
+}
+
+type Row = Record<string, unknown>;
+
+/** Every value bound in a drizzle `eq`/`and` condition. */
+function boundValues(condition: unknown): unknown[] {
+  if (condition instanceof Param) return [condition.value];
+  if (condition instanceof SQL) return condition.queryChunks.flatMap(boundValues);
+  return [];
+}
+
+/** True when each bound value equals one of the row's fields: enough for the `eq`/`and` filters used here. */
+const matches = (row: Row, condition: unknown) => boundValues(condition).every((v) => Object.values(row).includes(v));
+
 /**
- * Stateful fake of the slice of `Database` the hop touches: the payout_forward claim table
- * (insert-or-ignore, status updates) and a transaction for the journal rows.
+ * In-memory stand-in for the slice of `Database` the hop and the repair touch. Tables keep real
+ * rows, `where` honours `eq`/`and` filters, the `payout_forward` primary key makes a second claim
+ * insert a no-op, and a transaction that throws rolls its writes back.
+ *
+ * `failNextTransaction` makes the next transaction throw after running its callback (a dropped
+ * connection mid-commit); `goDownOnTransaction` additionally makes every later call throw.
  */
 function fakeDb() {
-  const claims = new Map<string, { status: string; txHash?: string; toAccount: string }>();
-  const inserted: Array<{ table: unknown; row: Record<string, unknown> }> = [];
-  const insertInto = (sink: Array<{ table: unknown; row: Record<string, unknown> }>) => (table: unknown) => ({
-    values: (row: Record<string, unknown>) => {
-      const record = () => sink.push({ table, row });
-      const isClaim = table === schema.payoutForward;
-      return Object.assign(Promise.resolve(record()), {
-        onConflictDoNothing: () => ({
-          returning: async () => {
-            const key = row.fromTxHash as string;
-            if (isClaim && claims.has(key)) return [];
-            if (isClaim) claims.set(key, { status: "claimed", toAccount: row.toAccount as string });
-            return [{ fromTxHash: key }];
-          },
-        }),
-      });
-    },
-  });
-  let lastSet: Record<string, unknown> = {};
-  const db = {
-    insert: insertInto(inserted),
-    update: () => ({
-      set: (set: Record<string, unknown>) => {
-        lastSet = set;
-        return {
-          where: () => {
-            // The only conditional update is the "re-claim a failed payout" one; apply it to the failed claims.
-            const reclaimable = [...claims.entries()].filter(([, c]) => c.status === "failed");
-            const touched = set.status === "claimed" ? reclaimable : [...claims.entries()];
-            for (const [, c] of touched) Object.assign(c, set);
-            return Object.assign(Promise.resolve(), {
-              returning: async () => (set.status === "claimed" ? touched.map(([k]) => ({ fromTxHash: k })) : []),
-            });
-          },
-        };
+  let tables = new Map<unknown, Row[]>();
+  const rowsOf = (table: unknown): Row[] => {
+    if (!tables.has(table)) tables.set(table, []);
+    return tables.get(table)!;
+  };
+  const state = { failNextTransaction: null as Error | null, goDownOnTransaction: false, down: false };
+  const guard = () => {
+    if (state.down) throw new Error("connection terminated");
+  };
+  const query = <T>(run: () => T, extra: object = {}) =>
+    Object.assign(
+      {
+        then: (resolve: (v: T) => unknown, reject: (e: unknown) => unknown) =>
+          Promise.resolve().then(() => { guard(); return run(); }).then(resolve, reject),
+      },
+      extra,
+    );
+  const project = (row: Row, fields?: Record<string, { name: string }>) =>
+    fields ? Object.fromEntries(Object.keys(fields).map((k) => [k, row[k]])) : { ...row };
+
+  const ops = {
+    insert: (table: unknown) => ({
+      values: (row: Row) => {
+        const full =
+          table === schema.payoutForward ? { status: "claimed", txHash: null, quoteId: null, ...row } : { ...row };
+        return query(() => { rowsOf(table).push(full); }, {
+          onConflictDoNothing: () => ({
+            returning: async () => {
+              guard();
+              if (rowsOf(table).some((r) => r.fromTxHash === row.fromTxHash)) return [];
+              rowsOf(table).push(full);
+              return [{ fromTxHash: row.fromTxHash }];
+            },
+          }),
+        });
       },
     }),
-    transaction: async (fn: (trx: unknown) => Promise<void>) => fn({ insert: insertInto(inserted) }),
+    update: (table: unknown) => ({
+      set: (set: Row) => ({
+        where: (condition: unknown) => {
+          const apply = () => {
+            const touched = rowsOf(table).filter((r) => matches(r, condition));
+            for (const r of touched) Object.assign(r, set);
+            return touched;
+          };
+          return query(() => { apply(); }, {
+            returning: async () => { guard(); return apply().map((r) => ({ fromTxHash: r.fromTxHash })); },
+          });
+        },
+      }),
+    }),
+    select: (fields?: Record<string, { name: string }>) => ({
+      from: (table: unknown) => ({
+        where: (condition: unknown) => {
+          const found = () => rowsOf(table).filter((r) => matches(r, condition)).map((r) => project(r, fields));
+          return query(found, { limit: (n: number) => query(() => found().slice(0, n)) });
+        },
+      }),
+    }),
+  };
+
+  const db = {
+    ...ops,
+    transaction: async <T>(fn: (trx: typeof ops) => Promise<T>): Promise<T> => {
+      guard();
+      const snapshot = new Map([...tables].map(([t, rows]) => [t, rows.map((r) => ({ ...r }))]));
+      try {
+        const result = await fn(ops);
+        if (state.failNextTransaction) {
+          const err = state.failNextTransaction;
+          state.failNextTransaction = null;
+          if (state.goDownOnTransaction) state.down = true;
+          throw err;
+        }
+        return result;
+      } catch (err) {
+        tables = snapshot;
+        throw err;
+      }
+    },
   } as unknown as Parameters<typeof forwardPayout>[0];
-  return { db, inserted, claims, lastSet: () => lastSet };
+
+  return {
+    db,
+    state,
+    claim: (hash: string) => rowsOf(schema.payoutForward).find((r) => r.fromTxHash === hash),
+    claims: () => rowsOf(schema.payoutForward),
+    journal: () => rowsOf(schema.journalEntry),
+    exitFills: () => rowsOf(schema.exitFill),
+  };
 }
 
 const base = (over: Partial<ForwardPayoutArgs> = {}): ForwardPayoutArgs => ({
@@ -88,73 +171,256 @@ const base = (over: Partial<ForwardPayoutArgs> = {}): ForwardPayoutArgs => ({
   amount: 5_000n * UNIT,
   memo: "customer-ref-123",
   usdcAssetAddress: USDC_ISSUER,
-  quoteId: "9d1f8f2a-1234-4a3b-9c00-abcdefabcdef",
+  quoteId: QUOTE_ID,
   ...over,
 });
 
 describe("forwardPayout", () => {
   it("attaches Memo.text for a non-numeric memo and records exit_fill + a balanced journal pair", async () => {
     const signer = fakeSigner();
-    const { db, inserted, claims } = fakeDb();
+    const { db, claim, journal, exitFills } = fakeDb();
 
-    const result = await forwardPayout(db, signer, base(), policy);
+    const result = await forwardPayout(db, signer, verified, base(), policy, fakeAlerter());
 
-    expect(result).toEqual({ hash: "fakehash123", status: "PENDING" });
+    expect(result).toEqual({ hash: "fakehash123", status: "PENDING", booked: true });
     expect(signer.submittedTx?.memo.type).toBe(MemoText);
     expect(Buffer.from(signer.submittedTx?.memo.value as Uint8Array).toString()).toBe("customer-ref-123");
-    expect(claims.get("contracttxhash")).toMatchObject({ status: "sent", txHash: "fakehash123" });
+    expect(claim("contracttxhash")).toMatchObject({ status: "sent", txHash: "fakehash123", refId: QUOTE_ID, quoteId: QUOTE_ID });
 
-    const rows = inserted.filter((i) => i.table !== schema.payoutForward);
-    expect(rows).toHaveLength(3);
-    expect(rows.find((i) => i.row.payoutRoute === "anchor_hop")).toMatchObject({
-      row: { payoutRoute: "anchor_hop", payoutMemo: "customer-ref-123", txHash: "fakehash123" },
-    });
-    expect(rows.find((i) => i.row.account === "usdc_cash")).toMatchObject({
-      row: { account: "usdc_cash", debit: "5000.0000000", credit: "0.0000000", ccy: "USDC" },
-    });
-    expect(rows.find((i) => i.row.account === "operator:payout_hop")).toMatchObject({
-      row: { account: "operator:payout_hop", debit: "0.0000000", credit: "5000.0000000", ccy: "USDC" },
-    });
+    expect(exitFills()).toEqual([
+      { quoteId: QUOTE_ID, payoutRoute: "anchor_hop", payoutMemo: "customer-ref-123", txHash: "fakehash123" },
+    ]);
+    expect(journal()).toEqual([
+      { refType: "payout_hop", refId: QUOTE_ID, account: "usdc_cash", debit: "5000.0000000", credit: "0.0000000", ccy: "USDC" },
+      { refType: "payout_hop", refId: QUOTE_ID, account: "operator:payout_hop", debit: "0.0000000", credit: "5000.0000000", ccy: "USDC" },
+    ]);
   });
 
   it("attaches Memo.id for a numeric memo, and skips exit_fill when there's no quoteId", async () => {
     const signer = fakeSigner();
-    const { db, inserted } = fakeDb();
+    const { db, claim, journal, exitFills } = fakeDb();
 
-    await forwardPayout(db, signer, base({ fromContractPayoutTxHash: "h2", amount: 10n * UNIT, memo: "88221199", quoteId: undefined }), policy);
+    await forwardPayout(db, signer, verified, base({ fromContractPayoutTxHash: "h2", amount: 10n * UNIT, memo: "88221199", quoteId: undefined }), policy, fakeAlerter());
 
     expect(signer.submittedTx?.memo.type).toBe(MemoID);
     expect(signer.submittedTx?.memo.value?.toString()).toBe("88221199");
-    expect(inserted.filter((i) => i.table !== schema.payoutForward)).toHaveLength(2);
+    expect(exitFills()).toHaveLength(0);
+    // Without a quote the journal pair is booked under the id generated at claim time.
+    expect(journal().map((r) => r.refId)).toEqual([claim("h2")?.refId, claim("h2")?.refId]);
   });
 
   it("pays a given first-leg transaction once, however many times it is asked", async () => {
     const signer = fakeSigner();
     const { db } = fakeDb();
 
-    await forwardPayout(db, signer, base(), policy);
-    await expect(forwardPayout(db, signer, base(), policy)).rejects.toBeInstanceOf(DuplicatePayoutError);
-    await expect(forwardPayout(db, signer, base({ amount: 1n * UNIT }), policy)).rejects.toBeInstanceOf(DuplicatePayoutError);
+    await forwardPayout(db, signer, verified, base(), policy, fakeAlerter());
+    await expect(forwardPayout(db, signer, verified, base(), policy, fakeAlerter())).rejects.toBeInstanceOf(DuplicatePayoutError);
+    await expect(forwardPayout(db, signer, verified, base({ amount: 1n * UNIT }), policy, fakeAlerter())).rejects.toBeInstanceOf(DuplicatePayoutError);
 
     expect(signer.calls).toBe(1);
   });
 
   it("lets a payout that failed to send be tried again, and pays it once it succeeds", async () => {
-    const { db, claims } = fakeDb();
+    const { db, claim } = fakeDb();
     const failing: PayoutSigner = { ...fakeSigner(), signAndSubmit: async () => { throw new Error("rpc down"); } };
-    await expect(forwardPayout(db, failing, base(), policy)).rejects.toThrow("rpc down");
-    expect(claims.get("contracttxhash")?.status).toBe("failed");
+    await expect(forwardPayout(db, failing, verified, base(), policy, fakeAlerter())).rejects.toThrow("rpc down");
+    expect(claim("contracttxhash")?.status).toBe("failed");
 
     const working = fakeSigner();
-    await forwardPayout(db, working, base(), policy);
+    await forwardPayout(db, working, verified, base(), policy, fakeAlerter());
     expect(working.calls).toBe(1);
-    expect(claims.get("contracttxhash")?.status).toBe("sent");
+    expect(claim("contracttxhash")?.status).toBe("sent");
   });
 
   it("treats a network ERROR status as a failed payout, not a sent one", async () => {
+    const { db, claim } = fakeDb();
+    await expect(forwardPayout(db, fakeSigner("ERROR"), verified, base(), policy, fakeAlerter())).rejects.toThrow(/submission failed/);
+    expect(claim("contracttxhash")?.status).toBe("failed");
+  });
+});
+
+describe("bookkeeping after the payment is sent", () => {
+  it("answers with the hash, flags the row bookkeeping_pending and alerts when the booking transaction throws", async () => {
+    const signer = fakeSigner();
+    const alerter = fakeAlerter();
+    const { db, state, claim, journal, exitFills } = fakeDb();
+    state.failNextTransaction = new Error("insert on exit_fill violates foreign key constraint");
+
+    const result = await forwardPayout(db, signer, verified, base(), policy, alerter);
+
+    expect(result).toEqual({ hash: "fakehash123", status: "PENDING", booked: false });
+    expect(signer.calls).toBe(1);
+    // The transaction rolled back, so nothing half-booked; the row says what happened and keeps the hash.
+    expect(claim("contracttxhash")).toMatchObject({ status: "bookkeeping_pending", txHash: "fakehash123", refId: QUOTE_ID });
+    expect(journal()).toHaveLength(0);
+    expect(exitFills()).toHaveLength(0);
+    expect(alerter.fire).toHaveBeenCalledWith(
+      "payout_unbooked",
+      expect.objectContaining({ subject: "contracttxhash", txHash: "fakehash123", refId: QUOTE_ID, flagged: true }),
+    );
+    expect(alerter.fire.mock.calls[0][1].reason).toMatch(/foreign key constraint/);
+
+    // A caller retrying is still refused: the anchor was paid.
+    await expect(forwardPayout(db, signer, verified, base(), policy, alerter)).rejects.toBeInstanceOf(DuplicatePayoutError);
+    expect(signer.calls).toBe(1);
+  });
+
+  it("still answers with the hash when the database is gone and the row cannot even be flagged", async () => {
+    const alerter = fakeAlerter();
+    const { db, state, claim } = fakeDb();
+    state.failNextTransaction = new Error("connection terminated");
+    state.goDownOnTransaction = true;
+
+    const result = await forwardPayout(db, fakeSigner(), verified, base(), policy, alerter);
+
+    expect(result).toEqual({ hash: "fakehash123", status: "PENDING", booked: false });
+    expect(claim("contracttxhash")?.status).toBe("claimed");
+    expect(alerter.fire).toHaveBeenCalledWith(
+      "payout_unbooked",
+      expect.objectContaining({ subject: "contracttxhash", txHash: "fakehash123", flagged: false }),
+    );
+  });
+});
+
+describe("bookPendingPayouts", () => {
+  /** Sends a payout whose booking fails, leaving it `bookkeeping_pending`. */
+  async function unbooked(over: Partial<ForwardPayoutArgs> = {}) {
+    const fake = fakeDb();
+    fake.state.failNextTransaction = new Error("connection reset");
+    await forwardPayout(fake.db, fakeSigner(), verified, base(over), policy, fakeAlerter());
+    expect(fake.claim(over.fromContractPayoutTxHash ?? "contracttxhash")?.status).toBe("bookkeeping_pending");
+    return fake;
+  }
+
+  it("books a pending payout under the refId fixed at claim time, with its exit_fill, and marks it sent", async () => {
+    const { db, claim, journal, exitFills } = await unbooked();
+
+    const result = await bookPendingPayouts(db, fakeAlerter());
+
+    expect(result).toEqual({ booked: ["contracttxhash"], alreadyBooked: [], failed: [] });
+    expect(claim("contracttxhash")?.status).toBe("sent");
+    expect(exitFills()).toEqual([
+      { quoteId: QUOTE_ID, payoutRoute: "anchor_hop", payoutMemo: "customer-ref-123", txHash: "fakehash123" },
+    ]);
+    expect(journal()).toEqual([
+      { refType: "payout_hop", refId: QUOTE_ID, account: "usdc_cash", debit: "5000.0000000", credit: "0.0000000", ccy: "USDC" },
+      { refType: "payout_hop", refId: QUOTE_ID, account: "operator:payout_hop", debit: "0.0000000", credit: "5000.0000000", ccy: "USDC" },
+    ]);
+  });
+
+  it("uses the generated refId of a payout with no quote, the same one the original attempt used", async () => {
+    const { db, claim, journal, exitFills } = await unbooked({ quoteId: undefined });
+    const refId = claim("contracttxhash")?.refId;
+    expect(refId).toMatch(/^[0-9a-f-]{36}$/);
+
+    await bookPendingPayouts(db, fakeAlerter());
+
+    expect(journal().map((r) => r.refId)).toEqual([refId, refId]);
+    expect(exitFills()).toHaveLength(0);
+  });
+
+  it("is idempotent: a second run books nothing more", async () => {
+    const { db, journal } = await unbooked();
+
+    await bookPendingPayouts(db, fakeAlerter());
+    const again = await bookPendingPayouts(db, fakeAlerter());
+
+    expect(again).toEqual({ booked: [], alreadyBooked: [], failed: [] });
+    expect(journal()).toHaveLength(2);
+  });
+
+  it("only marks sent a payout whose journal pair did commit (the acknowledgement was what got lost)", async () => {
+    const { db, claim, journal } = await unbooked();
+    journal().push(
+      { refType: "payout_hop", refId: QUOTE_ID, account: "usdc_cash", debit: "5000.0000000", credit: "0.0000000", ccy: "USDC" },
+      { refType: "payout_hop", refId: QUOTE_ID, account: "operator:payout_hop", debit: "0.0000000", credit: "5000.0000000", ccy: "USDC" },
+    );
+
+    const result = await bookPendingPayouts(db, fakeAlerter());
+
+    expect(result).toEqual({ booked: [], alreadyBooked: ["contracttxhash"], failed: [] });
+    expect(journal()).toHaveLength(2);
+    expect(claim("contracttxhash")?.status).toBe("sent");
+  });
+
+  it("leaves a payout it cannot book pending, alerts, and books it on a later run", async () => {
+    const { db, state, claim, journal } = await unbooked();
+    const alerter = fakeAlerter();
+    state.failNextTransaction = new Error("deadlock detected");
+
+    const first = await bookPendingPayouts(db, alerter);
+
+    expect(first).toEqual({ booked: [], alreadyBooked: [], failed: ["contracttxhash"] });
+    expect(claim("contracttxhash")?.status).toBe("bookkeeping_pending");
+    expect(journal()).toHaveLength(0);
+    expect(alerter.fire).toHaveBeenCalledWith("payout_unbooked", expect.objectContaining({ subject: "contracttxhash" }));
+
+    expect((await bookPendingPayouts(db, alerter)).booked).toEqual(["contracttxhash"]);
+    expect(journal()).toHaveLength(2);
+  });
+
+  it("leaves claimed, failed and already-sent payouts alone", async () => {
+    const { db, claims, journal } = fakeDb();
+    claims().push(
+      { fromTxHash: "a", status: "claimed", txHash: null, refId: "00000000-0000-4000-8000-000000000001", quoteId: null, amount: "1.0000000", memo: "m" },
+      { fromTxHash: "b", status: "failed", txHash: null, refId: "00000000-0000-4000-8000-000000000002", quoteId: null, amount: "1.0000000", memo: "m" },
+      { fromTxHash: "c", status: "sent", txHash: "t", refId: "00000000-0000-4000-8000-000000000003", quoteId: null, amount: "1.0000000", memo: "m" },
+    );
+
+    expect(await bookPendingPayouts(db, fakeAlerter())).toEqual({ booked: [], alreadyBooked: [], failed: [] });
+    expect(journal()).toHaveLength(0);
+  });
+});
+
+describe("first-leg verification", () => {
+  it("asks the verifier whether the named hash paid the operator at least the requested USDC", async () => {
+    const seen: FirstLegExpectation[] = [];
+    const recording: FirstLegVerifier = { verify: async (e) => { seen.push(e); } };
+    const { db } = fakeDb();
+
+    await forwardPayout(db, fakeSigner(), recording, base(), policy, fakeAlerter());
+
+    expect(seen).toEqual([
+      { txHash: "contracttxhash", operator: OPERATOR, usdcIssuer: USDC_ISSUER, minAmount: 5_000n * UNIT },
+    ]);
+  });
+
+  it.each([
+    "first-leg transaction contracttxhash was not found on the network",
+    "first-leg transaction contracttxhash did not succeed (status FAILED)",
+    "first-leg transaction did not pay the configured USDC to the operator account",
+    "first leg paid the operator 4999.0000000 USDC, less than the 5000.0000000 requested",
+  ])("refuses before claiming or sending when the verifier says: %s", async (reason) => {
+    const signer = fakeSigner();
     const { db, claims } = fakeDb();
-    await expect(forwardPayout(db, fakeSigner("ERROR"), base(), policy)).rejects.toThrow(/submission failed/);
-    expect(claims.get("contracttxhash")?.status).toBe("failed");
+    const refusing: FirstLegVerifier = { verify: async () => { throw new FirstLegRefusedError(reason); } };
+
+    await expect(forwardPayout(db, signer, refusing, base(), policy, fakeAlerter())).rejects.toThrow(new FirstLegRefusedError(reason));
+
+    expect(claims()).toHaveLength(0);
+    expect(signer.calls).toBe(0);
+  });
+
+  it("claims nothing when the verifier cannot reach the network, so a later request can still pay", async () => {
+    const signer = fakeSigner();
+    const { db, claims } = fakeDb();
+    const down: FirstLegVerifier = { verify: async () => { throw new FirstLegUnavailableError("rpc timeout"); } };
+
+    await expect(forwardPayout(db, signer, down, base(), policy, fakeAlerter())).rejects.toBeInstanceOf(FirstLegUnavailableError);
+    expect(claims()).toHaveLength(0);
+    expect(signer.calls).toBe(0);
+
+    await forwardPayout(db, signer, verified, base(), policy);
+    expect(signer.calls).toBe(1);
+  });
+
+  it("does not consult the verifier for a payout the policy already refuses", async () => {
+    let asked = false;
+    const { db } = fakeDb();
+    const watching: FirstLegVerifier = { verify: async () => { asked = true; } };
+
+    await expect(forwardPayout(db, fakeSigner(), watching, base({ toAnchorAccount: OTHER_ANCHOR }), policy, fakeAlerter())).rejects.toBeInstanceOf(PayoutRefusedError);
+    expect(asked).toBe(false);
   });
 });
 
@@ -162,10 +428,10 @@ describe("payout policy", () => {
   const refused = async (over: Partial<ForwardPayoutArgs>, reason: RegExp) => {
     const signer = fakeSigner();
     const { db, claims } = fakeDb();
-    await expect(forwardPayout(db, signer, base(over), policy)).rejects.toThrow(reason);
-    await expect(forwardPayout(db, signer, base(over), policy)).rejects.toBeInstanceOf(PayoutRefusedError);
+    await expect(forwardPayout(db, signer, verified, base(over), policy, fakeAlerter())).rejects.toThrow(reason);
+    await expect(forwardPayout(db, signer, verified, base(over), policy, fakeAlerter())).rejects.toBeInstanceOf(PayoutRefusedError);
     expect(signer.calls).toBe(0);
-    expect(claims.size).toBe(0); // refused before anything was claimed
+    expect(claims()).toHaveLength(0); // refused before anything was claimed
   };
 
   it("refuses a destination that is not an approved anchor", () => refused({ toAnchorAccount: OTHER_ANCHOR }, /approved anchor/));
@@ -180,7 +446,7 @@ describe("payout policy", () => {
 
   it("accepts a payout exactly at the cap", async () => {
     const { db } = fakeDb();
-    await expect(forwardPayout(db, fakeSigner(), base({ amount: 10_000n * UNIT }), policy)).resolves.toBeDefined();
+    await expect(forwardPayout(db, fakeSigner(), verified, base({ amount: 10_000n * UNIT }), policy, fakeAlerter())).resolves.toBeDefined();
   });
 });
 

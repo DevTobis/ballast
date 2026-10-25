@@ -8,7 +8,8 @@
  * This endpoint moves the operator's own USDC, so it is locked down three ways: every request must
  * carry the shared `x-internal-token`, the server listens on loopback unless told otherwise, and
  * what a request may ask for is bounded by the operator's `PayoutPolicy` (approved destinations,
- * the configured USDC, a per-payout cap), with each first-leg transaction payable once.
+ * the configured USDC, a per-payout cap), with each first-leg transaction checked on-chain and
+ * payable once.
  */
 import Fastify, { type FastifyInstance } from "fastify";
 import { z } from "zod";
@@ -19,7 +20,8 @@ import {
   loadNetworkConfig,
   requireInternalToken,
 } from "@ballast/network-config";
-import { createLogger } from "@ballast/observability";
+import { createAlerter, createLogger, type Alerter } from "@ballast/observability";
+import { rpc } from "@stellar/stellar-sdk";
 import {
   DuplicatePayoutError,
   PayoutRefusedError,
@@ -28,6 +30,13 @@ import {
   type PayoutPolicy,
 } from "./hop.js";
 import { OperatorPayoutSigner, type PayoutSigner } from "./signer.js";
+import { bookPendingPayouts } from "./repair.js";
+import {
+  FirstLegRefusedError,
+  FirstLegUnavailableError,
+  RpcFirstLegVerifier,
+  type FirstLegVerifier,
+} from "./firstLeg.js";
 
 const forwardBody = z.object({
   fromContractPayoutTxHash: z.string().min(1),
@@ -42,7 +51,7 @@ const forwardBody = z.object({
 export function buildServer(
   db: Database,
   signer: PayoutSigner,
-  options: { internalToken: string; policy: PayoutPolicy },
+  options: { internalToken: string; policy: PayoutPolicy; verifier: FirstLegVerifier; alerter?: Alerter },
 ): FastifyInstance {
   const app = Fastify({ logger: false });
   requireInternalToken(app, options.internalToken);
@@ -55,6 +64,7 @@ export function buildServer(
       const result = await forwardPayout(
         db,
         signer,
+        options.verifier,
         {
           fromContractPayoutTxHash: body.fromContractPayoutTxHash,
           toAnchorAccount: body.toAnchorAccount,
@@ -64,11 +74,14 @@ export function buildServer(
           quoteId: body.quoteId,
         },
         options.policy,
+        options.alerter,
       );
       return reply.send(result);
     } catch (err) {
       if (err instanceof PayoutRefusedError) return reply.status(403).send({ error: err.message });
       if (err instanceof DuplicatePayoutError) return reply.status(409).send({ error: err.message });
+      if (err instanceof FirstLegRefusedError) return reply.status(422).send({ error: err.message });
+      if (err instanceof FirstLegUnavailableError) return reply.status(503).send({ error: err.message });
       req.log.error({ err }, "payout-hop: forward failed");
       return reply.status(502).send({ error: err instanceof Error ? err.message : "unknown error" });
     }
@@ -85,12 +98,33 @@ async function main() {
   const network = loadNetworkConfig();
   const signer = await OperatorPayoutSigner.create(logger, network.rpcUrl, network.networkPassphrase);
 
-  const app = buildServer(db, signer, { internalToken, policy });
+  const alerter = createAlerter("payout-hop");
+
+  const verifier = new RpcFirstLegVerifier(
+    new rpc.Server(network.rpcUrl, { allowHttp: network.rpcUrl.startsWith("http://") }),
+    network.networkPassphrase,
+  );
+
+  const app = buildServer(db, signer, { internalToken, policy, verifier, alerter });
   const port = Number(process.env.PAYOUT_HOP_PORT ?? 3002);
   const host = internalBindHost("payout-hop");
 
   await app.listen({ port, host });
   logger.info({ port, host, operator: signer.publicKey(), destinations: policy.allowedDestinations.size }, "payout-hop: listening");
+
+  // Book anything a previous run sent but could not record, then keep sweeping.
+  const repair = async () => {
+    try {
+      const result = await bookPendingPayouts(db, alerter);
+      if (result.booked.length || result.alreadyBooked.length || result.failed.length) {
+        logger.info(result, "payout-hop: repaired unbooked payouts");
+      }
+    } catch (err) {
+      logger.error({ err }, "payout-hop: unbooked-payout repair failed");
+    }
+  };
+  await repair();
+  setInterval(repair, Number(process.env.PAYOUT_HOP_REPAIR_INTERVAL_S ?? 300) * 1000).unref();
 }
 
 if (process.env.VITEST !== "true") {

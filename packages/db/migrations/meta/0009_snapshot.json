@@ -1,5 +1,5 @@
 {
-  "id": "a08e9dca-57a1-447f-b6bc-4927e212a4fa",
+  "id": "aef91b0e-1e40-473b-8aa5-e450cc2054a9",
   "prevId": "935d93a7-95cb-4197-a578-fcbf16d20456",
   "version": "7",
   "dialect": "postgresql",
@@ -368,74 +368,6 @@
           "columns": [
             {
               "expression": "event_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.chain_event_gap": {
-      "name": "chain_event_gap",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "from_ledger": {
-          "name": "from_ledger",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "to_ledger": {
-          "name": "to_ledger",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "detected_at": {
-          "name": "detected_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "status": {
-          "name": "status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'open'"
-        }
-      },
-      "indexes": {
-        "chain_event_gap_range_uq": {
-          "name": "chain_event_gap_range_uq",
-          "columns": [
-            {
-              "expression": "from_ledger",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "to_ledger",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -1045,7 +977,15 @@
         }
       },
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
+      "uniqueConstraints": {
+        "liquidation_credit_line_id_unique": {
+          "name": "liquidation_credit_line_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "credit_line_id"
+          ]
+        }
+      },
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false

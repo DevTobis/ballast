@@ -23,6 +23,21 @@ Jobs run one at a time through a shared queue, because they share one account an
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
 Liquidation and margin steps are written to be safe to repeat after a crash.
 
+## Replica Behaviour and Advisory Locking
+
+All keeper jobs sign with a single operator account and need sequential transaction sequence numbers. To prevent duplicate submissions, race conditions, or `tx_bad_seq` errors across multiple replicas (e.g. `--scale keeper=2` or during rolling restarts):
+
+- Each tick acquires a session-level Postgres advisory lock (`pg_try_advisory_lock`) on a dedicated connection.
+- If another keeper instance holds the lock, the tick is logged and skipped.
+- When the job finishes, the lock is released. If an instance crashes or disconnects, Postgres automatically releases the advisory lock.
+- `KEEPER_LOCK_SCOPE`: controls locking granularity:
+  - `job` (default): lock key is `hashtext('keeper:' || name)`, allowing different jobs to run while locking out duplicates of the same job.
+  - `global`: lock key is `hashtext('keeper:global')`, ensuring strict single-job execution across the entire cluster.
+
+### Storage TTL Maintenance
+
+Soroban persistent storage entries archive if not extended. `CreditLine::extend_ttl(line)` is an unauthenticated contract entry point that extends instance and persistent entry TTLs (`Line`, `Claimable`, `Liquidation`). Keepers or periodic tasks can call this for dormant lines to ensure they remain accessible without requiring restoration.
+
 ## Run
 
 ```
@@ -46,12 +61,27 @@ repo-unwind and repo-margin schedules to every minute for local work.
 - `KEEPER_SYNC_COLLATERAL_CRON`, `KEEPER_CURE_EXPIRY_CRON`, `KEEPER_REPO_UNWIND_CRON`,
   `KEEPER_REPO_MARGIN_CRON`, `KEEPER_INTEREST_ACCRUAL_CRON`, `KEEPER_BALANCE_CRON`: cron overrides.
 - `ALERT_WEBHOOK_URL`, `ALERT_COOLDOWN_S`, `OPERATOR_MIN_XLM`: low-balance alert delivery and threshold.
+- `KEEPER_SHUTDOWN_GRACE_MS` (default `60000`): milliseconds to wait for the in-flight job to finish after SIGTERM/SIGINT before closing the DB and exiting. The `stop_grace_period` in `deploy/docker-compose.prod.yml` is set to 70 s to comfortably exceed this default.
 
 ## Source map
 
-- `src/index.ts`: wiring, cron registration, the serial job queue, balance check.
+- `src/index.ts`: wiring, cron registration, the serial job queue, balance check, graceful shutdown.
 - `src/jobs/syncCollateral.ts`, `cureExpiry.ts`, `interestAccrual.ts`, `repoMargin.ts`, `repoUnwind.ts`: one file per job.
 - `src/jobs/types.ts`: the shared `JobResult` shape.
+
+## Graceful shutdown
+
+On `SIGTERM` or `SIGINT` the keeper:
+
+1. Sets a flag so no new job is enqueued on the next cron tick.
+2. Calls `.stop()` on every `ScheduledTask`, preventing further ticks.
+3. Awaits the current `queue` promise (i.e. the in-flight job) for up to `KEEPER_SHUTDOWN_GRACE_MS` (default 60 s). If the job finishes within the grace period it logs success; if it times out it logs a warning and continues.
+4. Calls `db.end()` to drain and close the Postgres pool.
+5. Logs `"keeper: shutdown complete"` and exits with code 0.
+
+A **second** `SIGTERM`/`SIGINT` before shutdown completes causes an immediate `process.exit(1)` (Docker or the OS is insisting — we get out of the way).
+
+The compose file sets `stop_grace_period: 70s` on the `keeper` service so Docker waits long enough before sending `SIGKILL`.
 
 ## Tests
 

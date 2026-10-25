@@ -68,8 +68,36 @@
     {
       "idx": 9,
       "version": "7",
-      "when": 1792337628243,
-      "tag": "0009_lucky_darkstar",
+      "when": 1792424561610,
+      "tag": "0009_liquidation_credit_line_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1792605690058,
+      "tag": "0010_issuer_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1792771766999,
+      "tag": "0011_indexer_cursor",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1792783874569,
+      "tag": "0012_payout_forward_booking",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1792888316412,
+      "tag": "0013_chain_event_gap",
       "breakpoints": true
     }
   ]

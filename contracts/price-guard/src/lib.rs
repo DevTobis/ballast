@@ -59,20 +59,40 @@
 use ballast_common::{
     access::{self, Roles},
     price::{GuardedPrice, PriceSource, PriceStatus},
-    ttl,
+    timelock, ttl, upgrade,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 const ISSUER_SOURCE: &str = "issuer";
 
 #[contracttype]
-#[derive(Clone)]
-struct AssetGuardConfig {
-    band_bps: u32,
-    daily_move_band_bps: u32,
-    max_staleness_s: u64,
-    window_seconds: u64,
-    window_move_band_bps: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetGuardConfig {
+    pub band_bps: u32,
+    pub daily_move_band_bps: u32,
+    pub max_staleness_s: u64,
+    pub window_seconds: u64,
+    pub window_move_band_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigChange {
+    BandBps(Address, u32),
+    DailyMoveBandBps(Address, u32),
+    WindowSeconds(Address, u64),
+    WindowMoveBandBps(Address, u32),
+    MaxStalenessSeconds(Address, u64),
+    Asset(Address, u32, u32, u64, u32, u64),
+    IssuerPubKey(Address, BytesN<32>),
+    RequireNavSignature(bool),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfigChange {
+    pub change: ConfigChange,
+    pub executes_at: u64,
 }
 
 #[contracttype]
@@ -113,6 +133,7 @@ enum DataKey {
     RequireNavSignature,
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
+    PendingConfig(u64),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -217,6 +238,26 @@ fn track_source_name(env: &Env, asset: &Address, name: &Symbol) {
     }
 }
 
+fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
+    let names_key = (Symbol::new(env, "src_names"), asset.clone());
+    let names: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&names_key)
+        .unwrap_or_else(|| Vec::new(env));
+    if let Some(idx) = names.first_index_of(name) {
+        let mut new_names = Vec::new(env);
+        for (i, n) in names.iter().enumerate() {
+            if i as u32 != idx {
+                new_names.push_back(n);
+            }
+        }
+        env.storage().instance().set(&names_key, &new_names);
+    }
+    let key = DataKey::Source(asset.clone(), name.clone());
+    env.storage().persistent().remove(&key);
+}
+
 fn read_all_sources(env: &Env, asset: &Address) -> Vec<PriceSource> {
     let names_key = (Symbol::new(env, "src_names"), asset.clone());
     let names: Vec<Symbol> = env
@@ -309,6 +350,9 @@ mod alloc_free_sort {
     }
 }
 
+/// True when the spread between the lowest and highest value, in bps of the lowest, is at most
+/// `band_bps` (inclusive). Fewer than two values are trivially within band; a non-positive
+/// minimum never is.
 fn within_band(values: &[i128], band_bps: u32) -> bool {
     if values.len() < 2 {
         return true;
@@ -343,6 +387,9 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
 
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
 /// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
+///
+/// For an odd source count, the median is the middle value. For an even source count, the median
+/// is the average of the two middle values rounded down (conservative collateral valuation).
 ///
 /// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
 /// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
@@ -402,7 +449,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         alloc_free_sort::SortBuf::from(&fresh_values);
     plain_values.sort();
     let len = plain_values.len();
-    let median_value = plain_values.get(len / 2);
+    let median_value = if len % 2 == 1 {
+        plain_values.get(len / 2)
+    } else {
+        (plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2
+    };
 
     let mut as_array: [i128; 8] = [0; 8];
     for (i, slot) in as_array.iter_mut().enumerate().take(len) {
@@ -586,9 +637,42 @@ impl PriceGuard {
         access::pending_role_change(&env, id)
     }
 
+    /// Queues a timelocked contract upgrade to `new_wasm_hash`.
+    /// Admin only. Executable after 48h.
+    pub fn queue_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> u64 {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::queue_upgrade(&env, &new_wasm_hash)
+    }
+
+    /// Cancels a pending contract upgrade.
+    /// Admin only.
+    pub fn cancel_upgrade(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        upgrade::cancel_upgrade(&env, id);
+    }
+
+    /// Executes a queued contract upgrade once the 48h timelock has elapsed.
+    /// Permissionless once ready.
+    pub fn execute_upgrade(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        upgrade::execute_upgrade(&env, id);
+    }
+
+    /// Returns the pending upgrade for `id`, if one exists.
+    pub fn pending_upgrade(env: Env, id: u64) -> Option<upgrade::PendingUpgrade> {
+        upgrade::pending_upgrade(&env, id)
+    }
+
     /// Admin-set per-asset thresholds. Kept local to this contract rather than cross-called from
     /// `Registry` — see the module docs on the general Registry-decoupling simplification used
     /// across this pass's contracts.
+    ///
+    /// Tightening changes (smaller bands, shorter staleness, longer window) apply immediately;
+    /// loosening changes must be queued via `queue_config` and wait for the 48h timelock.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -602,6 +686,23 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+
+        let existing: Option<AssetGuardConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(asset.clone()));
+        if let Some(old) = existing {
+            let is_loosening = band_bps > old.band_bps
+                || daily_move_band_bps > old.daily_move_band_bps
+                || window_move_band_bps > old.window_move_band_bps
+                || max_staleness_s > old.max_staleness_s
+                || window_seconds < old.window_seconds;
+            assert!(
+                !is_loosening,
+                "price-guard: loosening changes must be queued via queue_config"
+            );
+        }
+
         env.storage().instance().set(
             &DataKey::Config(asset.clone()),
             &AssetGuardConfig {
@@ -629,9 +730,8 @@ impl PriceGuard {
     }
 
     /// Admin-only. Registers/rotates the raw Ed25519 public key `asset`'s issuer signs NAV
-    /// readings with — see the module doc comment. Required before `publish_nav` can succeed for
-    /// `asset` while `require_nav_signature` is `true`. Call this with the new publisher's raw
-    /// public key when rotating `price_publisher` and the publisher is also the NAV attestor.
+    /// readings with. Initial registration applies immediately; rotations must be queued
+    /// via `queue_config` with a 48h delay to protect against key compromise.
     pub fn configure_issuer_key(
         env: Env,
         admin: Address,
@@ -641,6 +741,16 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+        let existing: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::IssuerPubKey(asset.clone()));
+        if let Some(old) = existing {
+            assert!(
+                old == issuer_pubkey,
+                "price-guard: rotating issuer key must be queued via queue_config"
+            );
+        }
         env.storage()
             .instance()
             .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
@@ -650,12 +760,26 @@ impl PriceGuard {
         );
     }
 
-    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all —
-    /// see the module doc comment on why this exists and why it defaults to `true`.
+    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all.
+    /// Tightening (requiring signatures) is immediate; loosening (disabling verification) requires 48h timelock.
     pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+        let has_existing = env
+            .storage()
+            .instance()
+            .has(&DataKey::RequireNavSignature);
+        if has_existing {
+            let existing: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::RequireNavSignature)
+                .unwrap_or(true);
+            if existing && !required {
+                panic!("price-guard: disabling signature requirement must be queued via queue_config");
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::RequireNavSignature, &required);
@@ -663,6 +787,196 @@ impl PriceGuard {
             (Symbol::new(&env, "configure_signature_requirement"),),
             required,
         );
+    }
+
+    /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
+    /// for `asset`. Unknown name removal is a safe no-op.
+    pub fn remove_source(env: Env, admin: Address, asset: Address, name: Symbol) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+
+        remove_source_internal(&env, &asset, &name);
+
+        env.events().publish(
+            (Symbol::new(&env, "source_removed"), asset.clone()),
+            name,
+        );
+
+        evaluate(&env, asset);
+    }
+
+    /// Queues a loosening configuration change, subject to a 48h timelock delay.
+    /// Admin only. Returns the monotonic ID for `execute_config`.
+    pub fn queue_config(env: Env, admin: Address, change: ConfigChange) -> u64 {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingConfig(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingConfigChange {
+                change: change.clone(),
+                executes_at,
+            },
+        );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events().publish(
+            (Symbol::new(&env, "config_queued"), id),
+            (change, executes_at),
+        );
+        id
+    }
+
+    /// Cancels a pending configuration change. Admin only.
+    pub fn cancel_config(env: Env, admin: Address, id: u64) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingConfig(id);
+        let pending: PendingConfigChange = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("price-guard: no such pending change");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "config_cancelled"), id), pending.change);
+    }
+
+    /// Applies a queued configuration change once the 48h timelock has elapsed.
+    /// Permissionless.
+    pub fn execute_config(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingConfig(id);
+        let pending: PendingConfigChange = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("price-guard: no such pending change");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "price-guard: timelock has not elapsed"
+        );
+
+        match pending.change.clone() {
+            ConfigChange::BandBps(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.band_bps = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::DailyMoveBandBps(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.daily_move_band_bps = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::WindowSeconds(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.window_seconds = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::WindowMoveBandBps(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.window_move_band_bps = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::MaxStalenessSeconds(asset, val) => {
+                let mut config: AssetGuardConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Config(asset.clone()))
+                    .expect("price-guard: asset not configured");
+                config.max_staleness_s = val;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::Asset(asset, band, daily, win_sec, win_move, staleness) => {
+                let config = AssetGuardConfig {
+                    band_bps: band,
+                    daily_move_band_bps: daily,
+                    window_seconds: win_sec,
+                    window_move_band_bps: win_move,
+                    max_staleness_s: staleness,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Config(asset), &config);
+            }
+            ConfigChange::IssuerPubKey(asset, key_val) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::IssuerPubKey(asset), &key_val);
+            }
+            ConfigChange::RequireNavSignature(val) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RequireNavSignature, &val);
+            }
+        }
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "config_executed"), id), pending.change);
+    }
+
+    /// Read-only inspection of a pending config change.
+    pub fn pending_config(env: Env, id: u64) -> Option<PendingConfigChange> {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingConfig(id);
+        let res = env.storage().persistent().get(&key);
+        if res.is_some() {
+            timelock::extend_entry_ttl(&env, &key);
+        }
+        res
+    }
+
+    /// Read-only inspection of an asset guard config.
+    pub fn asset_config(env: Env, asset: Address) -> Option<AssetGuardConfig> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::Config(asset))
+    }
+
+    /// Read-only inspection of whether NAV signatures are required.
+    pub fn require_nav_signature(env: Env) -> bool {
+        ttl::extend_instance(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::RequireNavSignature)
+            .unwrap_or(true)
+    }
+
+    /// Read-only inspection of an asset's issuer public key.
+    pub fn issuer_pubkey(env: Env, asset: Address) -> Option<BytesN<32>> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::IssuerPubKey(asset))
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
@@ -746,6 +1060,12 @@ impl PriceGuard {
     /// 3. Otherwise, if the new median moved more than `daily_move_band_bps` against the last
     ///    good value -> `Halted` (sticky, until `confirm_halt_cleared`), value = last good.
     /// 4. Otherwise -> `Ok`, value = the new median, and this becomes the new "last good".
+    ///
+    /// Median rule:
+    /// - For an odd number of fresh sources: middle value after sorting (`len / 2`).
+    /// - For an even number of fresh sources: average of the two middle values rounded down
+    ///   (`(plain_values.get(len / 2 - 1) + plain_values.get(len / 2)) / 2`), providing conservative
+    ///   valuation for collateral.
     pub fn guarded_price(env: Env, asset: Address) -> GuardedPrice {
         evaluate(&env, asset)
     }
@@ -1339,6 +1659,86 @@ mod test {
         }
     }
 
+    /// Replay of the 2026-02-22 YieldBlox / USTRY manipulation path (PRD §11, Backlog B-0082).
+    /// NAV remains fixed at 1.0, while an independent feed steps up +0.1% per publish to +5%, then
+    /// drops back down. With a 50 bps band, no step beyond +0.5% may be Ok, the published value
+    /// must never exceed the NAV by more than the band, and the guard must not Halt on the way back down.
+    /// With the NAV and this one feed as the only sources, an Ok price is their average, so it
+    /// moves at half the feed's step; Degraded steps hold the last good price.
+    #[test]
+    fn scripted_replay_ustry_manipulation_2026_02_22() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let mut now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+
+        struct Step {
+            step: u32,
+            feed_value: i128,
+            expected_status: PriceStatus,
+            expected_value: i128,
+        }
+
+        let max_allowed = SCALE + (SCALE * 50) / 10_000;
+
+        let steps = [
+            Step { step: 0, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+            Step { step: 1, feed_value: SCALE + 10_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 5_000 },
+            Step { step: 2, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 3, feed_value: SCALE + 30_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 15_000 },
+            Step { step: 4, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 5, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 6, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 7, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 8, feed_value: SCALE + 200_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 9, feed_value: SCALE + 300_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 10, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 11, feed_value: SCALE + 500_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 12, feed_value: SCALE + 400_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 13, feed_value: SCALE + 250_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 14, feed_value: SCALE + 100_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 15, feed_value: SCALE + 60_000, expected_status: PriceStatus::Degraded, expected_value: SCALE + 25_000 },
+            Step { step: 16, feed_value: SCALE + 50_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 25_000 },
+            Step { step: 17, feed_value: SCALE + 40_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 20_000 },
+            Step { step: 18, feed_value: SCALE + 20_000, expected_status: PriceStatus::Ok, expected_value: SCALE + 10_000 },
+            Step { step: 19, feed_value: SCALE, expected_status: PriceStatus::Ok, expected_value: SCALE },
+        ];
+
+        assert!(steps.len() >= 15, "table must cover at least 15 steps");
+
+        for s in steps.iter() {
+            now += 10;
+            env.ledger().set_timestamp(now);
+            client.publish_source(&publisher, &asset, &feed_name, &s.feed_value, &now);
+
+            let price = client.guarded_price(&asset);
+            assert_eq!(
+                price.status, s.expected_status,
+                "step {}: feed {} expected status {:?}, got {:?}",
+                s.step, s.feed_value, s.expected_status, price.status
+            );
+            assert_eq!(
+                price.value, s.expected_value,
+                "step {}: feed {} expected value {}, got {}",
+                s.step, s.feed_value, s.expected_value, price.value
+            );
+            assert!(
+                price.value <= max_allowed,
+                "step {}: price {} must never exceed NAV by more than band ({})",
+                s.step, price.value, max_allowed
+            );
+            assert_ne!(
+                price.status,
+                PriceStatus::Halted,
+                "step {}: guard must not Halt on the way back down",
+                s.step
+            );
+        }
+    }
+
     #[test]
     fn one_fresh_source_can_never_set_a_price_however_large_the_move() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
@@ -1433,6 +1833,49 @@ mod test {
         // The second step (+1.8% against the reference) trips it; the value held is the last good
         // one, the first step's, the same as for a daily-band halt.
         assert_eq!(price.value, SCALE * 1_009 / 1_000);
+    }
+
+    /// Establishes an `Ok` baseline of 1.0000000 under a 100 bp daily band, then moves both sources
+    /// to `moved` and returns what the guard reports. The window band is opened to 100% so only the
+    /// daily check can fire. While the NAV has moved but the feed hasn't yet, the pair is >= 100 bp
+    /// apart, outside the 50 bp source band, so that in-between publish is `Degraded` and leaves the
+    /// baseline alone.
+    fn daily_move_to(moved: i128) -> GuardedPrice {
+        let (env, client, _admin, publisher, _risk, asset) =
+            setup_with_admin_and_window(50, 100, DEFAULT_WINDOW_SECONDS, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        client.publish_nav(&publisher, &asset, &code, &moved, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &moved, &now);
+        client.guarded_price(&asset)
+    }
+
+    #[test]
+    fn a_daily_move_equal_to_the_band_is_ok() {
+        let moved = SCALE + 100_000; // 1.0100000: exactly 100 bp
+        let price = daily_move_to(moved);
+        assert_eq!((price.status, price.value), (PriceStatus::Ok, moved));
+    }
+
+    #[test]
+    fn a_daily_move_one_bp_beyond_the_band_halts_at_the_baseline() {
+        let price = daily_move_to(SCALE + 101_000); // 1.0101000: 101 bp
+        assert_eq!((price.status, price.value), (PriceStatus::Halted, SCALE));
+    }
+
+    #[test]
+    fn a_downward_daily_move_hits_the_same_boundary() {
+        let moved = SCALE - 100_000; // 0.9900000: exactly 100 bp down
+        let price = daily_move_to(moved);
+        assert_eq!((price.status, price.value), (PriceStatus::Ok, moved));
+
+        let price = daily_move_to(SCALE - 101_000); // 0.9899000: 101 bp down
+        assert_eq!((price.status, price.value), (PriceStatus::Halted, SCALE));
     }
 
     #[test]
@@ -1784,6 +2227,589 @@ mod test {
         let next_price = client.guarded_price(&asset);
         assert_eq!(next_price.status, PriceStatus::Ok);
         assert_eq!(next_price.value, SCALE);
+    }
+
+    /// Golden vectors for the canonical NAV message. The same vectors live in
+    /// `services/price-guard/src/__fixtures__/nav-message-vectors.json`, asserted by
+    /// `services/price-guard/src/navSignature.test.ts` against `canonicalNavMessage`. If one side
+    /// changes, both tests have to change in the same commit:
+    ///   ("SPIKO",   1700000000, 10234567)                                -> "SPIKO:1700000000:10234567"
+    ///   ("CETES28", 4102444800, 170141183460469231731687303715884105727) -> "CETES28:4102444800:170141183460469231731687303715884105727"
+    #[test]
+    fn build_nav_message_matches_golden_vectors() {
+        let env = Env::default();
+
+        let message = build_nav_message(
+            &env,
+            &Bytes::from_slice(&env, b"SPIKO"),
+            1_700_000_000,
+            10_234_567,
+        );
+        assert_eq!(message, Bytes::from_slice(&env, b"SPIKO:1700000000:10234567"));
+
+        let message = build_nav_message(
+            &env,
+            &Bytes::from_slice(&env, b"CETES28"),
+            4_102_444_800,
+            i128::MAX,
+        );
+        assert_eq!(
+            message,
+            Bytes::from_slice(
+                &env,
+                b"CETES28:4102444800:170141183460469231731687303715884105727"
+            )
+        );
+    }
+
+    #[test]
+    fn timelock_tightening_asset_config_is_immediate() {
+        let (_env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        client.configure_asset(&admin, &asset, &50, &100, &172_800, &50, &1800);
+        let cfg = client.asset_config(&asset).expect("asset config must exist");
+        assert_eq!(cfg.band_bps, 50);
+        assert_eq!(cfg.daily_move_band_bps, 100);
+        assert_eq!(cfg.window_seconds, 172_800);
+        assert_eq!(cfg.window_move_band_bps, 50);
+        assert_eq!(cfg.max_staleness_s, 1800);
+    }
+
+    #[test]
+    fn timelock_loosening_asset_config_direct_call_panics() {
+        let (_env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let base = client.asset_config(&asset).unwrap();
+
+        // 1. Wider band_bps
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &(base.band_bps + 1),
+                &base.daily_move_band_bps,
+                &base.window_seconds,
+                &base.window_move_band_bps,
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "widening band_bps directly must fail");
+
+        // 2. Wider daily_move_band_bps
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &(base.daily_move_band_bps + 1),
+                &base.window_seconds,
+                &base.window_move_band_bps,
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "widening daily_move_band_bps directly must fail");
+
+        // 3. Shorter window_seconds
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &base.daily_move_band_bps,
+                &(base.window_seconds - 1),
+                &base.window_move_band_bps,
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "shortening window_seconds directly must fail");
+
+        // 4. Wider window_move_band_bps
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &base.daily_move_band_bps,
+                &base.window_seconds,
+                &(base.window_move_band_bps + 1),
+                &base.max_staleness_s,
+            );
+        }));
+        assert!(res.is_err(), "widening window_move_band_bps directly must fail");
+
+        // 5. Longer max_staleness_s
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_asset(
+                &admin,
+                &asset,
+                &base.band_bps,
+                &base.daily_move_band_bps,
+                &base.window_seconds,
+                &base.window_move_band_bps,
+                &(base.max_staleness_s + 1),
+            );
+        }));
+        assert!(res.is_err(), "increasing max_staleness_s directly must fail");
+    }
+
+    #[test]
+    fn timelock_loosening_parameters_via_queue_config() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let t0 = env.ledger().timestamp();
+
+        let id1 = client.queue_config(&admin, &ConfigChange::BandBps(asset.clone(), 150));
+        assert!(client.pending_config(&id1).is_some());
+
+        let id2 = client.queue_config(&admin, &ConfigChange::DailyMoveBandBps(asset.clone(), 300));
+        let id3 = client.queue_config(&admin, &ConfigChange::WindowSeconds(asset.clone(), 1800));
+        let id4 = client.queue_config(&admin, &ConfigChange::WindowMoveBandBps(asset.clone(), 250));
+        let id5 = client.queue_config(&admin, &ConfigChange::MaxStalenessSeconds(asset.clone(), 7200));
+        let id6 = client.queue_config(&admin, &ConfigChange::Asset(asset.clone(), 200, 400, 900, 350, 10_000));
+
+        for id in [id1, id2, id3, id4, id5, id6] {
+            let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.execute_config(&id);
+            }));
+            assert!(early.is_err(), "early execution must fail");
+        }
+
+        env.ledger().with_mut(|l| {
+            l.timestamp = t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+
+        client.execute_config(&id1);
+        assert_eq!(client.asset_config(&asset).unwrap().band_bps, 150);
+        assert!(client.pending_config(&id1).is_none());
+
+        client.execute_config(&id2);
+        assert_eq!(client.asset_config(&asset).unwrap().daily_move_band_bps, 300);
+
+        client.execute_config(&id3);
+        assert_eq!(client.asset_config(&asset).unwrap().window_seconds, 1800);
+
+        client.execute_config(&id4);
+        assert_eq!(client.asset_config(&asset).unwrap().window_move_band_bps, 250);
+
+        client.execute_config(&id5);
+        assert_eq!(client.asset_config(&asset).unwrap().max_staleness_s, 7200);
+
+        client.execute_config(&id6);
+        let final_cfg = client.asset_config(&asset).unwrap();
+        assert_eq!(final_cfg.band_bps, 200);
+        assert_eq!(final_cfg.daily_move_band_bps, 400);
+        assert_eq!(final_cfg.window_seconds, 900);
+        assert_eq!(final_cfg.window_move_band_bps, 350);
+        assert_eq!(final_cfg.max_staleness_s, 10_000);
+    }
+
+    #[test]
+    fn timelock_issuer_key_initial_and_rotation() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let (pubkey1, _) = test_issuer_keypair(&env);
+        let pubkey2 = BytesN::from_array(&env, &[7u8; 32]);
+
+        client.configure_issuer_key(&admin, &asset, &pubkey1);
+        assert_eq!(client.issuer_pubkey(&asset), Some(pubkey1.clone()));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_issuer_key(&admin, &asset, &pubkey2);
+        }));
+        assert!(res.is_err(), "direct rotation of issuer key must fail");
+
+        let t0 = env.ledger().timestamp();
+        let id = client.queue_config(&admin, &ConfigChange::IssuerPubKey(asset.clone(), pubkey2.clone()));
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&id);
+        }));
+        assert!(early.is_err());
+
+        env.ledger().with_mut(|l| {
+            l.timestamp = t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+
+        client.execute_config(&id);
+        assert_eq!(client.issuer_pubkey(&asset), Some(pubkey2));
+    }
+
+    #[test]
+    fn timelock_signature_requirement_tighten_vs_loosen() {
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(100, 200, 3600);
+
+        client.configure_signature_requirement(&admin, &true);
+        assert_eq!(client.require_nav_signature(), true);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_signature_requirement(&admin, &false);
+        }));
+        assert!(res.is_err(), "disabling signature requirement directly must fail");
+
+        let t0 = env.ledger().timestamp();
+        let id = client.queue_config(&admin, &ConfigChange::RequireNavSignature(false));
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&id);
+        }));
+        assert!(early.is_err());
+
+        env.ledger().with_mut(|l| {
+            l.timestamp = t0 + ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+
+        client.execute_config(&id);
+        assert_eq!(client.require_nav_signature(), false);
+    }
+
+    #[test]
+    fn timelock_cancel_config_and_stranger_checks() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let stranger = Address::generate(&env);
+
+        let change = ConfigChange::BandBps(asset.clone(), 150);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_config",
+                args: (stranger.clone(), change.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_config(&stranger, &change);
+        }));
+        assert!(res.is_err(), "stranger cannot queue_config");
+
+        env.mock_all_auths();
+        let id = client.queue_config(&admin, &change);
+        assert!(client.pending_config(&id).is_some());
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_config",
+                args: (stranger.clone(), id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_config(&stranger, &id);
+        }));
+        assert!(res.is_err(), "stranger cannot cancel_config");
+
+        env.mock_all_auths();
+        client.cancel_config(&admin, &id);
+        assert!(client.pending_config(&id).is_none());
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&id);
+        }));
+        assert!(res.is_err(), "cancelled config cannot be executed");
+    }
+
+    #[test]
+    fn a_stranger_cannot_queue_or_cancel_upgrade() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 10_000, 3600);
+        let stranger = Address::generate(&env);
+        let dummy_wasm = BytesN::from_array(&env, &[1u8; 32]);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_upgrade",
+                args: (stranger.clone(), dummy_wasm.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.queue_upgrade(&stranger, &dummy_wasm);
+        }));
+        assert!(result.is_err(), "only the stored admin may queue an upgrade");
+
+        env.mock_all_auths();
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_upgrade",
+                args: (stranger.clone(), id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let cancel_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_upgrade(&stranger, &id);
+        }));
+        assert!(cancel_res.is_err(), "only the stored admin may cancel an upgrade");
+
+        env.mock_all_auths();
+        client.cancel_upgrade(&admin, &id);
+        assert_eq!(client.pending_upgrade(&id), None);
+    }
+
+    #[test]
+    fn execute_upgrade_requires_the_timelock_to_elapse() {
+        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 10_000, 3600);
+        let dummy_wasm = BytesN::from_array(&env, &[2u8; 32]);
+        let id = client.queue_upgrade(&admin, &dummy_wasm);
+
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_upgrade(&id);
+        }));
+        assert!(early.is_err(), "cannot execute upgrade before 48h elapses");
+    }
+
+    #[test]
+    fn test_price_guard_upgrade_and_state_persistence() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        const NEW_WASM: &[u8] = include_bytes!("../../../vendor/test_wasms/contract.wasm");
+        let new_wasm_hash = env.deployer().upload_contract_wasm(NEW_WASM);
+
+        let id = client.queue_upgrade(&admin, &new_wasm_hash);
+        assert_eq!(
+            client.pending_upgrade(&id),
+            Some(ballast_common::upgrade::PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                executes_at: env.ledger().timestamp() + 48 * 3600,
+            })
+        );
+
+        // Advance 48 hours
+        env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600);
+        client.execute_upgrade(&id);
+
+        env.as_contract(&client.address, || {
+            assert_eq!(ballast_common::upgrade::pending_upgrade(&env, id), None);
+        });
+
+        mod upgraded {
+            soroban_sdk::contractimport!(file = "../../vendor/test_wasms/contract.wasm");
+        }
+        let upgraded_client = upgraded::Client::new(&env, &client.address);
+        let sum = upgraded_client.add(&15, &27);
+        assert_eq!(sum, 42);
+
+        // State persists: the last good price and config established before upgrade are still in storage
+        env.as_contract(&client.address, || {
+            let last_good: Option<i128> = env.storage().instance().get(&DataKey::LastGood(asset.clone()));
+            assert_eq!(last_good, Some(SCALE));
+            let config = read_config(&env, &asset);
+            assert_eq!(config.band_bps, 50);
+            assert_eq!(config.daily_move_band_bps, 10_000);
+        });
+    }
+
+    #[test]
+    fn median_of_two_sources_averages_middle_rounded_down() {
+        // Band of 100 bps (1%), daily move band 10,000 bps (100%).
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // 1.0000000 and 1.0050000 (diff is 50 bps, within 100 bps band).
+        let val1 = SCALE; // 10_000_000
+        let val2 = SCALE + 50_000; // 10_050_000 (1.005)
+        let expected = (val1 + val2) / 2; // 10_025_000 (1.0025)
+
+        client.publish_nav(&publisher, &asset, &code, &val1, &now, &sig);
+        let feed_name = feed(&env);
+        client.publish_source(&publisher, &asset, &feed_name, &val2, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+    }
+
+    #[test]
+    fn median_of_four_sources_averages_middle_two_rounded_down() {
+        // Band of 100 bps, daily move band 10,000 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Four sorted values: 10_000_000, 10_020_000, 10_040_001, 10_050_000.
+        // Middle two: 10_020_000 and 10_040_001.
+        // Sum = 20_060_001. Average rounded down = 10_030_000.
+        let v1 = SCALE; // 10_000_000
+        let v2 = SCALE + 20_000; // 10_020_000
+        let v3 = SCALE + 40_001; // 10_040_001
+        let v4 = SCALE + 50_000; // 10_050_000
+        let expected = (v2 + v3) / 2;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        let s4 = Symbol::new(&env, "feed_4");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+        client.publish_source(&publisher, &asset, &s4, &v4, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, expected);
+        assert_eq!(price.value, 10_030_000);
+    }
+
+    #[test]
+    fn median_of_odd_sources_returns_middle_value() {
+        // Band of 100 bps.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Three sorted values: 10_000_000, 10_030_000, 10_060_000.
+        // Middle is 10_030_000.
+        let v1 = SCALE;
+        let v2 = SCALE + 30_000;
+        let v3 = SCALE + 60_000;
+
+        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        let s2 = Symbol::new(&env, "feed_2");
+        let s3 = Symbol::new(&env, "feed_3");
+        client.publish_source(&publisher, &asset, &s2, &v2, &now);
+        client.publish_source(&publisher, &asset, &s3, &v3, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, v2);
+    }
+
+    // `within_band` boundaries. The band is inclusive: a spread of exactly `band_bps` is still
+    // within band, one bp more is not.
+
+    #[test]
+    fn within_band_spread_equal_to_band_is_inside() {
+        // (10_050 - 10_000) * 10_000 / 10_000 = 50 bps.
+        assert!(within_band(&[10_000, 10_050], 50));
+    }
+
+    #[test]
+    fn within_band_spread_one_over_band_is_outside() {
+        // 51 bps against a 50 bp band.
+        assert!(!within_band(&[10_000, 10_051], 50));
+    }
+
+    #[test]
+    fn within_band_non_positive_minimum_is_outside() {
+        assert!(!within_band(&[0, 5], 50));
+    }
+
+    #[test]
+    fn within_band_single_value_is_inside() {
+        assert!(within_band(&[10_000], 50));
+    }
+
+    #[test]
+    fn within_band_empty_slice_is_inside() {
+        assert!(within_band(&[], 50));
+    }
+
+    #[test]
+    fn within_band_only_extremes_decide() {
+        // The middle value never matters; only min and max, wherever they sit in the slice.
+        assert!(within_band(&[10_025, 10_050, 10_000], 50));
+        assert!(!within_band(&[10_051, 10_025, 10_000], 50));
+    }
+
+    #[test]
+    fn admin_can_remove_source_and_free_slot() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Publish NAV (slot 1) + 7 feeds (slots 2..8) -> total 8 sources.
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        for i in 1..=7 {
+            let name = Symbol::new(&env, &std::format!("feed_{}", i));
+            client.publish_source(&publisher, &asset, &name, &SCALE, &now);
+        }
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.sources.len(), 8);
+
+        // Attempting a 9th publish before removal panics because SortBuf capacity is 8.
+        let name_9 = Symbol::new(&env, "feed_9");
+        let res_9 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&publisher, &asset, &name_9, &SCALE, &now);
+        }));
+        assert!(res_9.is_err(), "publishing 9th source must panic before removal");
+
+        // Admin removes feed_7.
+        let name_7 = Symbol::new(&env, "feed_7");
+        client.remove_source(&admin, &asset, &name_7);
+
+        let price_after_remove = client.guarded_price(&asset);
+        assert_eq!(price_after_remove.status, PriceStatus::Ok);
+        assert_eq!(price_after_remove.sources.len(), 7);
+
+        // Now feed_9 can be published successfully in the freed slot.
+        client.publish_source(&publisher, &asset, &name_9, &SCALE, &now);
+        let price_after_9 = client.guarded_price(&asset);
+        assert_eq!(price_after_9.status, PriceStatus::Ok);
+        assert_eq!(price_after_9.sources.len(), 8);
+
+        // Removing unknown name is a safe no-op.
+        let unknown = Symbol::new(&env, "unknown");
+        client.remove_source(&admin, &asset, &unknown);
+        let price_after_unknown = client.guarded_price(&asset);
+        assert_eq!(price_after_unknown.sources.len(), 8);
+    }
+
+    #[test]
+    fn a_stranger_cannot_remove_source() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let stranger = Address::generate(&env);
+        let feed_name = feed(&env);
+        let now = env.ledger().timestamp();
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "remove_source",
+                args: (stranger.clone(), asset.clone(), feed_name.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.remove_source(&stranger, &asset, &feed_name);
+        }));
+        assert!(result.is_err(), "only the stored admin may remove a source");
+
+        // Real admin succeeds.
+        env.mock_all_auths();
+        client.remove_source(&admin, &asset, &feed_name);
     }
 
     mod invariants;

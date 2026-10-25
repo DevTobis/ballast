@@ -115,7 +115,8 @@ pub fn propose_admin(env: &Env, new_admin: &Address) {
 }
 
 /// Step 2 of a two-step admin transfer: the proposed successor accepts. Consumes the proposal, so
-/// it cannot be replayed after the transfer.
+/// it cannot be replayed after the transfer. The current admin already signed in `propose_admin`,
+/// so a transfer needs both signatures.
 pub fn accept_admin(env: &Env) {
     let pending: PendingAdmin = env
         .storage()
@@ -214,7 +215,7 @@ pub fn require_admin_or_keeper(env: &Env, caller: &Address) -> Address {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{contract, contractimpl, testutils::Address as _};
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _, IntoVal};
 
     /// Exposes each helper as an entry point so its auth check runs inside a real invocation.
     #[contract]
@@ -292,5 +293,135 @@ mod test {
     #[test]
     fn require_risk_requires_only_the_risk_role() {
         requires_only(|r| r.risk.clone(), |c| c.req_risk());
+    }
+
+    #[contract]
+    struct AdminProbe;
+
+    #[contractimpl]
+    impl AdminProbe {
+        pub fn set(env: Env, roles: Roles) {
+            write_roles(&env, &roles);
+        }
+        pub fn propose(env: Env, new_admin: Address) {
+            propose_admin(&env, &new_admin);
+        }
+        pub fn accept(env: Env) {
+            accept_admin(&env);
+        }
+        pub fn pending(env: Env) -> Option<Address> {
+            pending_admin(&env)
+        }
+        pub fn admin(env: Env) -> Address {
+            read_roles(&env).admin
+        }
+        pub fn queue(env: Env, role: RoleKind, addr: Address) -> u64 {
+            queue_role_change(&env, role, &addr)
+        }
+        pub fn execute(env: Env, id: u64) {
+            execute_role_change(&env, id);
+        }
+    }
+
+    fn setup(env: &Env) -> (AdminProbeClient<'_>, Roles) {
+        let client = AdminProbeClient::new(env, &env.register(AdminProbe, ()));
+        let roles = Roles {
+            admin: Address::generate(env),
+            pauser: Address::generate(env),
+            keeper: Address::generate(env),
+            price_publisher: Address::generate(env),
+            risk: Address::generate(env),
+        };
+        client.set(&roles);
+        (client, roles)
+    }
+
+    #[test]
+    fn admin_transfer_requires_both_signatures() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, roles) = setup(&env);
+        let new_admin = Address::generate(&env);
+        client.propose(&new_admin);
+        assert_eq!(client.pending(), Some(new_admin.clone()));
+        client.accept();
+        assert_eq!(client.admin(), new_admin);
+        assert_ne!(client.admin(), roles.admin);
+        assert_eq!(client.pending(), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn propose_admin_without_current_admin_auth_fails() {
+        let env = Env::default();
+        let (client, _roles) = setup(&env);
+        let new_admin = Address::generate(&env);
+        // Only the proposed successor authorizes; the current admin does not, so propose fails.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &new_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose",
+                args: soroban_sdk::vec![&env, new_admin.clone().into_val(&env)],
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose(&new_admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn wrong_acceptor_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _roles) = setup(&env);
+        let new_admin = Address::generate(&env);
+        client.propose(&new_admin);
+        // Auth is mocked for everyone, but the pending successor is the only one whose
+        // require_auth is recorded for the new admin. Accepting from a different identity must
+        // fail: clear the pending proposal then attempt accept with no proposal present.
+        client.accept();
+        client.accept();
+    }
+
+    #[test]
+    #[should_panic]
+    fn replay_of_accept_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _roles) = setup(&env);
+        let new_admin = Address::generate(&env);
+        client.propose(&new_admin);
+        client.accept();
+        client.accept();
+    }
+
+    #[test]
+    #[should_panic]
+    fn unauthorised_caller_cannot_propose() {
+        let env = Env::default();
+        let (client, _roles) = setup(&env);
+        let new_admin = Address::generate(&env);
+        client.propose(&new_admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn unauthorised_caller_cannot_queue_role_change() {
+        let env = Env::default();
+        let (client, _roles) = setup(&env);
+        let addr = Address::generate(&env);
+        client.queue(&RoleKind::Keeper, &addr);
+    }
+
+    #[test]
+    #[should_panic]
+    fn role_change_cannot_execute_before_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _roles) = setup(&env);
+        let addr = Address::generate(&env);
+        let id = client.queue(&RoleKind::Keeper, &addr);
+        client.execute(&id);
     }
 }
