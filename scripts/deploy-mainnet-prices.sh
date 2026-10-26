@@ -30,7 +30,10 @@
 # delete the file to deploy afresh, which orphans the contracts it lists. `deploy` and `initialize`
 # are sent once, never retried, and `initialize` is checked against the contract's `roles` on chain
 # (so one that landed before its marker was written is recognised, and one made by someone else is
-# refused). The other steps are re-run on resume if they were killed before their marker was written.
+# refused). `register_asset` reads the registry before every attempt and never re-sends once the asset is
+# there (a repeat would panic "already registered"). The `configure_*` calls take the same values again
+# without error (a repeat is not a loosening), so they are retried blindly and re-run on resume if they
+# were killed before their marker was written.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -182,6 +185,57 @@ print("ok" if all(have.get(k) == v for k, v in want.items()) else "foreign")' \
   return 1
 }
 
+# What the registry holds for an asset: prints `ok` (registered with the config this run would send),
+# `mismatch` (registered with a different one) or `absent`. Free simulation, retried on RPC errors;
+# an unregistered asset panics, which release builds surface as UnreachableCodeReached.
+asset_state() {
+  local sac=$1 out err attempt
+  err=$(mktemp)
+  for attempt in 1 2 3 4 5 6; do
+    if out=$(stellar contract invoke --id "${CID[registry]}" --source mainnet_admin --network "$NETWORK" -- asset --asset "$sac" 2>"$err"); then
+      rm -f "$err"
+      python3 -c 'import json,sys
+want = {"issuer": sys.argv[2], "contract": sys.argv[3], "haircut_base_bps": int(sys.argv[4]),
+        "price_band_bps": int(sys.argv[5]), "daily_move_band_bps": int(sys.argv[6])}
+have = json.loads(sys.argv[1])
+print("ok" if all(have.get(k) == v for k, v in want.items()) else "mismatch")' \
+        "$out" "$ISSUER" "$sac" "$HAIRCUT_BASE_BPS" "$PRICE_BAND_BPS" "$DAILY_MOVE_BAND_BPS"
+      return
+    fi
+    if grep -q "UnreachableCodeReached" "$err"; then rm -f "$err"; echo absent; return; fi
+    sleep 3
+  done
+  echo "!!! could not read the registry entry of $sac after 6 attempts:" >&2
+  sed 's/^/    /' "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+# `register_asset` is not safe to repeat blindly: once the transaction has landed, every further
+# attempt panics "asset already registered", so a lost response would fail the run for good. Each
+# attempt therefore reads the registry first and only sends while the asset is absent.
+register_asset_checked() {
+  local sac=$1 config=$2 attempt state
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "[dry-run] register_asset $sac $config" >&2
+    return 0
+  fi
+  for attempt in 1 2 3 4 5 6; do
+    state=$(asset_state "$sac") || return 1
+    case $state in
+      ok) return 0 ;;
+      mismatch)
+        echo "!!! $sac is already registered in ${CID[registry]} with a different config; not touching it." >&2
+        return 1 ;;
+    esac
+    stellar contract invoke --id "${CID[registry]}" --source mainnet_admin --network "$NETWORK" -- register_asset \
+      --admin "$ADMIN" --asset "$sac" --config "$config" >/dev/null || sleep 3
+  done
+  [[ "$(asset_state "$sac")" == ok ]] && return 0
+  echo "!!! $sac is still not registered after 6 attempts" >&2
+  return 1
+}
+
 # Derives the 32-byte ed25519 key (hex) from a G-address. A G-address is base32(version byte | key |
 # CRC16-XModem checksum), so the version and checksum are checked: a malformed address must never
 # turn into a key that gets registered as the NAV attestor.
@@ -319,10 +373,7 @@ for row in "${ROWS[@]}"; do
   SAC_LINES+="SAC_${CODE}=$SAC"$'\n'
 
   if step_done "REGISTER_$CODE"; then log "  $CODE already registered, skipping"; else
-    run stellar contract invoke --id "${CID[registry]}" --source mainnet_admin --network "$NETWORK" -- register_asset \
-      --admin "$ADMIN" --asset "$SAC" \
-      --config "{\"issuer\":\"$ISSUER\",\"contract\":\"$SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"$CCY\",\"redemption_lag_days\":1,\"haircut_base_bps\":$HAIRCUT_BASE_BPS,\"haircut_fx_bps\":0,\"price_band_bps\":$PRICE_BAND_BPS,\"daily_move_band_bps\":$DAILY_MOVE_BAND_BPS,\"status\":\"active\"}" \
-      >/dev/null
+    register_asset_checked "$SAC" "{\"issuer\":\"$ISSUER\",\"contract\":\"$SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"$CCY\",\"redemption_lag_days\":1,\"haircut_base_bps\":$HAIRCUT_BASE_BPS,\"haircut_fx_bps\":0,\"price_band_bps\":$PRICE_BAND_BPS,\"daily_move_band_bps\":$DAILY_MOVE_BAND_BPS,\"status\":\"active\"}"
     mark_step "REGISTER_$CODE"
   fi
 
