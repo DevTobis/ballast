@@ -1,7 +1,7 @@
 # Testnet deployment
 
 All six contracts are deployed, initialized, configured and asset-registered on Stellar testnet, and
-`e2e-services.sh` and `e2e-liquidation.sh` have passed against this exact deployment with real signed,
+`e2e-smoke.sh`, `e2e-services.sh`, `e2e-liquidation.sh` and `e2e-repo-margin.sh` have passed against this exact deployment with real signed,
 submitted transactions and real prices. Nothing on it is mocked; the two tokens are test tokens this
 repo issues (see "Test assets").
 
