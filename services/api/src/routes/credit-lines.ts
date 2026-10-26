@@ -350,7 +350,8 @@ export function registerCreditLineRoutes(
       const debtSource = onChainDebt === undefined ? "estimate" : "on-chain";
 
       const postReleaseLtvBps = await estimateLtvBps(db, line.id, pledge.id, onChainDebt);
-      if (postReleaseLtvBps >= MARGIN_THRESHOLDS.marginCallBps) {
+      // Same bar as the contract (PledgeVault.release) and CreditLine.draw: the line must stay Healthy.
+      if (postReleaseLtvBps >= MARGIN_THRESHOLDS.warningBps) {
         return reply.code(409).send({
           error: "release would breach the healthy LTV threshold",
           projectedLtvBps: postReleaseLtvBps,
