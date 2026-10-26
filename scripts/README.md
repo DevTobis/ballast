@@ -186,6 +186,17 @@ before sending the first mainnet transaction. The role accounts (`mainnet_admin`
 `mainnet_keeper`, `mainnet_price_publisher`, `mainnet_risk`) must already exist and be funded; the
 script never generates keys on mainnet.
 
+**If the run is interrupted.** Each contract id is appended to `.env.mainnet-deploy.partial`
+(git-ignored) as soon as it is deployed, with a `STEP_` marker after every completed on-chain step,
+and the script prints that file when it stops. A re-run refuses to start while it exists. Read it,
+fix the cause, then continue with `RESUME_PARTIAL=1 CONFIRM_MAINNET=deploy-prices
+scripts/deploy-mainnet-prices.sh`: it reuses the recorded ids, skips the marked steps, and refuses
+if a role identity no longer matches the one recorded. Deleting the file instead starts a new
+deployment and leaves the listed contracts orphaned. A step that landed on chain but was killed
+before its marker was written runs again on resume; `initialize` then fails with "already
+initialized", so check the chain and add the `STEP_` line by hand. On success the partial file is
+removed and `.env.mainnet-deploy` has the same format as before.
+
 ## If a CLI flag doesn't match
 
 The flag names were originally derived offline from `stellar contract info interface --wasm
