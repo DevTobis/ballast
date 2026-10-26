@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { signTransaction } from "@stellar/freighter-api";
 import { api, type BuiltTx, type TxResult } from "../lib/api.ts";
 import { useAuth } from "../lib/auth.tsx";
-import { networkPassphrase, txExplorerUrl } from "../lib/explorer.ts";
+import { networkPassphrase } from "../lib/config.ts";
+import { txExplorerUrl } from "../lib/explorer.ts";
 import { Button } from "./Button.tsx";
 
 type Phase = "ready" | "signing" | "submitting" | "pending" | "settled" | "failed" | "expired";

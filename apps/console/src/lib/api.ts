@@ -1,6 +1,5 @@
+import { apiUrl } from "./config.ts";
 import { notifyUnauthorized } from "./unauthorized.ts";
-
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 
 export class ApiError extends Error {
   constructor(
@@ -13,7 +12,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, token: string | null, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, {
+  const res = await fetch(`${apiUrl()}${path}`, {
     ...init,
     headers: {
       // Only with a body: Fastify rejects a JSON content-type on an empty one (e.g. DELETE).

@@ -18,6 +18,7 @@ import {
   formatDecimalString,
   formatDuration,
   formatScaledBigintString,
+  marginBand,
   toScaled,
 } from "../lib/format.ts";
 
@@ -150,7 +151,7 @@ export function BorrowerView() {
   );
 }
 
-function BorrowerLineDetail({
+export function BorrowerLineDetail({
   detail,
   pledges,
   assets,
@@ -162,7 +163,8 @@ function BorrowerLineDetail({
   onChanged: () => void;
 }) {
   const { session } = useAuth();
-  const [tx, setTx] = useState<BuiltTx | null>(null);
+  // Only a release answers with the LTV it would leave behind, so the preview below shows for that kind alone.
+  const [tx, setTx] = useState<(BuiltTx & { projectedLtvBps?: number }) | null>(null);
   const [drawAmount, setDrawAmount] = useState("");
   const [drawTo, setDrawTo] = useState(session?.stellarAccount ?? "");
   const [repayAmount, setRepayAmount] = useState("");
@@ -351,6 +353,14 @@ function BorrowerLineDetail({
       {actionError && <p className="text-xs text-accent">ERROR: {actionError}</p>}
       {txOpen && (
         <p className="text-xs text-fg-dim">Finish or dismiss the open transaction below before building another.</p>
+      )}
+      {tx && tx.projectedLtvBps !== undefined && (
+        <p role="status" className="border border-line bg-bg-raised px-3 py-2 text-xs uppercase tracking-wider text-fg-dim">
+          LTV after release: <span className="text-fg">{bpsToPercent(tx.projectedLtvBps)}</span>{" "}
+          <span className={marginBand(tx.projectedLtvBps) === "healthy" ? "text-ok" : "text-accent"}>
+            ({marginBand(tx.projectedLtvBps)})
+          </span>
+        </p>
       )}
       {tx && (
         <XdrOutput
