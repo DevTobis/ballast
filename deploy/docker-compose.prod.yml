@@ -40,6 +40,15 @@ services:
         condition: service_healthy
     command: ["sh", "-c", "pnpm --filter @ballast/db migrate"]
 
+  # One-shot, not started by `up`: `docker compose --profile seed run --rm seed` inserts the assets in
+  # scripts/shadow-assets.json into `asset`, which is where the price-guard reads what to publish.
+  # Safe to repeat (assets already there are skipped). See "Before the first start" in deploy/README.md.
+  seed:
+    <<: *service
+    restart: "no"
+    profiles: ["seed"]
+    command: ["sh", "-c", "pnpm --filter @ballast/service-price-guard shadow:seed"]
+
   api:
     <<: *service
     environment:
