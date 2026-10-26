@@ -132,7 +132,7 @@ retry stellar contract invoke --id "${CID[registry]}" --source admin --network "
 # (weekends); it can only be loosened later through the timelocked queue_config, so keep the default
 # for anything but a throwaway deployment.
 PRICE_MAX_STALENESS_S=${PRICE_MAX_STALENESS_S:-21600}
-log "Configuring PriceGuard for RWA1 (50bps band, 100bps daily move, ${PRICE_MAX_STALENESS_S}s staleness - RedStone's USTRY feed updates every 1-2h)"
+log "Configuring PriceGuard for RWA1 (50bps band, 100bps daily move, ${PRICE_MAX_STALENESS_S}s staleness - RedStone's USTRY feed was seen updating every 12h, so under ~13h the guard is Degraded part of each day)"
 retry stellar contract invoke --id "${CID[price-guard]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --band_bps 50 --daily_move_band_bps 100 \
   --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s "$PRICE_MAX_STALENESS_S" >/dev/null

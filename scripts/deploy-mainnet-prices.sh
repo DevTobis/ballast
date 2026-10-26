@@ -44,7 +44,10 @@ DAILY_MOVE_BAND_BPS=${DAILY_MOVE_BAND_BPS:-100}
 # Rolling reference: a cumulative move beyond WINDOW_MOVE_BAND_BPS within WINDOW_SECONDS halts.
 WINDOW_SECONDS=${WINDOW_SECONDS:-86400}
 WINDOW_MOVE_BAND_BPS=${WINDOW_MOVE_BAND_BPS:-100}
-# RedStone's RWA feeds update every 1-2h; the issuer NAV every few minutes.
+# The issuer NAV updates every few minutes, but RedStone's USTRY feed was seen updating only every 12h
+# (00:10 and 12:10 UTC), and PriceGuard needs two fresh sources: with a window under ~13h the guard is
+# Degraded for part of every day. 21600 is kept as the default only until that is decided; see
+# TESTNET_DEPLOYMENT.md.
 MAX_STALENESS_S=${MAX_STALENESS_S:-21600}
 HAIRCUT_BASE_BPS=${HAIRCUT_BASE_BPS:-500}
 
