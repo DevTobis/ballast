@@ -58,10 +58,10 @@ RedStone's USTRY feed contract read from **mainnet** (RedStone publishes no RWA 
 - The price publisher's Ed25519 key is registered as `RWA1`'s NAV attestor and `PriceGuard` requires
   the signature (`scripts/configure-nav-key.sh`). No issuer signs NAV, so the guarantee is that
   Ballast's publisher saw the value from the issuer's API, not issuer attestation.
-- `max_staleness_s` is 46,800 (13h) on this deployment (`PRICE_MAX_STALENESS_S=46800 scripts/deploy.sh
-  testnet`). RedStone's USTRY feed does **not** update every 1-2 hours: the readings recorded while
+- `max_staleness_s` is 46,800 (13h) on this deployment, which is now the default of `scripts/deploy.sh`,
+  `scripts/redeploy-price-guard.sh` and `scripts/deploy-mainnet-prices.sh`. RedStone's USTRY feed does **not** update every 1-2 hours: the readings recorded while
   testing were stamped 00:10 and 12:10 UTC, a 12-hour cadence with no weekend gap. PriceGuard needs two
-  fresh sources, so the earlier 6h window (the script default, 21,600) left the guard `Degraded`, and the
+  fresh sources, so the earlier 6h window (the old script default, 21,600) left the guard `Degraded`, and the
   API refusing to lend, for about half of every day. 13h covers the 12h cadence plus an hour of slack.
 - `PriceGuard` evaluates on every publish (see `contracts/AUDIT_NOTES.md`), and refuses readings
   dated more than 60s ahead of the ledger or with a non-positive price.
