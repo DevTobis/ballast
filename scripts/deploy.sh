@@ -128,10 +128,14 @@ retry stellar contract invoke --id "${CID[registry]}" --source admin --network "
   --config "{\"issuer\":\"$RWA_ISSUER\",\"contract\":\"$RWA_SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"USD\",\"redemption_lag_days\":1,\"haircut_base_bps\":500,\"haircut_fx_bps\":0,\"price_band_bps\":50,\"daily_move_band_bps\":100,\"status\":\"active\"}" \
   >/dev/null
 
-log "Configuring PriceGuard for RWA1 (50bps band, 100bps daily move, 6h staleness - RedStone's USTRY feed updates every 1-2h)"
+# Override PRICE_MAX_STALENESS_S for a testnet demo that must run when RedStone's USTRY feed is idle
+# (weekends); it can only be loosened later through the timelocked queue_config, so keep the default
+# for anything but a throwaway deployment.
+PRICE_MAX_STALENESS_S=${PRICE_MAX_STALENESS_S:-21600}
+log "Configuring PriceGuard for RWA1 (50bps band, 100bps daily move, ${PRICE_MAX_STALENESS_S}s staleness - RedStone's USTRY feed updates every 1-2h)"
 retry stellar contract invoke --id "${CID[price-guard]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --band_bps 50 --daily_move_band_bps 100 \
-  --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s 21600 >/dev/null
+  --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s "$PRICE_MAX_STALENESS_S" >/dev/null
 
 log "Configuring PledgeVault for RWA1 (5% haircut, escrow mode)"
 retry stellar contract invoke --id "${CID[pledge-vault]}" --source admin --network "$NETWORK" -- configure_asset \

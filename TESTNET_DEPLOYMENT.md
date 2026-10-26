@@ -1,7 +1,7 @@
 # Testnet deployment
 
 All six contracts are deployed, initialized, configured and asset-registered on Stellar testnet, and
-every end-to-end drill in `scripts/` has passed against this exact deployment with real signed,
+`e2e-services.sh` and `e2e-liquidation.sh` have passed against this exact deployment with real signed,
 submitted transactions and real prices. Nothing on it is mocked; the two tokens are test tokens this
 repo issues (see "Test assets").
 
@@ -9,9 +9,9 @@ repo issues (see "Test assets").
 
 `testnet` (`https://soroban-testnet.stellar.org`, passphrase `Test SDF Network ; September 2015`).
 
-## Current deployment (2026-10-08)
+## Current deployment (2026-10-25)
 
-Deployed in full with `scripts/deploy.sh testnet`. Earlier deployments (2026-09-17 and three
+Deployed in full with `scripts/deploy.sh testnet`. Earlier deployments (2026-10-08, 2026-09-17 and three
 intermediate ones made the same day while the contracts changed) are abandoned: each redeploy
 regenerates the role keys, so they can no longer be administered.
 
@@ -19,12 +19,12 @@ regenerates the role keys, so they can no longer be administered.
 
 | Contract | Contract ID |
 |---|---|
-| `registry` | `CD5FBP5FB24KUGUI5B3Q3YITQRA6YKFOEZWOEAAJ252VZ3REOVCRXYY7` |
-| `price-guard` | `CDZHCZHEFWD5ENWDHIRHUKGNRAMLPCXU3G3VYUACRTD34TUV2HRC4HF3` |
-| `pledge-vault` | `CC63JA7ZYE2WLYD32Y55VH44QQ2KTPXFEF7OU7PXA3K45GM2C2Q3BWUF` |
-| `credit-line` | `CCJABUP4DW632LJ6WHHW32DLNBNSV6W6GBPAWRAFVIHG6FWSRFW2OJXW` |
-| `exit-desk` | `CC6C2NKW6VFHXXCM6RPSWTD6Y2PBEZK45S573XCCLAE3QC2AF6WF6FW6` |
-| `repo-dvp` | `CBNIP4NSNHMYKWWSWIIABAZ7KLM2E7OX5HNLEZLXX2JUAFFXXDULWRFR` |
+| `registry` | `CALNSDZTJ7Y46XLSEVX7CHF7KVFO5L7QOMMDKHUWAUFX2FVB5KXVAPJ5` |
+| `price-guard` | `CAIPCSRMTBT7BUNYBQZWAFMSLGLM2TBU2B6DL4ZSUNAGJSQOV2DTI3IZ` |
+| `pledge-vault` | `CDVVS6I2KDUO5S5GCG7K7QMVULFLZFP2XL5ILVGT7YIAYRNARBCNDWQY` |
+| `credit-line` | `CAMNPRSWDSCLTKBFEF7MAXNFXRRP3U366LNR3BYAYKRAUWG6VFMWHTFD` |
+| `exit-desk` | `CA3SVJHY2DMUQYEHGPGDHXKQNUMLAZRR5WTGBTNQB5ZTGF6FXIKKRHXV` |
+| `repo-dvp` | `CDT4LQGLA7XQRRBYU6KGBL724A6PBMVUDEAXD2H2WL5OTCZVHXMFXNXN` |
 
 ### Test assets
 
@@ -32,18 +32,18 @@ Issued fresh for this deploy. They are not real RWAs or real USDC.
 
 | Asset | Classic issuer | SAC contract ID |
 |---|---|---|
-| `RWA1` | `GAXNUJKCMIFS2NAOHSDW47HFW63EELDHEEXKW23Z5IJ7RP5L5IPEXQSV` | `CBLP7TT2G4GZILL4FXKKLZJC73XCPDZEZJNCQLZVKKYE66X6VSIMYUB7` |
-| `TUSD` | `GCTT6A6JJUFNO36MNFAYFRVNVNUYLVSIUE5JQI32R4FLI7V4LAVE25VG` | `CDTFUAZEGMRNEL2HGLNHCCUWMLJPXBVGVVDPSVCGJ4XHN5JP37JBSZHC` |
+| `RWA1` | `GDXZ3ZJPBYYLWI5QBH7LKWP5ADMKJL6JRPVHBQBUBB2BEPYEPQ4L3WMD` | `CCMFACKPB6HI2IRD2Z2ZIB4SAM5RCGHPFZPTWDPHJSWSNEDC3L7PQBUL` |
+| `TUSD` | `GC2J4WF5G5VQZVUVINYBE4XZOTAQUBLTOAVMTO54NWMHAP5HFUTH622R` | `CB64A4RG42DBLAOT52ZTEUBOJ75XV5E2CKJIISIBCLXPQOLXFCSOEJT5` |
 
 ### Role addresses
 
 | Role | Address |
 |---|---|
-| `admin` | `GASSLAAKTUJGXRVRLUVQDY6YONBAGVD6PAQSZZNPDWJX6PH5KVEHFV6J` |
-| `pauser` | `GCDQOFCIB33VYETYBJDWH4AHYSY5IGVRE2S654ZGVP7Z7XKJRGEFWEBY` |
-| `keeper` | `GA3KVWVISNVS2ZHZ2KOU4TXWNJZXXRUZQD57QZVQRTZUJATSXDZ4KOZV` |
-| `price_publisher` | `GDLHSDDPKURDZGMOYB75FF67FPRJ4466EHAOHI7RN3H7COTFHFNSZ5B2` |
-| `risk` | `GDVZHGNJJMNQQGJ5WXGZJXETMDG4D6B5JF3JKTQF2MJURDPM3POM4YAA` |
+| `admin` | `GBYCVOTQPVZNRZKF2HTDJ7OVGSEZBKES7GE7RWC2474PF3Y4HVBJGOR6` |
+| `pauser` | `GBPOUCTBPEYFAGGRC3I5RQGK5A3JTVLZFQ2L6A2MBDQEFDJP2C5V34CB` |
+| `keeper` | `GDG7772LNDHN7KUP5WSIZUYLZ3B2SBQ7JCM3NOSD3J7JCKOBDUAWI6XS` |
+| `price_publisher` | `GCSU2SJJNUEU6BVZ3UMXTSYY2IPMRIASXDV6FOVJVL3UWWS4QRQ3HPHB` |
+| `risk` | `GDYSUOMBC3IRJR6TEU7LBJSYJLZNW5TF5RTIQQLIA2HHKNNR3XNM5WPO` |
 
 All generated fresh for this deploy via `stellar keys generate ... --fund` (testnet friendbot); these
 are test keys with no real value, not production credentials.
@@ -58,8 +58,10 @@ RedStone's USTRY feed contract read from **mainnet** (RedStone publishes no RWA 
 - The price publisher's Ed25519 key is registered as `RWA1`'s NAV attestor and `PriceGuard` requires
   the signature (`scripts/configure-nav-key.sh`). No issuer signs NAV, so the guarantee is that
   Ballast's publisher saw the value from the issuer's API, not issuer attestation.
-- `max_staleness_s` is 21,600 (6h): RedStone's USTRY feed updates every 1-2 hours, so a 1h window made
-  the guard report `Degraded` and refuse to lend.
+- `max_staleness_s` is 259,200 (72h) on this deployment (`PRICE_MAX_STALENESS_S=259200 scripts/deploy.sh
+  testnet`): RedStone's USTRY feed does not update at weekends, and a 6h window (the script default,
+  21,600) left the guard `Degraded` and the API refusing to lend. A 1h window did the same on weekdays.
+  A production deployment should keep the tight default.
 - `PriceGuard` evaluates on every publish (see `contracts/AUDIT_NOTES.md`), and refuses readings
   dated more than 60s ahead of the ledger or with a non-positive price.
 
