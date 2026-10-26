@@ -324,8 +324,10 @@ impl PledgeVault {
     }
 
     /// Releases `units` of collateral back to `borrower`, but only if doing so leaves the linked
-    /// `CreditLine` at a healthy or warning LTV — never margin-call or liquidation. This is the
-    /// only borrower-initiated way RWA leaves the vault (PRD §8 invariant 4).
+    /// `CreditLine` at a healthy LTV, the same bar `CreditLine::draw` sets: a release that would
+    /// reach the warning threshold (or beyond) is refused, so releasing collateral can never give
+    /// a borrower more leverage than drawing the same amount would (PRD §8: "only if LTV stays
+    /// healthy"). This is the only borrower-initiated way RWA leaves the vault (PRD §8 invariant 4).
     ///
     /// **Security-critical check**: `Position` is keyed by `(line, asset)`, not `(borrower, line,
     /// asset)` (see the module doc comment on why), so nothing about the storage key itself proves
@@ -373,7 +375,7 @@ impl PledgeVault {
             let new_ltv_bps = risk::ltv_bps(ltv_view.debt, new_collateral_value);
             let state = margin::classify(new_ltv_bps, &config.thresholds);
             assert!(
-                matches!(state, MarginState::Healthy | MarginState::Warning),
+                matches!(state, MarginState::Healthy),
                 "pledge-vault: release would leave the credit line unhealthy"
             );
         }
@@ -790,6 +792,42 @@ mod test {
         // liquidation (>9000 bps) -> must panic.
         h.vault
             .release(&h.borrower, &1, &h.asset, &(950 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_leaving_ltv_exactly_at_the_warning_threshold_panics() {
+        // No haircut and a $1.00 price, so collateral value equals the units left. Debt 700 over
+        // 1,000 units left is exactly 7,000 bps, the Warning threshold: refused (draw refuses it too).
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(2_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(2_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn release_leaving_ltv_one_bp_under_the_warning_threshold_works() {
+        // Same line, but 0.1 unit more stays behind: 700 / 1,000.1 = 6,999 bps, still Healthy.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(2_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(2_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(9_999 * PRICE_SCALE / 10));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 10_001 * PRICE_SCALE / 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_from_a_line_already_in_warning_panics() {
+        // 750 debt over 1,000 units is 7,500 bps (Warning) before anything is released; even a tiny
+        // release is refused until the borrower repays.
+        let h = setup(0, 750 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &PRICE_SCALE);
     }
 
     #[test]

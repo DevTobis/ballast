@@ -62,13 +62,24 @@ const release = (app: ReturnType<typeof server>["app"]) =>
 
 describe("DELETE /v1/credit-lines/:id/pledges/:pledgeId", () => {
   it("refuses a release that only breaches once accrued interest is counted", async () => {
-    // 500 principal + 200 interest = 700 owed: 700 / 800 = 87.5%, past the 80% threshold.
+    // 500 principal + 200 interest = 700 owed: 700 / 800 = 87.5%, past the 70% threshold.
     const { app, contracts } = server({ ltv: vi.fn().mockResolvedValue({ debt: 7_000_000_000n }) });
 
     const res = await release(app);
 
     expect(res.statusCode).toBe(409);
     expect(res.json()).toMatchObject({ projectedLtvBps: 8750, debtSource: "on-chain" });
+    expect(contracts.pledgeVault.release).not.toHaveBeenCalled();
+  });
+
+  it("refuses a release that would leave the line in Warning, as the contract does", async () => {
+    // 600 owed against 800 left: 75%, past the 70% warning threshold but short of margin call.
+    const { app, contracts } = server({ ltv: vi.fn().mockResolvedValue({ debt: 6_000_000_000n }) });
+
+    const res = await release(app);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ projectedLtvBps: 7500, debtSource: "on-chain" });
     expect(contracts.pledgeVault.release).not.toHaveBeenCalled();
   });
 
