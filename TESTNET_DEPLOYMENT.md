@@ -9,9 +9,9 @@ repo issues (see "Test assets").
 
 `testnet` (`https://soroban-testnet.stellar.org`, passphrase `Test SDF Network ; September 2015`).
 
-## Current deployment (2026-10-25)
+## Current deployment (2026-10-26)
 
-Deployed in full with `scripts/deploy.sh testnet`. Earlier deployments (2026-10-08, 2026-09-17 and three
+Deployed in full with `scripts/deploy.sh testnet`. Earlier deployments (2026-10-25, 2026-10-08, 2026-09-17 and three
 intermediate ones made the same day while the contracts changed) are abandoned: each redeploy
 regenerates the role keys, so they can no longer be administered.
 
@@ -19,12 +19,12 @@ regenerates the role keys, so they can no longer be administered.
 
 | Contract | Contract ID |
 |---|---|
-| `registry` | `CALNSDZTJ7Y46XLSEVX7CHF7KVFO5L7QOMMDKHUWAUFX2FVB5KXVAPJ5` |
-| `price-guard` | `CAIPCSRMTBT7BUNYBQZWAFMSLGLM2TBU2B6DL4ZSUNAGJSQOV2DTI3IZ` |
-| `pledge-vault` | `CDVVS6I2KDUO5S5GCG7K7QMVULFLZFP2XL5ILVGT7YIAYRNARBCNDWQY` |
-| `credit-line` | `CAMNPRSWDSCLTKBFEF7MAXNFXRRP3U366LNR3BYAYKRAUWG6VFMWHTFD` |
-| `exit-desk` | `CA3SVJHY2DMUQYEHGPGDHXKQNUMLAZRR5WTGBTNQB5ZTGF6FXIKKRHXV` |
-| `repo-dvp` | `CDT4LQGLA7XQRRBYU6KGBL724A6PBMVUDEAXD2H2WL5OTCZVHXMFXNXN` |
+| `registry` | `CANHFCUCG6J2LH5VIZ4SISREO6B6LSJ2NPDW3HVNGZMG2Z7ZSHP67FZ4` |
+| `price-guard` | `CCSIO64AJEN3ITER7QXLTETSG5LZ2EIQWO5ON2TEVPOOKHBFR2ZVYUOP` |
+| `pledge-vault` | `CDAY4DLXRG4QRZQ222PLAANXT3O2HUWXUNFHFN4B6CQYFJ26FRXQOTNW` |
+| `credit-line` | `CD4XXUTHU3YOXZKAZGYLIMG5CTRDIYA3A4BSJF4MJIT3KEY7TZGL4IOT` |
+| `exit-desk` | `CC6AJECLP7JW33XIGEYZMFQKMK3FSCFGMMWO7IMAIBY6UU222HENYORI` |
+| `repo-dvp` | `CAHPYY7EP2D4BWDAMBOIKIFNRTT7XQOZQURCOWXSFJGBETKMVP2YKHAZ` |
 
 ### Test assets
 
@@ -32,18 +32,18 @@ Issued fresh for this deploy. They are not real RWAs or real USDC.
 
 | Asset | Classic issuer | SAC contract ID |
 |---|---|---|
-| `RWA1` | `GDXZ3ZJPBYYLWI5QBH7LKWP5ADMKJL6JRPVHBQBUBB2BEPYEPQ4L3WMD` | `CCMFACKPB6HI2IRD2Z2ZIB4SAM5RCGHPFZPTWDPHJSWSNEDC3L7PQBUL` |
-| `TUSD` | `GC2J4WF5G5VQZVUVINYBE4XZOTAQUBLTOAVMTO54NWMHAP5HFUTH622R` | `CB64A4RG42DBLAOT52ZTEUBOJ75XV5E2CKJIISIBCLXPQOLXFCSOEJT5` |
+| `RWA1` | `GDABQNIQCVFK23VBSPO4DAGUMZMSB4O5K25DZ7IX5O4GTIKMRSB3WZ73` | `CBUHRZ2D5EDPEY36Z4QHHAXV3XRKGLRYK7Y7HCD77YPL5G6IUNBCA7BZ` |
+| `TUSD` | `GCUSWVAGRM7FAZBNU3LBYMWNBOKDITRC3YAREM3WJCLW2M7AGZCG3LVN` | `CBGZOLNRJ4AYWLZHO76MWWY5MSCNEXFGA36CUT6WYDJRLJ6XBCGYT2FY` |
 
 ### Role addresses
 
 | Role | Address |
 |---|---|
-| `admin` | `GBYCVOTQPVZNRZKF2HTDJ7OVGSEZBKES7GE7RWC2474PF3Y4HVBJGOR6` |
-| `pauser` | `GBPOUCTBPEYFAGGRC3I5RQGK5A3JTVLZFQ2L6A2MBDQEFDJP2C5V34CB` |
-| `keeper` | `GDG7772LNDHN7KUP5WSIZUYLZ3B2SBQ7JCM3NOSD3J7JCKOBDUAWI6XS` |
-| `price_publisher` | `GCSU2SJJNUEU6BVZ3UMXTSYY2IPMRIASXDV6FOVJVL3UWWS4QRQ3HPHB` |
-| `risk` | `GDYSUOMBC3IRJR6TEU7LBJSYJLZNW5TF5RTIQQLIA2HHKNNR3XNM5WPO` |
+| `admin` | `GAQNMORYSOQYHWE7P3RILQFQTUCIHL737XKN46GZ6KPRTG7LO3OHFZYA` |
+| `pauser` | `GAOI6H4AJLDZEBUD22HYRCBNI2QDGK2MLTEUCMAMAIXD4FS4WAZP676S` |
+| `keeper` | `GAVT5OW47GEEZU65ON7HLHFIGSYZXFYIT322JCWRLZBFDAWLONXYJPUF` |
+| `price_publisher` | `GCANB2464OSE2EHJAXV5YI4QRCQMQY7XZURWFHHIP5QJNXJCRCO24GWU` |
+| `risk` | `GA3YANYKKYCKMSCM4PFYCMCXVTEOH3B32JYASL4HD2R7NFBH3FSOKIAV` |
 
 All generated fresh for this deploy via `stellar keys generate ... --fund` (testnet friendbot); these
 are test keys with no real value, not production credentials.
@@ -58,10 +58,11 @@ RedStone's USTRY feed contract read from **mainnet** (RedStone publishes no RWA 
 - The price publisher's Ed25519 key is registered as `RWA1`'s NAV attestor and `PriceGuard` requires
   the signature (`scripts/configure-nav-key.sh`). No issuer signs NAV, so the guarantee is that
   Ballast's publisher saw the value from the issuer's API, not issuer attestation.
-- `max_staleness_s` is 259,200 (72h) on this deployment (`PRICE_MAX_STALENESS_S=259200 scripts/deploy.sh
-  testnet`): RedStone's USTRY feed does not update at weekends, and a 6h window (the script default,
-  21,600) left the guard `Degraded` and the API refusing to lend. A 1h window did the same on weekdays.
-  A production deployment should keep the tight default.
+- `max_staleness_s` is 46,800 (13h) on this deployment (`PRICE_MAX_STALENESS_S=46800 scripts/deploy.sh
+  testnet`). RedStone's USTRY feed does **not** update every 1-2 hours: the readings recorded while
+  testing were stamped 00:10 and 12:10 UTC, a 12-hour cadence with no weekend gap. PriceGuard needs two
+  fresh sources, so the earlier 6h window (the script default, 21,600) left the guard `Degraded`, and the
+  API refusing to lend, for about half of every day. 13h covers the 12h cadence plus an hour of slack.
 - `PriceGuard` evaluates on every publish (see `contracts/AUDIT_NOTES.md`), and refuses readings
   dated more than 60s ahead of the ledger or with a non-positive price.
 
