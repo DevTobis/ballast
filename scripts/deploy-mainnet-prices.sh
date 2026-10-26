@@ -22,12 +22,21 @@
 #     WINDOW_MOVE_BAND_BPS, MAX_STALENESS_S.
 #
 # Output: .env.mainnet-deploy at the repo root (contract ids and role addresses, no secrets).
+#
+# Interrupted runs: every contract id is appended to .env.mainnet-deploy.partial (git-ignored) the
+# moment it is deployed, together with a STEP_ marker after each completed on-chain step. If the
+# script dies, it prints that file. A re-run refuses to start while it exists; once you have read
+# it, either resume with RESUME_PARTIAL=1 (reuses the recorded ids and skips the marked steps), or
+# delete the file to deploy afresh, which orphans the contracts it lists. A step that landed on
+# chain but was killed before its marker was written is run again on resume - `initialize` then
+# fails with "already initialized"; confirm on chain and add the STEP_ line by hand.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NETWORK=mainnet
 OUT_FILE=".env.${NETWORK}-deploy"
+PARTIAL_FILE="${OUT_FILE}.partial"
 ASSETS_FILE=${ASSETS_FILE:-scripts/shadow-assets.json}
 PRICE_BAND_BPS=${PRICE_BAND_BPS:-50}
 DAILY_MOVE_BAND_BPS=${DAILY_MOVE_BAND_BPS:-100}
@@ -50,6 +59,7 @@ Options:
 
 Environment:
   CONFIRM_MAINNET=deploy-prices  Required for live deployment
+  RESUME_PARTIAL=1               Resume from .env.mainnet-deploy.partial left by an interrupted run
 EOF
 }
 
@@ -91,6 +101,33 @@ if [[ "$DRY_RUN" == false && -e "$OUT_FILE" ]]; then
   echo "!!! $OUT_FILE already exists - a deployment is on record. Move it away deliberately to redeploy." >&2
   exit 1
 fi
+if [[ "$DRY_RUN" == false && -e "$PARTIAL_FILE" && "${RESUME_PARTIAL:-}" != "1" ]]; then
+  echo "!!! $PARTIAL_FILE exists - an earlier run deployed contracts and did not finish:" >&2
+  sed 's/^/    /' "$PARTIAL_FILE" >&2
+  echo "!!! To continue that deployment re-run with RESUME_PARTIAL=1. To start over, delete the file," >&2
+  echo "!!! knowing the contracts listed above stay on mainnet, orphaned." >&2
+  exit 1
+fi
+if [[ "$DRY_RUN" == false && "${RESUME_PARTIAL:-}" == "1" && ! -e "$PARTIAL_FILE" ]]; then
+  echo "!!! RESUME_PARTIAL=1 but $PARTIAL_FILE does not exist - nothing to resume." >&2
+  exit 1
+fi
+
+# Progress record for an interrupted run (see the header). No-ops in --dry-run.
+partial_get() { [[ -e "$PARTIAL_FILE" ]] && grep -m1 "^$1=" "$PARTIAL_FILE" | cut -d= -f2- || true; }
+partial_put() { [[ "$DRY_RUN" == true ]] || echo "$1=$2" >> "$PARTIAL_FILE"; }
+step_done() { [[ -e "$PARTIAL_FILE" ]] && grep -qx "STEP_$1=1" "$PARTIAL_FILE"; }
+mark_step() { partial_put "STEP_$1" 1; }
+
+on_exit() {
+  local code=$?
+  if (( code != 0 )) && [[ "$DRY_RUN" == false && -e "$PARTIAL_FILE" && ! -e "$OUT_FILE" ]]; then
+    echo "!!! Deployment stopped (exit $code). Contracts already on mainnet, from $PARTIAL_FILE:" >&2
+    sed 's/^/    /' "$PARTIAL_FILE" >&2
+    echo "!!! Re-run with RESUME_PARTIAL=1 once the cause is fixed." >&2
+  fi
+}
+trap on_exit EXIT
 
 retry() {
   local -i attempt=1
@@ -120,6 +157,17 @@ KEEPER=$(identity_address mainnet_keeper)
 PRICE_PUBLISHER=$(identity_address mainnet_price_publisher)
 RISK=$(identity_address mainnet_risk)
 
+if [[ "$DRY_RUN" == false && "${RESUME_PARTIAL:-}" == "1" ]]; then
+  # The recorded ids were initialized with these roles; resuming under another set would mix them.
+  for role in ADMIN PAUSER KEEPER PRICE_PUBLISHER RISK; do
+    recorded=$(partial_get "$role")
+    if [[ "$recorded" != "${!role}" ]]; then
+      echo "!!! $role in $PARTIAL_FILE (${recorded:-unset}) does not match identity mainnet_${role,,} (${!role}) - refusing to resume." >&2
+      exit 1
+    fi
+  done
+fi
+
 if [[ "$DRY_RUN" == false ]]; then
   log "Checking every role account exists and has XLM on mainnet"
   for addr in "$ADMIN" "$PAUSER" "$KEEPER" "$PRICE_PUBLISHER" "$RISK"; do
@@ -133,19 +181,33 @@ fi
 log "Building contracts"
 (cd contracts && for c in common registry price-guard; do (cd "$c" && stellar contract build -q); done)
 
+# The roles are written first so a resume can check it is talking to the same identities.
+if [[ "$DRY_RUN" == false && ! -e "$PARTIAL_FILE" ]]; then
+  for role in ADMIN PAUSER KEEPER PRICE_PUBLISHER RISK; do partial_put "$role" "${!role}"; done
+fi
+
 declare -A CID
 log "Deploying registry and price-guard"
 for c in registry price-guard; do
+  key="$(echo "${c^^}" | tr - _)_CID"
+  CID[$c]=$(partial_get "$key")
+  if [[ -n "${CID[$c]}" ]]; then
+    log "  $c -> ${CID[$c]} (already deployed, resuming)"
+    continue
+  fi
   wasm="contracts/target/wasm32v1-none/release/ballast_${c//-/_}.wasm"
   CID[$c]=$(run stellar contract deploy --wasm "$wasm" --source mainnet_admin --network "$NETWORK")
+  partial_put "$key" "${CID[$c]}"
   log "  $c -> ${CID[$c]}"
 done
 
 log "Initializing roles"
 for c in registry price-guard; do
+  step_done "INIT_$c" && { log "  $c already initialized, skipping"; continue; }
   run stellar contract invoke --id "${CID[$c]}" --source mainnet_admin --network "$NETWORK" -- initialize \
     --admin "$ADMIN" --pauser "$PAUSER" --keeper "$KEEPER" \
     --price_publisher "$PRICE_PUBLISHER" --risk "$RISK" >/dev/null
+  mark_step "INIT_$c"
 done
 
 # A G-address is base32(version byte | 32-byte key | 2-byte checksum): the key is bytes 1..33.
@@ -162,27 +224,38 @@ for row in "${ROWS[@]}"; do
   IFS=$'\t' read -r CODE ISSUER CCY <<<"$row"
   SAC=$(retry stellar contract id asset --asset "$CODE:$ISSUER" --network "$NETWORK")
   log "Registering $CODE ($ISSUER) as $SAC"
+  SAC_LINES+="SAC_${CODE}=$SAC"$'\n'
 
-  run stellar contract invoke --id "${CID[registry]}" --source mainnet_admin --network "$NETWORK" -- register_asset \
-    --admin "$ADMIN" --asset "$SAC" \
-    --config "{\"issuer\":\"$ISSUER\",\"contract\":\"$SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"$CCY\",\"redemption_lag_days\":1,\"haircut_base_bps\":$HAIRCUT_BASE_BPS,\"haircut_fx_bps\":0,\"price_band_bps\":$PRICE_BAND_BPS,\"daily_move_band_bps\":$DAILY_MOVE_BAND_BPS,\"status\":\"active\"}" \
-    >/dev/null
+  if step_done "REGISTER_$CODE"; then log "  $CODE already registered, skipping"; else
+    run stellar contract invoke --id "${CID[registry]}" --source mainnet_admin --network "$NETWORK" -- register_asset \
+      --admin "$ADMIN" --asset "$SAC" \
+      --config "{\"issuer\":\"$ISSUER\",\"contract\":\"$SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"$CCY\",\"redemption_lag_days\":1,\"haircut_base_bps\":$HAIRCUT_BASE_BPS,\"haircut_fx_bps\":0,\"price_band_bps\":$PRICE_BAND_BPS,\"daily_move_band_bps\":$DAILY_MOVE_BAND_BPS,\"status\":\"active\"}" \
+      >/dev/null
+    mark_step "REGISTER_$CODE"
+  fi
 
-  run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_asset \
-    --admin "$ADMIN" --asset "$SAC" --band_bps "$PRICE_BAND_BPS" --daily_move_band_bps "$DAILY_MOVE_BAND_BPS" \
-    --window_seconds "$WINDOW_SECONDS" --window_move_band_bps "$WINDOW_MOVE_BAND_BPS" \
-    --max_staleness_s "$MAX_STALENESS_S" >/dev/null
+  if step_done "GUARD_$CODE"; then log "  $CODE price-guard config already applied, skipping"; else
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_asset \
+      --admin "$ADMIN" --asset "$SAC" --band_bps "$PRICE_BAND_BPS" --daily_move_band_bps "$DAILY_MOVE_BAND_BPS" \
+      --window_seconds "$WINDOW_SECONDS" --window_move_band_bps "$WINDOW_MOVE_BAND_BPS" \
+      --max_staleness_s "$MAX_STALENESS_S" >/dev/null
+    mark_step "GUARD_$CODE"
+  fi
 
   # No issuer signs NAV; the publisher key signs what the service read from the issuer's API.
-  run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_issuer_key \
-    --admin "$ADMIN" --asset "$SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
-
-  SAC_LINES+="SAC_${CODE}=$SAC"$'\n'
+  if step_done "ISSUERKEY_$CODE"; then log "  $CODE issuer key already set, skipping"; else
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_issuer_key \
+      --admin "$ADMIN" --asset "$SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
+    mark_step "ISSUERKEY_$CODE"
+  fi
 done
 
 log "Requiring NAV signatures"
-run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
-  --admin "$ADMIN" --required true >/dev/null
+if step_done SIGNATURES; then log "  already required, skipping"; else
+  run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
+    --admin "$ADMIN" --required true >/dev/null
+  mark_step SIGNATURES
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
   log "Dry run complete: nothing was sent and $OUT_FILE was not written."
@@ -201,4 +274,5 @@ REGISTRY_CID=${CID[registry]}
 PRICE_GUARD_CID=${CID[price-guard]}
 ${SAC_LINES}
 EOT
+rm -f "$PARTIAL_FILE"
 log "Wrote $OUT_FILE. Point PRICE_GUARD_CONTRACT_ID / REGISTRY_CONTRACT_ID at these and run the price-guard service with PRICE_GUARD_PUBLISH=true."
