@@ -192,10 +192,14 @@ and the script prints that file when it stops. A re-run refuses to start while i
 fix the cause, then continue with `RESUME_PARTIAL=1 CONFIRM_MAINNET=deploy-prices
 scripts/deploy-mainnet-prices.sh`: it reuses the recorded ids, skips the marked steps, and refuses
 if a role identity no longer matches the one recorded. Deleting the file instead starts a new
-deployment and leaves the listed contracts orphaned. A step that landed on chain but was killed
-before its marker was written runs again on resume; `initialize` then fails with "already
-initialized", so check the chain and add the `STEP_` line by hand. On success the partial file is
-removed and `.env.mainnet-deploy` has the same format as before.
+deployment and leaves the listed contracts orphaned. `deploy` and `initialize` are sent once and
+never retried: a failed `deploy` stops the script with instructions to check the admin account's
+recent transactions, and `initialize` is checked against the contract's `roles` on chain, so one
+that landed before its marker was written is recognised, and a contract someone else initialized
+first is refused. The remaining steps run again on resume if they were killed before their marker
+was written. The publisher's NAV attestor key is decoded (version and checksum checked) before
+anything is deployed, and the run stops if that fails. On success the partial file is removed and
+`.env.mainnet-deploy` has the same format as before.
 
 ## If a CLI flag doesn't match
 

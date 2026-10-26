@@ -27,9 +27,10 @@
 # moment it is deployed, together with a STEP_ marker after each completed on-chain step. If the
 # script dies, it prints that file. A re-run refuses to start while it exists; once you have read
 # it, either resume with RESUME_PARTIAL=1 (reuses the recorded ids and skips the marked steps), or
-# delete the file to deploy afresh, which orphans the contracts it lists. A step that landed on
-# chain but was killed before its marker was written is run again on resume - `initialize` then
-# fails with "already initialized"; confirm on chain and add the STEP_ line by hand.
+# delete the file to deploy afresh, which orphans the contracts it lists. `deploy` and `initialize`
+# are sent once, never retried, and `initialize` is checked against the contract's `roles` on chain
+# (so one that landed before its marker was written is recognised, and one made by someone else is
+# refused). The other steps are re-run on resume if they were killed before their marker was written.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -138,9 +139,61 @@ retry() {
   done
 }
 
-# Runs a state-changing `stellar` command, or just prints it in --dry-run.
+# Runs a state-changing `stellar` command, or just prints it in --dry-run. Only for calls that are
+# safe to repeat: it retries blindly on failure.
 run() {
   if [[ "$DRY_RUN" == true ]]; then echo "[dry-run] $*" >&2; echo "DRYRUN"; else retry "$@"; fi
+}
+
+# Same, but sends the command once. For `deploy` and `initialize`, which are not safe to repeat: a
+# failure after the transaction landed would deploy a second contract (losing the first id) or hit
+# "already initialized" on a contract that is in fact set up. Callers check the chain instead.
+run_once() {
+  if [[ "$DRY_RUN" == true ]]; then echo "[dry-run] $*" >&2; echo "DRYRUN"; else "$@"; fi
+}
+
+# What a contract's roles look like on chain: prints `ok` (initialized with exactly the roles in this
+# run), `foreign` (initialized with others - someone else called initialize first, so the contract
+# must not be used) or `uninitialized`. The read is a free simulation, so it is retried on RPC errors;
+# the contracts' release builds carry no panic text, so an unset `roles` surfaces as
+# UnreachableCodeReached.
+roles_state() {
+  local id=$1 out err attempt
+  err=$(mktemp)
+  for attempt in 1 2 3 4 5 6; do
+    if out=$(stellar contract invoke --id "$id" --source mainnet_admin --network "$NETWORK" -- roles 2>"$err"); then
+      rm -f "$err"
+      python3 -c 'import json,sys
+want = dict(zip(("admin", "pauser", "keeper", "price_publisher", "risk"), sys.argv[2:]))
+have = json.loads(sys.argv[1])
+print("ok" if all(have.get(k) == v for k, v in want.items()) else "foreign")' \
+        "$out" "$ADMIN" "$PAUSER" "$KEEPER" "$PRICE_PUBLISHER" "$RISK"
+      return
+    fi
+    if grep -q "UnreachableCodeReached" "$err"; then rm -f "$err"; echo uninitialized; return; fi
+    sleep 3
+  done
+  echo "!!! could not read roles of $id after 6 attempts:" >&2
+  sed 's/^/    /' "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+# Derives the 32-byte ed25519 key (hex) from a G-address. A G-address is base32(version byte | key |
+# CRC16-XModem checksum), so the version and checksum are checked: a malformed address must never
+# turn into a key that gets registered as the NAV attestor.
+publisher_key_hex() {
+  python3 -c '
+import base64, sys
+raw = base64.b32decode(sys.argv[1])
+assert len(raw) == 35 and raw[0] == 6 << 3, "not an ed25519 public key address"
+crc = 0
+for byte in raw[:33]:
+    crc ^= byte << 8
+    for _ in range(8):
+        crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+assert crc.to_bytes(2, "little") == raw[33:], "checksum mismatch"
+print(raw[1:33].hex())' "$1"
 }
 
 identity_address() {
@@ -181,6 +234,16 @@ fi
 log "Building contracts"
 (cd contracts && for c in common registry price-guard; do (cd "$c" && stellar contract build -q); done)
 
+# Derived before anything is deployed, so a bad address stops the run while there is nothing to orphan.
+# (A dry run uses placeholder addresses, which cannot be decoded.)
+if [[ "$DRY_RUN" == true ]]; then
+  PUBLISHER_KEY_HEX=$(publisher_key_hex "$PRICE_PUBLISHER" 2>/dev/null || echo "<publisher-key-hex>")
+else
+  PUBLISHER_KEY_HEX=$(publisher_key_hex "$PRICE_PUBLISHER") \
+    || { echo "!!! cannot derive the NAV attestor key from mainnet_price_publisher ($PRICE_PUBLISHER)" >&2; exit 1; }
+  log "NAV attestor key for $PRICE_PUBLISHER: $PUBLISHER_KEY_HEX"
+fi
+
 # The roles are written first so a resume can check it is talking to the same identities.
 if [[ "$DRY_RUN" == false && ! -e "$PARTIAL_FILE" ]]; then
   for role in ADMIN PAUSER KEEPER PRICE_PUBLISHER RISK; do partial_put "$role" "${!role}"; done
@@ -196,7 +259,12 @@ for c in registry price-guard; do
     continue
   fi
   wasm="contracts/target/wasm32v1-none/release/ballast_${c//-/_}.wasm"
-  CID[$c]=$(run stellar contract deploy --wasm "$wasm" --source mainnet_admin --network "$NETWORK")
+  # Once, never retried (see run_once). If this fails the transaction may still have landed.
+  CID[$c]=$(run_once stellar contract deploy --wasm "$wasm" --source mainnet_admin --network "$NETWORK") || {
+    echo "!!! deploying $c failed. It may still have landed: look at $ADMIN's recent transactions on" >&2
+    echo "!!! stellar.expert before re-running, and add a ${key}=<id> line to $PARTIAL_FILE if it did." >&2
+    exit 1
+  }
   partial_put "$key" "${CID[$c]}"
   log "  $c -> ${CID[$c]}"
 done
@@ -204,14 +272,35 @@ done
 log "Initializing roles"
 for c in registry price-guard; do
   step_done "INIT_$c" && { log "  $c already initialized, skipping"; continue; }
-  run stellar contract invoke --id "${CID[$c]}" --source mainnet_admin --network "$NETWORK" -- initialize \
-    --admin "$ADMIN" --pauser "$PAUSER" --keeper "$KEEPER" \
-    --price_publisher "$PRICE_PUBLISHER" --risk "$RISK" >/dev/null
+  if [[ "$DRY_RUN" == true ]]; then
+    run_once stellar contract invoke --id "${CID[$c]}" --source mainnet_admin --network "$NETWORK" -- initialize \
+      --admin "$ADMIN" --pauser "$PAUSER" --keeper "$KEEPER" \
+      --price_publisher "$PRICE_PUBLISHER" --risk "$RISK" >/dev/null
+    continue
+  fi
+  # Ask the chain first, so a step that landed before its marker was written is recognised.
+  state=$(roles_state "${CID[$c]}")
+  if [[ "$state" == uninitialized ]]; then
+    if ! run_once stellar contract invoke --id "${CID[$c]}" --source mainnet_admin --network "$NETWORK" -- initialize \
+      --admin "$ADMIN" --pauser "$PAUSER" --keeper "$KEEPER" \
+      --price_publisher "$PRICE_PUBLISHER" --risk "$RISK" >/dev/null; then
+      echo "!!! initialize on $c failed; checking whether it landed anyway" >&2
+    fi
+    state=$(roles_state "${CID[$c]}")
+  fi
+  case "$state" in
+    ok) log "  $c initialized with the expected roles" ;;
+    foreign)
+      echo "!!! ${CID[$c]} ($c) is initialized with DIFFERENT roles - someone else called initialize first." >&2
+      echo "!!! Do not use this contract. Remove $PARTIAL_FILE and deploy again." >&2
+      exit 1 ;;
+    *)
+      echo "!!! initialize on $c did not take effect and the contract is still uninitialized." >&2
+      echo "!!! Nothing was changed by the failed call: fix the cause and re-run with RESUME_PARTIAL=1." >&2
+      exit 1 ;;
+  esac
   mark_step "INIT_$c"
 done
-
-# A G-address is base32(version byte | 32-byte key | 2-byte checksum): the key is bytes 1..33.
-PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PRICE_PUBLISHER" 2>/dev/null || echo "<publisher-key-hex>")
 
 mapfile -t ROWS < <(python3 -c '
 import json,sys
