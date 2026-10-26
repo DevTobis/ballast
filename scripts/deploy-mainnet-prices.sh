@@ -49,9 +49,9 @@ WINDOW_SECONDS=${WINDOW_SECONDS:-86400}
 WINDOW_MOVE_BAND_BPS=${WINDOW_MOVE_BAND_BPS:-100}
 # The issuer NAV updates every few minutes, but RedStone's USTRY feed was seen updating only every 12h
 # (00:10 and 12:10 UTC), and PriceGuard needs two fresh sources: with a window under ~13h the guard is
-# Degraded for part of every day. 21600 is kept as the default only until that is decided; see
-# TESTNET_DEPLOYMENT.md.
-MAX_STALENESS_S=${MAX_STALENESS_S:-21600}
+# Degraded for part of every day. 46800 (13h) covers the 12h cadence plus an hour of slack; see
+# TESTNET_DEPLOYMENT.md. Loosening it later goes through the 48h queue_config timelock.
+MAX_STALENESS_S=${MAX_STALENESS_S:-46800}
 HAIRCUT_BASE_BPS=${HAIRCUT_BASE_BPS:-500}
 
 usage() {
