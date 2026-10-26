@@ -14,7 +14,9 @@ RUN corepack enable && corepack prepare pnpm@10.22.0 --activate
 WORKDIR /app
 COPY . .
 RUN pnpm install --frozen-lockfile
-ARG VITE_API_URL=http://localhost:3000
+# No default: a console built without the real API address shows a configuration error instead of
+# silently calling localhost.
+ARG VITE_API_URL=""
 ARG VITE_STELLAR_NETWORK_PASSPHRASE=""
 ENV VITE_API_URL=$VITE_API_URL VITE_STELLAR_NETWORK_PASSPHRASE=$VITE_STELLAR_NETWORK_PASSPHRASE
 RUN pnpm build

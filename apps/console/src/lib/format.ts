@@ -66,6 +66,18 @@ export function bpsToPercent(bps: number): string {
   return `${(bps / 100).toFixed(2)}%`;
 }
 
+/**
+ * The margin band an LTV falls in, at the platform's default thresholds (70% / 80% / 90%, the ones
+ * CreditLine and the API's release check use). Per-asset on-chain thresholds can differ, so this
+ * labels a figure for the reader and does not decide anything.
+ */
+export function marginBand(ltvBps: number): "healthy" | "warning" | "margin call" | "liquidation" {
+  if (ltvBps >= 9_000) return "liquidation";
+  if (ltvBps >= 8_000) return "margin call";
+  if (ltvBps >= 7_000) return "warning";
+  return "healthy";
+}
+
 /** A duration in seconds as the largest whole-ish unit, e.g. 21600 -> "6 h". */
 export function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "--";

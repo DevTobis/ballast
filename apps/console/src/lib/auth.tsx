@@ -2,7 +2,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 import { requestAccess, signTransaction } from "@stellar/freighter-api";
 import { api } from "./api.ts";
 import { setUnauthorizedHandler } from "./unauthorized.ts";
-import { networkPassphrase } from "./explorer.ts";
+import { networkPassphrase } from "./config.ts";
 
 interface Session {
   token: string;
