@@ -53,6 +53,9 @@ pub enum LiquidationRoute {
     Rfq,
 }
 
+/// Classifies `ltv_bps` against `thresholds`. Threshold boundaries are inclusive on the upper
+/// (more severe) state (`>=`): an LTV equal to `warning_bps`, `margin_call_bps`, or
+/// `liquidation_bps` enters that state immediately.
 pub fn classify(ltv_bps: u32, thresholds: &MarginThresholds) -> MarginState {
     if ltv_bps >= thresholds.liquidation_bps {
         MarginState::Liquidation
@@ -84,6 +87,15 @@ mod test {
         assert_eq!(classify(7_500, &t), MarginState::Warning);
         assert_eq!(classify(8_500, &t), MarginState::MarginCall);
         assert_eq!(classify(9_500, &t), MarginState::Liquidation);
+
+        // Thresholds are inclusive on the upper state (`>=`):
+        assert_eq!(classify(0, &t), MarginState::Healthy);
+        assert_eq!(classify(6_999, &t), MarginState::Healthy);
+        assert_eq!(classify(7_000, &t), MarginState::Warning);
+        assert_eq!(classify(7_999, &t), MarginState::Warning);
+        assert_eq!(classify(8_000, &t), MarginState::MarginCall);
+        assert_eq!(classify(8_999, &t), MarginState::MarginCall);
+        assert_eq!(classify(9_000, &t), MarginState::Liquidation);
     }
 
     #[test]
