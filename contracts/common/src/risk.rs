@@ -53,6 +53,24 @@ mod test {
     }
 
     #[test]
+    fn collateral_value_zero_haircut_returns_gross() {
+        let v = collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, 0);
+        assert_eq!(v, 1_000 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn collateral_value_full_haircut_returns_zero() {
+        let v = collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, 10_000);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "haircut exceeds 100%")]
+    fn collateral_value_haircut_exceeding_100_percent_panics() {
+        collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, 10_001);
+    }
+
+    #[test]
     fn ltv_bps_computes_ratio() {
         // $500 debt against $950 collateral -> 5263 bps (~52.6%)
         let ltv = ltv_bps(500 * PRICE_SCALE, 950 * PRICE_SCALE);
