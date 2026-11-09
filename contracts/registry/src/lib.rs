@@ -1431,4 +1431,37 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    #[should_panic(expected = "registry: already initialized")]
+    fn initialize_panics_when_called_a_second_time() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        client.initialize(
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+    }
+
+    #[test]
+    fn initialize_second_call_leaves_roles_unchanged() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        let original_roles = env.as_contract(&client.address, || Registry::roles(env.clone()));
+
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.initialize(
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &Address::generate(&env),
+            );
+        }));
+        assert!(second.is_err());
+
+        let after_roles = env.as_contract(&client.address, || Registry::roles(env.clone()));
+        assert_eq!(after_roles, original_roles);
+    }
 }
