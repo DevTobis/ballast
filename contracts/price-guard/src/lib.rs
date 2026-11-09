@@ -2812,5 +2812,25 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
+    #[test]
+    fn decimal_ascii_encoders_match_std_formatting() {
+        let env = Env::default();
+        let u64_vectors: [u64; 5] = [0, 9, 10, 1_700_000_000, u64::MAX];
+        for n in u64_vectors {
+            let expected = std::format!("{}", n);
+            let encoded = decimal_ascii::u64_to_bytes(&env, n);
+            assert_eq!(encoded, Bytes::from_slice(&env, expected.as_bytes()));
+        }
+        assert_eq!(decimal_ascii::u64_to_bytes(&env, u64::MAX).len(), 20);
+
+        let i128_vectors: [i128; 6] = [0, 1, -1, 10_000_000, i128::MAX, i128::MIN];
+        for n in i128_vectors {
+            let expected = std::format!("{}", n);
+            let encoded = decimal_ascii::i128_to_bytes(&env, n);
+            assert_eq!(encoded, Bytes::from_slice(&env, expected.as_bytes()));
+        }
+        assert_eq!(decimal_ascii::i128_to_bytes(&env, i128::MIN).len(), 40);
+    }
+
     mod invariants;
 }
