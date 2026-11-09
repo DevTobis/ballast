@@ -2812,5 +2812,89 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn publish_nav_rejects_unconfigured_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let unconfigured_asset = Address::generate(&env);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        client.publish_nav(&publisher, &unconfigured_asset, &code, &SCALE, &env.ledger().timestamp(), &sig);
+    }
+
+    #[test]
+    #[should_panic(expected = "no issuer public key configured")]
+    fn publish_nav_rejects_missing_issuer_key_when_signature_required() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let asset = Address::generate(&env);
+        client.configure_asset(&admin, &asset, &50, &100, &DEFAULT_WINDOW_SECONDS, &DEFAULT_WINDOW_MOVE_BAND_BPS, &3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &env.ledger().timestamp(), &sig);
+    }
+
+    #[test]
+    fn publish_nav_succeeds_without_issuer_key_when_requirement_off() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let asset = Address::generate(&env);
+        client.configure_asset(&admin, &asset, &50, &100, &DEFAULT_WINDOW_SECONDS, &DEFAULT_WINDOW_MOVE_BAND_BPS, &3600);
+        client.configure_signature_requirement(&admin, &false);
+
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &env.ledger().timestamp(), &sig);
+        let gp = client.guarded_price(&asset);
+        assert_eq!(gp.sources.len(), 1);
+        assert_eq!(gp.sources.get(0).unwrap().value, SCALE);
+    }
+
+    #[test]
+    fn publish_source_and_guarded_price_panic_for_unconfigured_asset() {
+        let (env, client, publisher, _risk, _configured_asset) = setup(50, 100, 3600);
+        let unconfigured = Address::generate(&env);
+        let feed_name = Symbol::new(&env, "redston");
+        let now = env.ledger().timestamp();
+
+        let pub_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&publisher, &unconfigured, &feed_name, &SCALE, &now);
+        }));
+        assert!(pub_res.is_err());
+
+        let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.guarded_price(&unconfigured);
+        }));
+        assert!(read_res.is_err());
+    }
+
     mod invariants;
 }
