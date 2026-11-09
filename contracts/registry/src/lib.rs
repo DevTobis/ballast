@@ -1431,4 +1431,52 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    fn execute_param_enforces_bps_bounds_at_10_000_and_10_001_for_each_field() {
+        let (env, client, admin, _risk, _default_asset) = setup();
+
+        type Builder = fn(u32) -> ParamChange;
+        type Getter = fn(&AssetConfig) -> u32;
+        let fields: [(Builder, Getter); 4] = [
+            (ParamChange::HaircutBaseBps, |c| c.haircut_base_bps),
+            (ParamChange::HaircutFxBps, |c| c.haircut_fx_bps),
+            (ParamChange::PriceBandBps, |c| c.price_band_bps),
+            (ParamChange::DailyMoveBandBps, |c| c.daily_move_band_bps),
+        ];
+
+        for (make_change, read_field) in fields {
+            let asset = Address::generate(&env);
+            let mut base_cfg = valid_config(&env, &asset);
+            base_cfg.haircut_base_bps = 0;
+            base_cfg.haircut_fx_bps = 0;
+            client.register_asset(&admin, &asset, &base_cfg);
+
+            // 1. 10_001 bps is rejected, leaving config unchanged and pending id present:
+            let before = client.asset(&asset);
+            let bad_id = client.queue_param(&admin, &asset, &make_change(10_001));
+            env.ledger().with_mut(|l| {
+                l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            });
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.execute_param(&bad_id);
+            }));
+            assert!(rejected.is_err());
+            assert_eq!(read_field(&client.asset(&asset)), read_field(&before));
+            env.as_contract(&client.address, || {
+                assert!(env.storage().persistent().has(&DataKey::PendingParam(bad_id)));
+            });
+
+            // 2. 10_000 bps is accepted and removes the pending entry:
+            let ok_id = client.queue_param(&admin, &asset, &make_change(10_000));
+            env.ledger().with_mut(|l| {
+                l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            });
+            client.execute_param(&ok_id);
+            assert_eq!(read_field(&client.asset(&asset)), 10_000);
+            env.as_contract(&client.address, || {
+                assert!(!env.storage().persistent().has(&DataKey::PendingParam(ok_id)));
+            });
+        }
+    }
 }
