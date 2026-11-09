@@ -1431,4 +1431,42 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_panics_for_unknown_id() {
+        let (_env, client, _admin, _risk, _asset) = setup();
+        client.execute_param(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_panics_on_second_execution_and_keeps_first_change() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(750));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 750);
+
+        let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_param(&id);
+        }));
+        assert!(replay.is_err());
+        assert_eq!(client.asset(&asset).haircut_base_bps, 750);
+
+        client.execute_param(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_rejects_queue_unpause_id() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&unpause_id);
+    }
 }
