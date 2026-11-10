@@ -35,7 +35,7 @@ describe("PriceGuardClient", () => {
   });
 
   it("configureSignatureRequirement() returns non-empty unsigned XDR", async () => {
-    const xdr = await client.configureSignatureRequirement(source, true);
+    const xdr = await client.configureSignatureRequirement(source, asset, true);
     expect(xdr.length).toBeGreaterThan(0);
   });
 

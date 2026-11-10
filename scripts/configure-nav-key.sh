@@ -33,6 +33,6 @@ echo ">>> Registering $PRICE_PUBLISHER as the NAV attestor for $RWA_SAC"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
   --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
 
-echo ">>> Requiring NAV signatures"
+echo ">>> Requiring NAV signatures for $RWA_SAC"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
-  --admin "$ADMIN" --required true >/dev/null
+  --admin "$ADMIN" --asset "$RWA_SAC" --required true >/dev/null

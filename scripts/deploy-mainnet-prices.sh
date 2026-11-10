@@ -391,14 +391,13 @@ for row in "${ROWS[@]}"; do
       --admin "$ADMIN" --asset "$SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
     mark_step "ISSUERKEY_$CODE"
   fi
-done
 
-log "Requiring NAV signatures"
-if step_done SIGNATURES; then log "  already required, skipping"; else
-  run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
-    --admin "$ADMIN" --required true >/dev/null
-  mark_step SIGNATURES
-fi
+  if step_done "SIGNATURES_$CODE"; then log "  $CODE NAV signature requirement already set, skipping"; else
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
+      --admin "$ADMIN" --asset "$SAC" --required true >/dev/null
+    mark_step "SIGNATURES_$CODE"
+  fi
+done
 
 if [[ "$DRY_RUN" == true ]]; then
   log "Dry run complete: nothing was sent and $OUT_FILE was not written."

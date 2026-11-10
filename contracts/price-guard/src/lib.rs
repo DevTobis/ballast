@@ -32,13 +32,14 @@
 //! representation this contract can cheaply reconstruct) so both sides build byte-for-byte the
 //! same message.
 //!
-//! An admin-settable `require_nav_signature` flag (default `true`, global — not per-asset; see
+//! An admin-settable per-asset `require_nav_signature` flag (default `true` per asset; see
 //! `configure_signature_requirement`) exists as a local-testing/bring-up affordance: a fresh
 //! local/testnet deploy has no issuer keys registered yet, and forcing signature checks on from
 //! the very first `publish_nav` call would brick the smoke-test flow before anyone's had a chance
-//! to run `configure_issuer_key`. It is NOT a security control — production deploys should leave
-//! it at its default `true` once real issuer keys are configured. See `contracts/README.md` for
-//! the testnet-smoke-flow implication.
+//! to run `configure_issuer_key`. Scoping the flag per asset ensures disabling verification for a
+//! bring-up or synthetic test asset never weakens verification for live collateral assets on the
+//! same contract. Production deploys should leave it at its default `true` once real issuer keys
+//! are configured. See `contracts/README.md` for the testnet-smoke-flow implication.
 //!
 //! The real trust boundary is still `require_price_publisher`'s `require_auth()`: only the
 //! configured off-chain publisher may call `publish_nav`/`publish_source` at all. Signature
@@ -85,7 +86,7 @@ pub enum ConfigChange {
     MaxStalenessSeconds(Address, u64),
     Asset(Address, u32, u32, u64, u32, u64),
     IssuerPubKey(Address, BytesN<32>),
-    RequireNavSignature(bool),
+    RequireNavSignature(Address, bool),
 }
 
 #[contracttype]
@@ -128,9 +129,9 @@ enum DataKey {
     /// `configure_issuer_key`. `publish_nav` verifies `sig` against this when
     /// `require_nav_signature` is `true`.
     IssuerPubKey(Address),
-    /// Global (not per-asset) admin-settable flag, default `true` when unset — see the module doc
-    /// comment on why this exists and why it isn't a security control.
-    RequireNavSignature,
+    /// Per-asset admin-settable flag, default `true` when unset — see the module doc
+    /// comment on why this exists and why scoping it per asset isolates bring-up assets.
+    RequireNavSignature(Address),
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
@@ -194,10 +195,10 @@ fn build_nav_message(env: &Env, asset_code: &Bytes, ts: u64, value: i128) -> Byt
     message
 }
 
-fn require_nav_signature(env: &Env) -> bool {
+fn require_nav_signature(env: &Env, asset: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::RequireNavSignature)
+        .get(&DataKey::RequireNavSignature(asset.clone()))
         .unwrap_or(true)
 }
 
@@ -760,31 +761,28 @@ impl PriceGuard {
         );
     }
 
-    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all.
+    /// Admin-only. Per-asset toggle for whether `publish_nav` verifies `sig` for `asset`.
     /// Tightening (requiring signatures) is immediate; loosening (disabling verification) requires 48h timelock.
-    pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
+    pub fn configure_signature_requirement(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        required: bool,
+    ) {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
-        let has_existing = env
-            .storage()
-            .instance()
-            .has(&DataKey::RequireNavSignature);
+        let key = DataKey::RequireNavSignature(asset.clone());
+        let has_existing = env.storage().instance().has(&key);
         if has_existing {
-            let existing: bool = env
-                .storage()
-                .instance()
-                .get(&DataKey::RequireNavSignature)
-                .unwrap_or(true);
+            let existing: bool = env.storage().instance().get(&key).unwrap_or(true);
             if existing && !required {
                 panic!("price-guard: disabling signature requirement must be queued via queue_config");
             }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RequireNavSignature, &required);
+        env.storage().instance().set(&key, &required);
         env.events().publish(
-            (Symbol::new(&env, "configure_signature_requirement"),),
+            (Symbol::new(&env, "configure_signature_requirement"), asset),
             required,
         );
     }
@@ -936,10 +934,10 @@ impl PriceGuard {
                     .instance()
                     .set(&DataKey::IssuerPubKey(asset), &key_val);
             }
-            ConfigChange::RequireNavSignature(val) => {
+            ConfigChange::RequireNavSignature(asset, val) => {
                 env.storage()
                     .instance()
-                    .set(&DataKey::RequireNavSignature, &val);
+                    .set(&DataKey::RequireNavSignature(asset), &val);
             }
         }
         env.storage().persistent().remove(&key);
@@ -964,13 +962,10 @@ impl PriceGuard {
         env.storage().instance().get(&DataKey::Config(asset))
     }
 
-    /// Read-only inspection of whether NAV signatures are required.
-    pub fn require_nav_signature(env: Env) -> bool {
+    /// Read-only inspection of whether NAV signatures are required for `asset`.
+    pub fn require_nav_signature(env: Env, asset: Address) -> bool {
         ttl::extend_instance(&env);
-        env.storage()
-            .instance()
-            .get(&DataKey::RequireNavSignature)
-            .unwrap_or(true)
+        require_nav_signature(&env, &asset)
     }
 
     /// Read-only inspection of an asset's issuer public key.
@@ -997,7 +992,7 @@ impl PriceGuard {
         read_config(&env, &asset); // asserts the asset is configured
         require_sane_reading(&env, value, ts);
 
-        if require_nav_signature(&env) {
+        if require_nav_signature(&env, &asset) {
             let issuer_pubkey: BytesN<32> = env
                 .storage()
                 .instance()
@@ -1183,7 +1178,7 @@ mod test {
         // These tests exercise the median/band/staleness/halt logic, not signature verification
         // (which has its own dedicated tests below) — turn the check off so a zero-filled `sig`
         // doesn't panic every call here.
-        client.configure_signature_requirement(&admin, &false);
+        client.configure_signature_requirement(&admin, &asset, &false);
 
         (env, client, admin, price_publisher, risk, asset)
     }
@@ -1336,7 +1331,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
@@ -1358,7 +1353,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         // Signed over a DIFFERENT value than what's actually published -> verification must fail.
@@ -1560,7 +1555,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
@@ -1576,7 +1571,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let sig = sign_nav(&env, &signing_key, &code, now + 1, SCALE);
@@ -1591,7 +1586,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, _signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let other_signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
         let now = env.ledger().timestamp();
@@ -1607,7 +1602,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, _signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let random_sig = BytesN::from_array(&env, &[0x5au8; 64]);
@@ -1624,13 +1619,44 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         env.ledger().set_timestamp(1_000);
         let now = env.ledger().timestamp();
         let historical_ts = now - 1;
         let sig = sign_nav(&env, &signing_key, &code, historical_ts, SCALE);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &historical_ts, &sig);
+    }
+
+    #[test]
+    fn per_asset_nav_signature_requirement_allows_unsigned_asset_a_while_enforcing_signed_asset_b() {
+        let (env, client, admin, publisher, _risk, asset_a) = setup_with_admin(50, 10_000, 3600);
+        let asset_b = Address::generate(&env);
+        client.configure_asset(&admin, &asset_b, &50, &10_000, &86_400, &100, &3600);
+        let (pubkey_b, signing_key_b) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset_b, &pubkey_b);
+
+        // `setup_with_admin` disabled signature requirement for `asset_a`, while `asset_b` defaults to `true`.
+        assert!(!client.require_nav_signature(&asset_a));
+        assert!(client.require_nav_signature(&asset_b));
+
+        let code_a = Bytes::from_slice(&env, b"ASSETA");
+        let code_b = Bytes::from_slice(&env, b"ASSETB");
+        let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Unsigned publish succeeds on asset A.
+        client.publish_nav(&publisher, &asset_a, &code_a, &SCALE, &now, &zero_sig);
+
+        // Unsigned publish fails on asset B.
+        let unsigned_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset_b, &code_b, &SCALE, &now, &zero_sig);
+        }));
+        assert!(unsigned_b.is_err(), "unsigned NAV publish on asset B must be rejected");
+
+        // Signed publish succeeds on asset B.
+        let valid_sig_b = sign_nav(&env, &signing_key_b, &code_b, now, SCALE);
+        client.publish_nav(&publisher, &asset_b, &code_b, &SCALE, &now, &valid_sig_b);
     }
 
     // --- adversarial cases -------------------------------------------------------------------
@@ -2082,7 +2108,7 @@ mod test {
         assert!(has_event(&events, "configure_issuer_key"), "configure_issuer_key event must be emitted");
 
         // 3. configure_signature_requirement event
-        client.configure_signature_requirement(&admin, &false);
+        client.configure_signature_requirement(&admin, &asset, &false);
         let events = env.events().all();
         assert!(has_event(&events, "configure_signature_requirement"), "configure_signature_requirement event must be emitted");
 
@@ -2174,7 +2200,7 @@ mod test {
     fn a_stranger_cannot_configure_signature_requirement() {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         use soroban_sdk::IntoVal;
-        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 100, 3600);
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
         let stranger = Address::generate(&env);
 
         env.mock_auths(&[MockAuth {
@@ -2182,19 +2208,19 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "configure_signature_requirement",
-                args: (stranger.clone(), true).into_val(&env),
+                args: (stranger.clone(), asset.clone(), true).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_signature_requirement(&stranger, &true);
+            client.configure_signature_requirement(&stranger, &asset, &true);
         }));
         assert!(result.is_err(), "only the stored admin may configure signature requirement");
 
         // Scoped auths cannot be built for generated contract addresses, so the real admin's
         // success path runs under mock_all_auths like the rest of this module.
         env.mock_all_auths();
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
     }
 
     #[test]
@@ -2434,18 +2460,21 @@ mod test {
 
     #[test]
     fn timelock_signature_requirement_tighten_vs_loosen() {
-        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(100, 200, 3600);
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
 
-        client.configure_signature_requirement(&admin, &true);
-        assert_eq!(client.require_nav_signature(), true);
+        client.configure_signature_requirement(&admin, &asset, &true);
+        assert_eq!(client.require_nav_signature(&asset), true);
 
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_signature_requirement(&admin, &false);
+            client.configure_signature_requirement(&admin, &asset, &false);
         }));
         assert!(res.is_err(), "disabling signature requirement directly must fail");
 
         let t0 = env.ledger().timestamp();
-        let id = client.queue_config(&admin, &ConfigChange::RequireNavSignature(false));
+        let id = client.queue_config(
+            &admin,
+            &ConfigChange::RequireNavSignature(asset.clone(), false),
+        );
 
         let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.execute_config(&id);
@@ -2458,7 +2487,7 @@ mod test {
         });
 
         client.execute_config(&id);
-        assert_eq!(client.require_nav_signature(), false);
+        assert_eq!(client.require_nav_signature(&asset), false);
     }
 
     #[test]

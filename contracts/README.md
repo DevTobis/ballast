@@ -84,16 +84,18 @@ This was a breaking change to `publish_nav`'s call signature. Both `scripts/depl
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
 — see `TESTNET_DEPLOYMENT.md`):
 
-- `scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
-  after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
-  key for its test `RWA1` asset.
+- `scripts/deploy.sh` delegates to `scripts/configure-nav-key.sh` after `configure_asset` for
+  `price-guard`, which registers the publisher's Ed25519 key for `RWA1` and calls
+  `configure_signature_requirement --admin "$ADMIN" --asset "$RWA_SAC" --required true` (or `--required false` for bring-up assets without an issuer key).
 - `scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
-  bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
+  bytes of `"RWA1"`) alongside the signature.
 
-`require_nav_signature` defaults to `true` on a fresh deploy (see the crate's module doc comment on
-why this flag exists — it's a local-testing/bring-up affordance, not a security control) — a real
-testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if
-it was ever turned off, and should leave it at its default `true` otherwise.
+`require_nav_signature(asset)` defaults to `true` per asset on a fresh deploy (see the crate's
+module doc comment on why this per-asset flag exists — it's a local-testing/bring-up affordance
+scoped per asset so disabling verification for a bring-up asset does not weaken live collateral
+assets) — a real testnet/mainnet deploy should call `configure_issuer_key` for every asset before
+flipping its signature requirement on if it was ever turned off, and should leave it at its default
+`true` otherwise.
 
 ## Rotating the price publisher without redeploying
 
@@ -122,7 +124,7 @@ stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
   configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
-  configure_signature_requirement --admin "$ADMIN" --required true
+  configure_signature_requirement --admin "$ADMIN" --asset "$RWA_SAC" --required true
 ```
 
 Update `PRICE_PUBLISHER` in `.env.<network>-deploy` before re-running
