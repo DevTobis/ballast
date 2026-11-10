@@ -95,6 +95,17 @@ pub struct PendingConfigChange {
     pub executes_at: u64,
 }
 
+/// Read-only snapshot of an asset's sticky halt state, returned by `halt_info(asset)` when
+/// `DataKey::Halted(asset)` is latched.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HaltInfo {
+    /// The baseline last-good guarded price prior to the halt (`0` if none was recorded).
+    pub last_good: i128,
+    /// The candidate median value that exceeded the move band and triggered the halt.
+    pub pending: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 struct NavRecord {
@@ -977,6 +988,51 @@ impl PriceGuard {
     pub fn issuer_pubkey(env: Env, asset: Address) -> Option<BytesN<32>> {
         ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::IssuerPubKey(asset))
+    }
+
+    /// Pure read-only getter for an asset's configured guard thresholds (`AssetGuardConfig`).
+    /// Panics if the asset is not configured.
+    pub fn config(env: Env, asset: Address) -> AssetGuardConfig {
+        read_config(&env, &asset)
+    }
+
+    /// Pure read-only getter for an asset's registered Ed25519 issuer public key, if any.
+    pub fn issuer_key(env: Env, asset: Address) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::IssuerPubKey(asset))
+    }
+
+    /// Pure read-only getter for whether NAV Ed25519 signature verification is currently required.
+    pub fn signature_required(env: Env) -> bool {
+        require_nav_signature(&env)
+    }
+
+    /// Pure read-only getter for an asset's sticky halt state. Returns `Some(HaltInfo)` when
+    /// `asset` is halted, or `None` when not halted.
+    pub fn halt_info(env: Env, asset: Address) -> Option<HaltInfo> {
+        let halted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Halted(asset.clone()))
+            .unwrap_or(false);
+        if !halted {
+            return None;
+        }
+        let last_good = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastGood(asset.clone()))
+            .unwrap_or(0);
+        let pending = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingHaltValue(asset))
+            .unwrap_or(0);
+        Some(HaltInfo { last_good, pending })
+    }
+
+    /// Pure read-only getter for an asset's last known good guarded price, if one has been recorded.
+    pub fn last_good(env: Env, asset: Address) -> Option<i128> {
+        env.storage().instance().get(&DataKey::LastGood(asset))
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
@@ -2810,6 +2866,73 @@ mod test {
         // Real admin succeeds.
         env.mock_all_auths();
         client.remove_source(&admin, &asset, &feed_name);
+    }
+
+    #[test]
+    fn readonly_getters_expose_config_issuer_key_signature_flag_halt_info_and_last_good() {
+        let (env, client, admin, publisher, risk, asset) = setup_with_admin(50, 100, 3600);
+
+        // 1. config(asset) returns the configured thresholds
+        assert_eq!(
+            client.config(&asset),
+            AssetGuardConfig {
+                band_bps: 50,
+                daily_move_band_bps: 100,
+                max_staleness_s: 3600,
+                window_seconds: DEFAULT_WINDOW_SECONDS,
+                window_move_band_bps: DEFAULT_WINDOW_MOVE_BAND_BPS,
+            }
+        );
+
+        // 2. issuer_key(asset) reflects the registered issuer key (and None for unconfigured asset)
+        let unconfigured = Address::generate(&env);
+        assert_eq!(client.issuer_key(&unconfigured), None);
+        let (expected_pubkey, _) = test_issuer_keypair(&env);
+        assert_eq!(client.issuer_key(&asset), Some(expected_pubkey));
+
+        // 3. signature_required() defaults to true, and reflects queued toggle to false
+        assert!(client.signature_required());
+        let toggle_id = client.queue_config(&admin, &ConfigChange::RequireNavSignature(false));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+        client.execute_config(&toggle_id);
+        assert!(!client.signature_required());
+
+        // Re-enable immediately via configure_signature_requirement
+        client.configure_signature_requirement(&admin, &true);
+        assert!(client.signature_required());
+
+        // 4. last_good(asset) and halt_info(asset) before any publish
+        assert_eq!(client.last_good(&asset), None);
+        assert_eq!(client.halt_info(&asset), None);
+
+        // Publish two agreeing sources at $1.00 -> establishes last_good = SCALE
+        let now = env.ledger().timestamp();
+        publish_signed_nav(&env, &client, &publisher, &asset, SCALE, now);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.halt_info(&asset), None);
+
+        // 5. Publish a 5% jump (500 bps > daily_move_band_bps = 100) -> latches halt
+        let jump_price = SCALE + (SCALE * 500) / 10_000;
+        publish_signed_nav(&env, &client, &publisher, &asset, jump_price, now);
+        client.publish_source(&publisher, &asset, &feed(&env), &jump_price, &now);
+
+        assert_eq!(
+            client.halt_info(&asset),
+            Some(HaltInfo {
+                last_good: SCALE,
+                pending: jump_price,
+            })
+        );
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+
+        // 6. confirm_halt_cleared promotes pending to last_good and clears halt_info
+        client.confirm_halt_cleared(&risk, &asset);
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.last_good(&asset), Some(jump_price));
     }
 
     mod invariants;
