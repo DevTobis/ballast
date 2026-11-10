@@ -80,6 +80,8 @@ NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" RWA
 inv --id "$PRICE_GUARD_CID" --source price_publisher -- publish_nav \
   --publisher "$PRICE_PUBLISHER" --asset "$RWA_SAC" --asset_code "$RWA1_ASSET_CODE_HEX" \
   --value "$NAV_VALUE" --ts "$NAV_TS" --sig "$NAV_SIG" >/dev/null
+inv --id "$PRICE_GUARD_CID" --source admin -- configure_source \
+  --admin "$ADMIN" --asset "$RWA_SAC" --name redston --enabled true >/dev/null
 inv --id "$PRICE_GUARD_CID" --source price_publisher -- publish_source \
   --publisher "$PRICE_PUBLISHER" --asset "$RWA_SAC" --source redston --value "$FEED_VALUE" --ts "$FEED_TS" >/dev/null
 

@@ -134,6 +134,8 @@ enum DataKey {
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
+    /// Per-asset admin allowlist entry for secondary oracle sources (`configure_source`).
+    SourceEnabled(Address, Symbol),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -789,6 +791,52 @@ impl PriceGuard {
         );
     }
 
+    /// Admin-only. Adds or removes `name` from `asset`'s allowlist of secondary price sources.
+    /// The `"issuer"` source name is reserved exclusively for `publish_nav`. Disabling a source
+    /// (`enabled = false`) removes its stored reading and tracked slot immediately and re-evaluates
+    /// the asset's guarded price.
+    pub fn configure_source(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        name: Symbol,
+        enabled: bool,
+    ) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+        assert!(
+            name != Symbol::new(&env, ISSUER_SOURCE),
+            "price-guard: 'issuer' source is reserved for publish_nav"
+        );
+
+        let key = DataKey::SourceEnabled(asset.clone(), name.clone());
+        if enabled {
+            env.storage().instance().set(&key, &true);
+        } else {
+            env.storage().instance().remove(&key);
+            remove_source_internal(&env, &asset, &name);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "configure_source"), asset.clone()),
+            (name, enabled),
+        );
+
+        if !enabled {
+            evaluate(&env, asset);
+        }
+    }
+
+    /// Read-only inspection of whether `name` is currently allowlisted for `asset`.
+    pub fn is_source_enabled(env: Env, asset: Address, name: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::SourceEnabled(asset, name))
+            .unwrap_or(false)
+    }
+
     /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
     /// for `asset`. Unknown name removal is a safe no-op.
     pub fn remove_source(env: Env, admin: Address, asset: Address, name: Symbol) {
@@ -797,6 +845,9 @@ impl PriceGuard {
         ttl::extend_instance(&env);
         read_config(&env, &asset);
 
+        env.storage()
+            .instance()
+            .remove(&DataKey::SourceEnabled(asset.clone(), name.clone()));
         remove_source_internal(&env, &asset, &name);
 
         env.events().publish(
@@ -1042,6 +1093,16 @@ impl PriceGuard {
         ttl::extend_instance(&env);
         read_config(&env, &asset);
         require_sane_reading(&env, value, ts);
+        assert!(
+            source != Symbol::new(&env, ISSUER_SOURCE),
+            "price-guard: 'issuer' source is reserved for publish_nav"
+        );
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::SourceEnabled(asset.clone(), source.clone()))
+            .unwrap_or(false);
+        assert!(enabled, "price-guard: source is not allowlisted for asset");
 
         track_source_name(&env, &asset, &source);
         write_source(&env, &asset, &source, value, ts);
@@ -1184,6 +1245,13 @@ mod test {
         // (which has its own dedicated tests below) — turn the check off so a zero-filled `sig`
         // doesn't panic every call here.
         client.configure_signature_requirement(&admin, &false);
+
+        for name in [
+            "redston", "redemp", "band3", "band4", "feed_1", "feed_2", "feed_3", "feed_4",
+            "feed_5", "feed_6", "feed_7", "feed_9",
+        ] {
+            client.configure_source(&admin, &asset, &Symbol::new(&env, name), &true);
+        }
 
         (env, client, admin, price_publisher, risk, asset)
     }
@@ -2086,6 +2154,8 @@ mod test {
         let events = env.events().all();
         assert!(has_event(&events, "configure_signature_requirement"), "configure_signature_requirement event must be emitted");
 
+        client.configure_source(&admin, &asset, &feed(&env), &true);
+
         // 4. nav_published event
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
@@ -2810,6 +2880,54 @@ mod test {
         // Real admin succeeds.
         env.mock_all_auths();
         client.remove_source(&admin, &asset, &feed_name);
+    }
+
+    #[test]
+    fn configure_source_allowlist_enforces_listed_unlisted_reserved_and_removed_names() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // 1. Unlisted source name is rejected by publish_source
+        let unlisted = Symbol::new(&env, "unlisted_src");
+        assert!(!client.is_source_enabled(&asset, &unlisted));
+        let unlisted_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&publisher, &asset, &unlisted, &SCALE, &now);
+        }));
+        assert!(unlisted_res.is_err(), "unlisted source must be rejected");
+
+        // 2. Reserved "issuer" name cannot be allowlisted or published via publish_source
+        let issuer_sym = Symbol::new(&env, ISSUER_SOURCE);
+        let cfg_issuer_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.configure_source(&admin, &asset, &issuer_sym, &true);
+        }));
+        assert!(cfg_issuer_res.is_err(), "'issuer' must be rejected in configure_source");
+
+        let pub_issuer_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&publisher, &asset, &issuer_sym, &SCALE, &now);
+        }));
+        assert!(pub_issuer_res.is_err(), "'issuer' must be rejected in publish_source");
+
+        // 3. Admin allowlists "unlisted_src" -> publish_source succeeds and counts toward Ok
+        client.configure_source(&admin, &asset, &unlisted, &true);
+        assert!(client.is_source_enabled(&asset, &unlisted));
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &unlisted, &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        // 4. Disabling the source (enabled = false) immediately stops it from counting and rejects new publishes
+        client.configure_source(&admin, &asset, &unlisted, &false);
+        assert!(!client.is_source_enabled(&asset, &unlisted));
+        let after_disable = client.guarded_price(&asset);
+        assert_eq!(after_disable.status, PriceStatus::Degraded);
+        assert_eq!(after_disable.sources.len(), 1);
+
+        let republish_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(&publisher, &asset, &unlisted, &SCALE, &now);
+        }));
+        assert!(republish_res.is_err(), "disabled source must be rejected");
     }
 
     mod invariants;
