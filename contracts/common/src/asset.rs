@@ -46,14 +46,20 @@ pub struct AssetConfig {
 }
 
 impl AssetConfig {
-    /// Returns the combined haircut without relying on the registry's storage invariant.
-    /// `u64` keeps this safe even for an unvalidated config supplied by a caller.
+    /// Returns the combined haircut (`haircut_base_bps + haircut_fx_bps`), saturating and
+    /// clamped at `10_000` bps (100%) as a defence in depth so callers such as
+    /// [`crate::risk::collateral_value`] can never overflow or trap even on an unvalidated
+    /// config. A combined total of exactly `10_000` bps (collateral valued at zero) is allowed.
     pub fn total_haircut_bps(&self) -> u64 {
-        u64::from(self.haircut_base_bps) + u64::from(self.haircut_fx_bps)
+        u64::from(self.haircut_base_bps)
+            .saturating_add(u64::from(self.haircut_fx_bps))
+            .min(10_000)
     }
 
     /// Validate an asset config against the address under which it will be stored.
     /// Bps limits are kept here so registration and timelocked updates share one policy.
+    /// A combined haircut of `10_000` bps (100%, valuing collateral at zero) is permitted;
+    /// anything above `10_000` bps is rejected.
     pub fn validate(&self, env: &Env, asset: &Address) -> Result<(), &'static str> {
         if self.haircut_base_bps > 10_000 {
             return Err("registry: base haircut cannot exceed 100%");
@@ -61,7 +67,8 @@ impl AssetConfig {
         if self.haircut_fx_bps > 10_000 {
             return Err("registry: FX haircut cannot exceed 100%");
         }
-        if self.total_haircut_bps() > 10_000 {
+        if u64::from(self.haircut_base_bps).saturating_add(u64::from(self.haircut_fx_bps)) > 10_000
+        {
             return Err("registry: total haircut cannot exceed 100%");
         }
         if self.price_band_bps == 0 || self.price_band_bps > 10_000 {
@@ -121,6 +128,36 @@ mod test {
             status: Symbol::new(&env, "active"),
         };
 
-        assert_eq!(config.total_haircut_bps(), u64::from(u32::MAX) + 1);
+        assert_eq!(config.total_haircut_bps(), 10_000);
+    }
+
+    #[test]
+    fn total_haircut_allows_100_percent_and_validate_rejects_above() {
+        let env = Env::default();
+        let address = Address::generate(&env);
+        let mut config = AssetConfig {
+            issuer: address.clone(),
+            contract: address.clone(),
+            standard: AssetStandard::ClassicSac,
+            yield_type: YieldType::Accumulating,
+            custody_mode: CustodyMode::Escrow,
+            ccy: Symbol::new(&env, "USD"),
+            redemption_lag_days: 1,
+            haircut_base_bps: 6_000,
+            haircut_fx_bps: 4_000,
+            price_band_bps: 50,
+            daily_move_band_bps: 100,
+            status: Symbol::new(&env, "active"),
+        };
+
+        assert_eq!(config.total_haircut_bps(), 10_000);
+        assert!(config.validate(&env, &address).is_ok());
+
+        config.haircut_fx_bps = 5_000;
+        assert_eq!(config.total_haircut_bps(), 10_000);
+        assert_eq!(
+            config.validate(&env, &address),
+            Err("registry: total haircut cannot exceed 100%")
+        );
     }
 }

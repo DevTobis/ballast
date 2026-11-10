@@ -162,7 +162,22 @@ impl Registry {
         access::require_admin(&env);
         ttl::extend_instance(&env);
         // Fail fast if the asset doesn't exist yet, rather than queuing a change for nothing.
-        read_asset(&env, &asset);
+        let mut preview = read_asset(&env, &asset);
+        match &change {
+            ParamChange::HaircutBaseBps(v) => {
+                preview.haircut_base_bps = *v;
+                if let Err(message) = preview.validate(&env, &asset) {
+                    panic!("{}", message);
+                }
+            }
+            ParamChange::HaircutFxBps(v) => {
+                preview.haircut_fx_bps = *v;
+                if let Err(message) = preview.validate(&env, &asset) {
+                    panic!("{}", message);
+                }
+            }
+            _ => {}
+        }
 
         let id = timelock::next_id(&env);
         let key = DataKey::PendingParam(id);
@@ -1430,5 +1445,58 @@ mod test {
             assert_eq!(loaded.haircut_base_bps, 300);
             assert_eq!(loaded.status, config.status);
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: total haircut cannot exceed 100%")]
+    fn queued_haircut_base_and_fx_exceeding_100_percent_panics_on_execute() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        // Queue HaircutBaseBps(10_000) and HaircutFxBps(5_000) against the initial config
+        // (base = 300, fx = 0). Each is individually <= 10_000 against the initial sibling,
+        // but executing both would push total_haircut_bps to 15_000.
+        let id_base = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(10_000));
+        let id_fx = client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(5_000));
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        client.execute_param(&id_base);
+        assert_eq!(client.asset(&asset).total_haircut_bps(), 10_000);
+
+        // The second execute must panic because 10_000 + 5_000 > 10_000.
+        client.execute_param(&id_fx);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: total haircut cannot exceed 100%")]
+    fn queue_param_rejects_haircut_fx_when_sum_exceeds_100_percent_at_queue_time() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        let id_base = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(10_000));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id_base);
+
+        // Now that haircut_base_bps is 10_000, queueing HaircutFxBps(5_000) is rejected immediately.
+        client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(5_000));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: haircut cannot exceed 100%")]
+    fn raise_haircut_now_rejects_when_combined_with_fx_exceeds_100_percent() {
+        let (env, client, admin, risk, asset) = setup();
+
+        let id_fx = client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(9_700));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id_fx);
+        assert_eq!(client.asset(&asset).total_haircut_bps(), 10_000);
+
+        // Raising base by even 1 bps when base (300) + fx (9_700) == 10_000 must panic.
+        client.raise_haircut_now(&risk, &asset, &1);
     }
 }
