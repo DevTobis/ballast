@@ -50,3 +50,46 @@ impl GuardedPrice {
         matches!(self.status, PriceStatus::Ok)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Env;
+
+    fn sample_price(env: &Env, status: PriceStatus) -> GuardedPrice {
+        GuardedPrice {
+            asset: Address::generate(env),
+            // Use a valid non-zero price so an implementation that mistakenly checks `value > 0`
+            // instead of `status` would fail the Degraded / Halted assertions.
+            value: PRICE_SCALE,
+            status,
+            ts: 1_700_000_000,
+            sources: Vec::new(env),
+        }
+    }
+
+    #[test]
+    fn guarded_price_usability_matrix_across_all_statuses() {
+        let env = Env::default();
+
+        let ok = sample_price(&env, PriceStatus::Ok);
+        assert!(ok.is_usable_for_new_risk());
+        assert!(ok.is_usable_for_liquidation());
+
+        let degraded = sample_price(&env, PriceStatus::Degraded);
+        assert!(!degraded.is_usable_for_new_risk());
+        assert!(!degraded.is_usable_for_liquidation());
+
+        let halted = sample_price(&env, PriceStatus::Halted);
+        assert!(!halted.is_usable_for_new_risk());
+        assert!(!halted.is_usable_for_liquidation());
+    }
+
+    #[test]
+    fn price_scale_matches_seven_decimal_stellar_stroops() {
+        // 1 unit = 10^7 stroops on Stellar classic / SAC tokens, so multiplying a 7-decimal
+        // token balance by a 7-decimal price and dividing by PRICE_SCALE yields 7-decimal USD stroops.
+        assert_eq!(PRICE_SCALE, 10_000_000);
+    }
+}
