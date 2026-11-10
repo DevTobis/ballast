@@ -2812,5 +2812,105 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
+    #[test]
+    fn is_fresh_staleness_and_future_skew_boundaries() {
+        let env = Env::default();
+        let now: u64 = 10_000;
+        let max_staleness_s: u64 = 3_600;
+        env.ledger().with_mut(|l| l.timestamp = now);
+
+        let build_source = |observed_at: u64| PriceSource {
+            name: Symbol::new(&env, "feed"),
+            value: SCALE,
+            observed_at,
+            stale: false,
+        };
+
+        // 1. Exact staleness boundary: age == max_staleness_s -> fresh (true).
+        assert!(is_fresh(
+            &env,
+            &build_source(now - max_staleness_s),
+            max_staleness_s
+        ));
+
+        // 2. One second past staleness boundary: age == max_staleness_s + 1 -> stale (false).
+        assert!(!is_fresh(
+            &env,
+            &build_source(now - max_staleness_s - 1),
+            max_staleness_s
+        ));
+
+        // 3. Exact future-skew boundary: observed_at == now + MAX_FUTURE_SKEW_S (now + 60) -> fresh (true).
+        assert!(is_fresh(
+            &env,
+            &build_source(now + MAX_FUTURE_SKEW_S),
+            max_staleness_s
+        ));
+
+        // 4. One second past future-skew boundary: observed_at == now + MAX_FUTURE_SKEW_S + 1 (now + 61) -> stale (false).
+        assert!(!is_fresh(
+            &env,
+            &build_source(now + MAX_FUTURE_SKEW_S + 1),
+            max_staleness_s
+        ));
+    }
+
+    #[test]
+    fn publish_source_accepts_max_future_skew_and_is_fresh_across_staleness_boundary() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now: u64 = 10_000;
+        env.ledger().with_mut(|l| l.timestamp = now);
+
+        // Publishing at observed_at == now + MAX_FUTURE_SKEW_S (now + 60) is accepted and fresh.
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        let res = client.publish_source(
+            &publisher,
+            &asset,
+            &feed(&env),
+            &SCALE,
+            &(now + MAX_FUTURE_SKEW_S),
+        );
+        assert_eq!(res.status, PriceStatus::Ok);
+        assert_eq!(res.sources.len(), 2);
+
+        // If the ledger clock moves backwards relative to the stored reading (so observed_at is
+        // now + MAX_FUTURE_SKEW_S + 1), evaluate treats that stored source as not fresh.
+        env.ledger().with_mut(|l| l.timestamp = now - 1);
+        let future_skewed = client.guarded_price(&asset);
+        assert_eq!(future_skewed.status, PriceStatus::Degraded);
+        assert_eq!(future_skewed.sources.len(), 1);
+
+        // At age == max_staleness_s for the earlier source (t = now + 3_600), both sources are fresh.
+        env.ledger().with_mut(|l| l.timestamp = now + 3_600);
+        let at_boundary = client.guarded_price(&asset);
+        assert_eq!(at_boundary.status, PriceStatus::Ok);
+        assert_eq!(at_boundary.sources.len(), 2);
+
+        // One second later (t = now + 3_601), the source published at `now` is stale (age == 3_601),
+        // leaving only the source published at `now + 60` fresh -> Degraded.
+        env.ledger().with_mut(|l| l.timestamp = now + 3_601);
+        let past_boundary = client.guarded_price(&asset);
+        assert_eq!(past_boundary.status, PriceStatus::Degraded);
+        assert_eq!(past_boundary.sources.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: reading is dated in the future")]
+    fn publish_source_rejects_reading_one_second_past_max_future_skew() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let now: u64 = 10_000;
+        env.ledger().with_mut(|l| l.timestamp = now);
+
+        client.publish_source(
+            &publisher,
+            &asset,
+            &feed(&env),
+            &SCALE,
+            &(now + MAX_FUTURE_SKEW_S + 1),
+        );
+    }
+
     mod invariants;
 }
