@@ -22,3 +22,7 @@ names; the second topic is the key to filter on.
 | `unpause_cancelled` | `(Symbol("unpause_cancelled"), id: u64)` | `scope: PauseScope` | `cancel_unpause` |
 
 `executes_at` is a ledger timestamp in seconds. Indexers should subscribe to these topic names.
+
+## Timelock Cancellation
+
+Queued parameter changes (`queue_param`) and unpauses (`queue_unpause`) can be cancelled by the stored `admin` before execution via `cancel_param(admin, id)` and `cancel_unpause(admin, id)`. Cancellation removes the persistent storage entry immediately so that subsequent calls to `execute_param(id)`, `execute_unpause(id)`, or a second cancel fail with `"registry: no such pending change"` / `"registry: no such pending unpause"`.

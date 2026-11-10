@@ -187,7 +187,8 @@ impl Registry {
     /// Admin only.
     pub fn cancel_param(env: Env, admin: Address, id: u64) {
         admin.require_auth();
-        access::require_admin(&env);
+        let stored_admin = access::require_admin(&env);
+        assert_eq!(stored_admin, admin, "registry: caller is not admin");
         ttl::extend_instance(&env);
         let key = DataKey::PendingParam(id);
         let pending: PendingParamChange = env
@@ -307,7 +308,8 @@ impl Registry {
     /// Admin only.
     pub fn cancel_unpause(env: Env, admin: Address, id: u64) {
         admin.require_auth();
-        access::require_admin(&env);
+        let stored_admin = access::require_admin(&env);
+        assert_eq!(stored_admin, admin, "registry: caller is not admin");
         ttl::extend_instance(&env);
         let key = DataKey::PendingUnpause(id);
         let pending: PendingUnpause = env
@@ -1097,6 +1099,94 @@ mod test {
         }));
         assert!(result.is_err(), "execute_unpause should fail after cancellation");
         assert!(client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    fn a_stranger_cannot_cancel_param_or_unpause() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _risk, asset) = setup();
+        let stranger = Address::generate(&env);
+
+        let param_id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(900));
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_param",
+                args: (stranger.clone(), param_id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let cancel_param_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_param(&stranger, &param_id);
+        }));
+        assert!(
+            cancel_param_res.is_err(),
+            "non-admin must not be able to cancel a pending param change"
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_unpause",
+                args: (stranger.clone(), unpause_id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let cancel_unpause_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_unpause(&stranger, &unpause_id);
+        }));
+        assert!(
+            cancel_unpause_res.is_err(),
+            "non-admin must not be able to cancel a pending unpause"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn cancel_param_after_execute_fails() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(650));
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+
+        client.cancel_param(&admin, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn cancel_unpause_after_execute_fails() {
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        client.cancel_unpause(&admin, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_after_cancel_panics_with_no_such_pending_change() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(650));
+        client.cancel_param(&admin, &id);
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
     }
 
     #[test]
