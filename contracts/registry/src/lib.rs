@@ -1431,4 +1431,80 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    fn assert_config_eq(actual: &AssetConfig, expected: &AssetConfig) {
+        assert_eq!(actual.issuer, expected.issuer);
+        assert_eq!(actual.contract, expected.contract);
+        assert_eq!(actual.standard, expected.standard);
+        assert_eq!(actual.yield_type, expected.yield_type);
+        assert_eq!(actual.custody_mode, expected.custody_mode);
+        assert_eq!(actual.ccy, expected.ccy);
+        assert_eq!(actual.redemption_lag_days, expected.redemption_lag_days);
+        assert_eq!(actual.haircut_base_bps, expected.haircut_base_bps);
+        assert_eq!(actual.haircut_fx_bps, expected.haircut_fx_bps);
+        assert_eq!(actual.price_band_bps, expected.price_band_bps);
+        assert_eq!(actual.daily_move_band_bps, expected.daily_move_band_bps);
+        assert_eq!(actual.status, expected.status);
+    }
+
+    #[test]
+    fn execute_param_applies_every_param_change_variant_without_clobbering_other_fields() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        // 1. HaircutBaseBps(500)
+        let mut expected = client.asset(&asset);
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(500));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        expected.haircut_base_bps = 500;
+        assert_config_eq(&client.asset(&asset), &expected);
+
+        // 2. HaircutFxBps(250)
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(250));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        expected.haircut_fx_bps = 250;
+        assert_config_eq(&client.asset(&asset), &expected);
+
+        // 3. PriceBandBps(75)
+        let id = client.queue_param(&admin, &asset, &ParamChange::PriceBandBps(75));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        expected.price_band_bps = 75;
+        assert_config_eq(&client.asset(&asset), &expected);
+
+        // 4. DailyMoveBandBps(150)
+        let id = client.queue_param(&admin, &asset, &ParamChange::DailyMoveBandBps(150));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        expected.daily_move_band_bps = 150;
+        assert_config_eq(&client.asset(&asset), &expected);
+
+        // 5. RedemptionLagDays(3)
+        let id = client.queue_param(&admin, &asset, &ParamChange::RedemptionLagDays(3));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        expected.redemption_lag_days = 3;
+        assert_config_eq(&client.asset(&asset), &expected);
+
+        // 6. Status(symbol_short!("paused"))
+        let paused_status = symbol_short!("paused");
+        let id = client.queue_param(&admin, &asset, &ParamChange::Status(paused_status.clone()));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        expected.status = paused_status;
+        assert_config_eq(&client.asset(&asset), &expected);
+    }
 }
