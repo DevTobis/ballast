@@ -16,6 +16,36 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 The keeper is trusted for **timing and completeness**, not for **value**: every amount a settlement
 uses comes from the contract's own state or from the PriceGuard, never from a keeper-supplied number.
 
+### Admin, Risk & Pauser Timelock Matrix (`Registry` and `PriceGuard`)
+
+| Contract | Function | Who | Delay | Status (Intended / Open) | Why Immediate is Safe / Tracking Issue |
+|---|---|---|---|---|---|
+| `Registry` | `initialize` | Deployer (one-shot) | Immediate | Intended | One-time bootstrap on an uninitialised contract; panics if called again. |
+| `Registry` | `register_asset` | `admin` | Immediate | Intended | First-time asset onboarding only; panics if the asset is already registered, so live configs cannot be overwritten. |
+| `Registry` | `queue_param` / `execute_param` | `admin` / anyone | 48h timelock | Intended | All edits to an existing asset's haircuts, bands, redemption lag, or status wait 48h. |
+| `Registry` | `cancel_param` | `admin` | Immediate | Intended | Drops a queued parameter change before execution, keeping live parameters unchanged. |
+| `Registry` | `raise_haircut_now` | `risk` | Immediate | Intended | Tightening-only emergency action (`add_bps: u32` can only raise `haircut_base_bps`, capped at 100% combined). |
+| `Registry` | `pause` | `pauser` | Immediate | Intended | Emergency stop only; never blocks repayments, top-ups, or healthy collateral releases. |
+| `Registry` | `queue_unpause` / `execute_unpause` | `admin` / anyone | 48h timelock | Intended | Resuming a paused scope re-opens risk and requires 48h notice. |
+| `Registry` | `cancel_unpause` | `admin` | Immediate | Intended | Cancels a pending unpause so the scope stays paused. |
+| `Registry` | `queue_role_change` / `execute_role_change` | `admin` / anyone | 48h timelock | Intended | Rotates `Pauser`, `Keeper`, `PricePublisher`, or `Risk` after 48h. |
+| `Registry` | `propose_admin` / `accept_admin` | `admin` / `new_admin` | Immediate (two-step) | Intended | Two-step ownership transfer handshake prevents mistyped target addresses. |
+| `Registry` | `queue_upgrade` / `execute_upgrade` | `admin` / anyone | 48h timelock | Intended | In-place Wasm upgrade subject to 48h timelock (to be frozen post-audit). |
+| `Registry` | `cancel_upgrade` | `admin` | Immediate | Intended | Cancels a queued Wasm upgrade before execution. |
+| `PriceGuard` | `initialize` | Deployer (one-shot) | Immediate | Intended | One-time bootstrap; panics if called again. |
+| `PriceGuard` | `configure_asset` | `admin` | Immediate (initial or tightening only) | Intended (#99) | Initial setup and strictly tightening changes apply immediately; loosening changes panic and require `queue_config` (48h). |
+| `PriceGuard` | `configure_issuer_key` | `admin` | Immediate (first registration only) | Intended (#99) | First-time key registration is immediate; rotating an existing key panics and requires `queue_config` (48h). |
+| `PriceGuard` | `configure_signature_requirement` | `admin` | Immediate (initial or `true` only) | Intended (#99) | Enabling signature verification (`true`) is tightening; disabling (`false`) panics and requires `queue_config` (48h). |
+| `PriceGuard` | `queue_config` / `execute_config` | `admin` / anyone | 48h timelock | Intended (#99) | Applies loosening threshold changes, issuer key rotations, or signature-verification disabling after 48h. |
+| `PriceGuard` | `cancel_config` | `admin` | Immediate | Intended (#99) | Cancels a pending loosening config change before execution. |
+| `PriceGuard` | `remove_source` | `admin` | Immediate | Intended | Evicts a dead feed from the 8-slot `SortBuf` and immediately re-evaluates `guarded_price` (degrading if `< 2` fresh sources remain). |
+| `PriceGuard` | `confirm_halt_cleared` | `risk` | Immediate | Intended | Human circuit-breaker confirmation (PRD §6.4) promoting `PendingHaltValue` to `LastGood`. |
+| `PriceGuard` | `publish_nav` / `publish_source` | `price_publisher` | Immediate | Intended | Normal oracle ingestion bounded by future-skew, `band_bps`, `daily_move_band_bps`, and `window_move_band_bps`. |
+| `PriceGuard` | `queue_role_change` / `execute_role_change` | `admin` / anyone | 48h timelock | Intended | Rotates non-admin roles after 48h. |
+| `PriceGuard` | `propose_admin` / `accept_admin` | `admin` / `new_admin` | Immediate (two-step) | Intended | Two-step admin transfer handshake. |
+| `PriceGuard` | `queue_upgrade` / `execute_upgrade` | `admin` / anyone | 48h timelock | Intended | In-place Wasm upgrade subject to 48h timelock. |
+| `PriceGuard` | `cancel_upgrade` | `admin` | Immediate | Intended | Cancels a queued Wasm upgrade before execution. |
+
 ## PriceGuard
 
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;

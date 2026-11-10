@@ -194,3 +194,43 @@ However, once Ballast undergoes external security audit and reaches production m
 - After completing the formal security audit and deployment verification on mainnet, upgrade authority will be permanently renounced or burned (e.g. by setting the contract admin to an unspendable burn address or locking the upgrade mechanism).
 - Freezing post-audit guarantees immutability, ensuring neither compromised admin keys nor rogue governance actions can replace contract code or drain user collateral, fulfilling Ballast's core security commitments.
 
+## Timelocked vs. Immediate Admin, Risk & Pauser Functions (`Registry` and `PriceGuard`)
+
+The tables below document every privileged (`admin`, `risk`, `pauser`, `price_publisher`) and timelock-execution entry point on `Registry` and `PriceGuard`, its required delay (`TIMELOCK_DELAY_SECONDS = 48h`), whether that behaviour is intended or tracked by an open issue, and why each immediate entry point is safe.
+
+### `Registry`
+
+| Function | Who | Delay | Status (Intended / Open) | Rationale & Notes |
+|---|---|---|---|---|
+| `initialize` | Deployer (one-shot) | Immediate | Intended | Bootstraps initial `Roles` once on a fresh contract instance; panics with `"registry: already initialized"` on any second call. |
+| `register_asset` | `admin` | Immediate | Intended | First-time onboarding of a new collateral asset only; panics with `"registry: asset already registered"` if the address already exists, so it cannot overwrite live risk parameters. |
+| `queue_param` / `execute_param` | `admin` queues; anyone executes | 48h timelock | Intended | All changes to an existing asset's `haircut_base_bps`, `haircut_fx_bps`, `price_band_bps`, `daily_move_band_bps`, `redemption_lag_days`, or `status` wait 48h so lenders and borrowers can exit before new parameters take effect. |
+| `cancel_param` | `admin` | Immediate | Intended | Cancels a pending `ParamChange` before execution, preserving the current live configuration (protective no-op on live state). |
+| `raise_haircut_now` | `risk` | Immediate | Intended | Tightening-only emergency control (PRD §6.2): `add_bps` is unsigned (`u32`) and only increases `haircut_base_bps` (capped at `10_000` combined with `haircut_fx_bps`). Reducing a haircut requires the 48h `queue_param` / `execute_param` path. |
+| `pause` | `pauser` | Immediate | Intended | Emergency stop only (PRD §6.2): halts `Pledges`, `Draws`, `Exits`, `Repos`, or `All`, while repayments, collateral top-ups, and healthy releases remain open. |
+| `queue_unpause` / `execute_unpause` | `admin` queues; anyone executes | 48h timelock | Intended | Lifting a pause re-enables risk-taking operations and therefore requires the 48h notice period. |
+| `cancel_unpause` | `admin` | Immediate | Intended | Cancels a queued unpause before execution so the scope remains paused (protective). |
+| `queue_role_change` / `execute_role_change` | `admin` queues; anyone executes | 48h timelock | Intended | Rotates non-admin roles (`Pauser`, `Keeper`, `PricePublisher`, `Risk`) after a 48h review window. |
+| `propose_admin` / `accept_admin` | `admin` proposes; `new_admin` accepts | Immediate (two-step) | Intended | Two-step ownership handshake prevents accidental transfer to a mistyped or unowned address. |
+| `queue_upgrade` / `execute_upgrade` | `admin` queues; anyone executes | 48h timelock | Intended | In-place Wasm upgrade gated by a 48h timelock (and subject to the post-audit freeze policy above). |
+| `cancel_upgrade` | `admin` | Immediate | Intended | Allows `admin` to abort a pending Wasm upgrade during the 48h review window. |
+
+### `PriceGuard`
+
+| Function | Who | Delay | Status (Intended / Open) | Rationale & Notes |
+|---|---|---|---|---|
+| `initialize` | Deployer (one-shot) | Immediate | Intended | Bootstraps initial `Roles` once on a fresh contract instance; panics with `"price-guard: already initialized"` on any second call. |
+| `configure_asset` | `admin` | Immediate (initial or tightening only) | Intended (loosening moved to 48h timelock in #99) | Initial per-asset threshold setup and strictly tightening updates (smaller `band_bps` / `daily_move_band_bps` / `window_move_band_bps`, shorter `max_staleness_s`, or longer `window_seconds`) apply immediately; any loosening update panics and must go through `queue_config` / `execute_config`. |
+| `configure_issuer_key` | `admin` | Immediate (first registration only) | Intended (key rotation moved to 48h timelock in #99) | First-time registration of an asset's Ed25519 NAV attestor key applies immediately; rotating an existing key to a different `BytesN<32>` panics and must go through `queue_config` / `execute_config`. |
+| `configure_signature_requirement` | `admin` | Immediate (initial setup or enabling `true` only) | Intended (disabling moved to 48h timelock in #99) | Enabling `require_nav_signature = true` (tightening) or setting the initial value is immediate; flipping an existing `true` to `false` (loosening) panics and must go through `queue_config` / `execute_config`. |
+| `queue_config` / `execute_config` | `admin` queues; anyone executes | 48h timelock | Intended (#99) | Applies loosening `ConfigChange` variants (`BandBps`, `DailyMoveBandBps`, `WindowSeconds`, `WindowMoveBandBps`, `MaxStalenessSeconds`, `Asset`, `IssuerPubKey` rotation, `RequireNavSignature(false)`) after the 48h timelock. |
+| `cancel_config` | `admin` | Immediate | Intended (#99) | Cancels a queued loosening `ConfigChange` before execution, keeping the stricter live configuration intact. |
+| `remove_source` | `admin` | Immediate | Intended | Evicts a dead or decommissioned feed slot (bounded by the 8-source `SortBuf` cap) and immediately re-evaluates `guarded_price`; if fewer than two fresh sources remain, the asset transitions to `Degraded`. |
+| `confirm_halt_cleared` | `risk` | Immediate | Intended | Human-in-the-loop circuit-breaker reset (PRD §6.4): after a move beyond `daily_move_band_bps` or `window_move_band_bps` latches `Halted`, `risk` confirms the move was real market motion and promotes `PendingHaltValue` to `LastGood`. |
+| `publish_nav` / `publish_source` | `price_publisher` | Immediate | Intended | Routine oracle feed ingestion; bounded on every call by future-skew checks, `band_bps`, `daily_move_band_bps`, and `window_move_band_bps`. |
+| `queue_role_change` / `execute_role_change` | `admin` queues; anyone executes | 48h timelock | Intended | Rotates non-admin roles (`Pauser`, `Keeper`, `PricePublisher`, `Risk`) after a 48h timelock. |
+| `propose_admin` / `accept_admin` | `admin` proposes; `new_admin` accepts | Immediate (two-step) | Intended | Two-step admin transfer handshake matching `Registry`. |
+| `queue_upgrade` / `execute_upgrade` | `admin` queues; anyone executes | 48h timelock | Intended | In-place Wasm upgrade gated by a 48h timelock. |
+| `cancel_upgrade` | `admin` | Immediate | Intended | Aborts a queued Wasm upgrade before execution. |
+
+
