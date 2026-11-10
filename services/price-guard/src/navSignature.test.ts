@@ -1,15 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { canonicalNavMessage } from "./navSignature.js";
+import { canonicalNavMessage, verifyNavSignature } from "./navSignature.js";
 
 /**
  * Golden vectors shared with `build_nav_message_matches_golden_vectors` in
- * `contracts/price-guard/src/lib.rs`, which asserts the same bytes on-chain:
+ * `contracts/price-guard/src/lib.rs` and documented in `docs/nav-signing.md`:
  *   ("SPIKO",   1700000000, 10234567)                                -> "SPIKO:1700000000:10234567"
  *   ("CETES28", 4102444800, 170141183460469231731687303715884105727) -> "CETES28:4102444800:170141183460469231731687303715884105727"
  * The second value is i128::MAX. If either side changes, change both in the same commit.
  */
-const vectors: Array<{ assetCode: string; ts: number; value: string; message: string }> = JSON.parse(
+const vectors: Array<{
+  assetCode: string;
+  ts: number;
+  value: string;
+  message: string;
+  messageHex: string;
+  publicKeyHex: string;
+  publicKeyBase64: string;
+  stellarPublicKey: string;
+  signatureHex: string;
+}> = JSON.parse(
   readFileSync(new URL("./__fixtures__/nav-message-vectors.json", import.meta.url), "utf8"),
 );
 
@@ -21,7 +31,19 @@ describe("canonicalNavMessage", () => {
     ]);
   });
 
-  it.each(vectors)("builds $message", ({ assetCode, ts, value, message }) => {
-    expect(canonicalNavMessage(assetCode, ts, BigInt(value))).toEqual(Buffer.from(message, "utf8"));
-  });
+  it.each(vectors)(
+    "builds $message and verifies its documented Ed25519 signature vector",
+    ({ assetCode, ts, value, message, messageHex, publicKeyHex, publicKeyBase64, signatureHex }) => {
+      const msgBuf = canonicalNavMessage(assetCode, ts, BigInt(value));
+      expect(msgBuf).toEqual(Buffer.from(message, "utf8"));
+      expect(msgBuf.toString("hex")).toBe(messageHex);
+
+      const pubHexBuf = Buffer.from(publicKeyHex, "hex");
+      const pubB64Buf = Buffer.from(publicKeyBase64, "base64");
+      expect(pubHexBuf).toEqual(pubB64Buf);
+
+      const sigBuf = Buffer.from(signatureHex, "hex");
+      expect(verifyNavSignature(assetCode, ts, BigInt(value), sigBuf, pubHexBuf)).toBe(true);
+    },
+  );
 });

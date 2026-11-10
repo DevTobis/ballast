@@ -95,6 +95,20 @@ why this flag exists — it's a local-testing/bring-up affordance, not a securit
 testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if
 it was ever turned off, and should leave it at its default `true` otherwise.
 
+### Canonical Message Format, Key Encoding & Verified Test Vectors
+
+See [`docs/nav-signing.md`](../docs/nav-signing.md) for the full operator specification, including:
+- **Attestor trust model:** `price_publisher` fetches the issuer quote over HTTPS and signs `{asset_code}:{ts}:{value}` with its own Ed25519 key (`scripts/sign-nav.mjs`, `services/price-guard/src/navAttestor.ts`). The on-chain check verifies that the `price_publisher` attested to those exact bytes (matching `contracts/AUDIT_NOTES.md`), not that the issuer signed them directly.
+- **Exact grammar:** UTF-8 `<asset_code>:<ts>:<value>` with unsigned base-10 `u64` timestamp `<ts>` and signed base-10 `i128` (`1e7`-scaled) `<value>`.
+- **Key conversion (`G...` -> 32-byte hex/base64):**
+  ```bash
+  python3 -c 'import base64, sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PUBLISHER_G"
+  ```
+- **Two verified Ed25519 test vectors** (seed `0909...09`, public key `fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618` / `GD6ROJBYLKQMOW3E7N4M2YBPUHMZD7PL65VRHRMO24BOVSBV5H3BQRSL`), exercised by both `contracts/price-guard/src/lib.rs` and `services/price-guard/src/navSignature.test.ts`:
+  1. `SPIKO:1700000000:10234567` -> sig `234bd254088c736541fe363aa4d7163004ece797b6dfc6d58d3e796987cfc20501ae42a42e9db5d1a026294b755e3c98943fdce037cff1bacfd578e749a7ba0e`
+  2. `CETES28:4102444800:170141183460469231731687303715884105727` -> sig `8d3d74080eedf829ec37883108d114c7430729a98d904561c05f1c09280c5ace0632377afafe85061421bee92cc6de6bf6e4cacf2b82aef39d4a2333d8294c0c`
+- **Operational runbook** for registering `configure_issuer_key` and flipping `configure_signature_requirement --required true`.
+
 ## Rotating the price publisher without redeploying
 
 `PriceGuard` stores its roles, so the off-chain publisher can be rotated in place instead of
