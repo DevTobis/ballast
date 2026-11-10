@@ -64,6 +64,7 @@ use ballast_common::{
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 const ISSUER_SOURCE: &str = "issuer";
+const NAV_DOMAIN_PREFIX: &[u8] = b"ballast-nav-v1:";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +135,11 @@ enum DataKey {
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
+    /// Per-asset canonical ticker (`asset_code: Bytes`) bound to `asset`.
+    AssetCode(Address),
+    /// Reverse lookup from `asset_code: Bytes` to the `asset: Address` that owns it, preventing
+    /// cross-asset NAV signature replay under a shared issuer key.
+    CodeAsset(Bytes),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -181,17 +187,51 @@ mod decimal_ascii {
     }
 }
 
-/// Builds the canonical NAV message `"{asset_code}:{ts}:{value}"` (UTF-8 bytes) that both this
-/// contract and the off-chain `price-guard` service (`services/price-guard/src/navSignature.ts`)
+/// Builds the canonical domain-separated NAV message
+/// `"ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}"` (UTF-8 bytes) that both this contract
+/// and the off-chain `price-guard` service (`services/price-guard/src/navSignature.ts`)
 /// sign/verify against. Keep these two builders in lockstep — see the module doc comment.
-fn build_nav_message(env: &Env, asset_code: &Bytes, ts: u64, value: i128) -> Bytes {
+fn build_nav_message(
+    env: &Env,
+    contract: &Address,
+    asset_code: &Bytes,
+    ts: u64,
+    value: i128,
+) -> Bytes {
     let colon = Bytes::from_slice(env, b":");
-    let mut message = asset_code.clone();
+    let mut message = Bytes::from_slice(env, NAV_DOMAIN_PREFIX);
+    message.append(&contract.to_string().to_bytes());
+    message.append(&colon);
+    message.append(asset_code);
     message.append(&colon);
     message.append(&decimal_ascii::u64_to_bytes(env, ts));
     message.append(&colon);
     message.append(&decimal_ascii::i128_to_bytes(env, value));
     message
+}
+
+fn bind_or_verify_asset_code(env: &Env, asset: &Address, asset_code: &Bytes) {
+    assert!(
+        !asset_code.is_empty(),
+        "price-guard: asset_code must not be empty"
+    );
+    let asset_key = DataKey::AssetCode(asset.clone());
+    if let Some(expected_code) = env.storage().instance().get::<_, Bytes>(&asset_key) {
+        assert!(
+            &expected_code == asset_code,
+            "price-guard: asset_code mismatch for asset"
+        );
+    } else {
+        let code_key = DataKey::CodeAsset(asset_code.clone());
+        if let Some(owner_asset) = env.storage().instance().get::<_, Address>(&code_key) {
+            assert!(
+                &owner_asset == asset,
+                "price-guard: asset_code is bound to a different asset"
+            );
+        }
+        env.storage().instance().set(&asset_key, asset_code);
+        env.storage().instance().set(&code_key, asset);
+    }
 }
 
 fn require_nav_signature(env: &Env) -> bool {
@@ -760,6 +800,16 @@ impl PriceGuard {
         );
     }
 
+    /// Admin-only. Explicitly binds `asset_code` (e.g. `"SPIKO"`) to `asset` so no other asset on
+    /// this deployment can claim that ticker or replay its NAV signatures.
+    pub fn configure_asset_code(env: Env, admin: Address, asset: Address, asset_code: Bytes) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+        bind_or_verify_asset_code(&env, &asset, &asset_code);
+    }
+
     /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all.
     /// Tightening (requiring signatures) is immediate; loosening (disabling verification) requires 48h timelock.
     pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
@@ -996,6 +1046,7 @@ impl PriceGuard {
         ttl::extend_instance(&env);
         read_config(&env, &asset); // asserts the asset is configured
         require_sane_reading(&env, value, ts);
+        bind_or_verify_asset_code(&env, &asset, &asset_code);
 
         if require_nav_signature(&env) {
             let issuer_pubkey: BytesN<32> = env
@@ -1003,7 +1054,8 @@ impl PriceGuard {
                 .instance()
                 .get(&DataKey::IssuerPubKey(asset.clone()))
                 .expect("price-guard: no issuer public key configured for asset (call configure_issuer_key)");
-            let message = build_nav_message(&env, &asset_code, ts, value);
+            let contract = env.current_contract_address();
+            let message = build_nav_message(&env, &contract, &asset_code, ts, value);
             // Panics (traps the whole invocation) if `sig` doesn't verify — see
             // `soroban_sdk::crypto::Crypto::ed25519_verify`'s doc comment.
             env.crypto().ed25519_verify(&issuer_pubkey, &message, &sig);
@@ -1217,13 +1269,14 @@ mod test {
 
     fn sign_nav(
         env: &Env,
+        contract: &Address,
         signing_key: &ed25519_dalek::SigningKey,
         code: &Bytes,
         ts: u64,
         value: i128,
     ) -> BytesN<64> {
         use ed25519_dalek::Signer;
-        let message = build_nav_message(env, code, ts, value);
+        let message = build_nav_message(env, contract, code, ts, value);
         let mut message_bytes = [0u8; 256];
         let len = message.len() as usize;
         message.copy_into_slice(&mut message_bytes[..len]);
@@ -1339,7 +1392,7 @@ mod test {
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now, SCALE);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
 
         let redstone = Symbol::new(&env, "redston");
@@ -1362,7 +1415,7 @@ mod test {
 
         let now = env.ledger().timestamp();
         // Signed over a DIFFERENT value than what's actually published -> verification must fail.
-        let sig = sign_nav(&env, &signing_key, &code, now, SCALE + 1);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now, SCALE + 1);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
     }
 
@@ -1563,7 +1616,7 @@ mod test {
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now, SCALE);
         let other_code = Bytes::from_slice(&env, b"OTHERASSET");
         client.publish_nav(&publisher, &asset, &other_code, &SCALE, &now, &sig);
     }
@@ -1579,7 +1632,7 @@ mod test {
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &signing_key, &code, now + 1, SCALE);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now + 1, SCALE);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
     }
 
@@ -1595,7 +1648,7 @@ mod test {
 
         let other_signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &other_signing_key, &code, now, SCALE);
+        let sig = sign_nav(&env, &client.address, &other_signing_key, &code, now, SCALE);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
     }
 
@@ -1629,8 +1682,74 @@ mod test {
         env.ledger().set_timestamp(1_000);
         let now = env.ledger().timestamp();
         let historical_ts = now - 1;
-        let sig = sign_nav(&env, &signing_key, &code, historical_ts, SCALE);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, historical_ts, SCALE);
         client.publish_nav(&publisher, &asset, &code, &SCALE, &historical_ts, &sig);
+    }
+
+    #[test]
+    fn signature_for_asset_a_is_rejected_for_asset_b_under_same_issuer_key() {
+        let (env, client, admin, publisher, _risk, asset_a) = setup_with_admin(50, 10_000, 3600);
+        let asset_b = Address::generate(&env);
+        client.configure_asset(&admin, &asset_b, &50, &10_000, &DEFAULT_WINDOW_SECONDS, &DEFAULT_WINDOW_MOVE_BAND_BPS, &3600);
+
+        let code_a = Bytes::from_slice(&env, b"SPIKO");
+        let code_b = Bytes::from_slice(&env, b"CETES28");
+        client.configure_asset_code(&admin, &asset_a, &code_a);
+        client.configure_asset_code(&admin, &asset_b, &code_b);
+
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset_a, &pubkey);
+        client.configure_issuer_key(&admin, &asset_b, &pubkey);
+        client.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig_a = sign_nav(&env, &client.address, &signing_key, &code_a, now, SCALE);
+
+        // Publishing for asset A succeeds
+        client.publish_nav(&publisher, &asset_a, &code_a, &SCALE, &now, &sig_a);
+
+        // Replaying sig_a for asset B with code_b fails Ed25519 verification
+        let replay_with_code_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset_b, &code_b, &SCALE, &now, &sig_a);
+        }));
+        assert!(replay_with_code_b.is_err(), "sig for asset A must fail for asset B with code B");
+
+        // Replaying sig_a for asset B by passing asset A's code_a fails asset_code binding check
+        let replay_with_code_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset_b, &code_a, &SCALE, &now, &sig_a);
+        }));
+        assert!(replay_with_code_a.is_err(), "sig for asset A must fail for asset B even when passing code A");
+    }
+
+    #[test]
+    fn signature_for_deployment_a_is_rejected_by_deployment_b() {
+        let (env, client_a, admin, publisher, risk, asset) = setup_with_admin(50, 10_000, 3600);
+
+        let id_b = env.register(PriceGuard, ());
+        let client_b = PriceGuardClient::new(&env, &id_b);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        client_b.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+        client_b.configure_asset(&admin, &asset, &50, &10_000, &DEFAULT_WINDOW_SECONDS, &DEFAULT_WINDOW_MOVE_BAND_BPS, &3600);
+
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client_a.configure_issuer_key(&admin, &asset, &pubkey);
+        client_b.configure_issuer_key(&admin, &asset, &pubkey);
+        client_a.configure_signature_requirement(&admin, &true);
+        client_b.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        let sig_a = sign_nav(&env, &client_a.address, &signing_key, &code, now, SCALE);
+
+        // Accepted by deployment A
+        client_a.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig_a);
+
+        // Rejected by deployment B because current_contract_address differs
+        let res_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client_b.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig_a);
+        }));
+        assert!(res_b.is_err(), "signature for deployment A must be rejected by deployment B");
     }
 
     // --- adversarial cases -------------------------------------------------------------------
@@ -2238,17 +2357,29 @@ mod test {
     #[test]
     fn build_nav_message_matches_golden_vectors() {
         let env = Env::default();
+        let contract = Address::from_str(
+            &env,
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+        );
 
         let message = build_nav_message(
             &env,
+            &contract,
             &Bytes::from_slice(&env, b"SPIKO"),
             1_700_000_000,
             10_234_567,
         );
-        assert_eq!(message, Bytes::from_slice(&env, b"SPIKO:1700000000:10234567"));
+        assert_eq!(
+            message,
+            Bytes::from_slice(
+                &env,
+                b"ballast-nav-v1:CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC:SPIKO:1700000000:10234567"
+            )
+        );
 
         let message = build_nav_message(
             &env,
+            &contract,
             &Bytes::from_slice(&env, b"CETES28"),
             4_102_444_800,
             i128::MAX,
@@ -2257,7 +2388,7 @@ mod test {
             message,
             Bytes::from_slice(
                 &env,
-                b"CETES28:4102444800:170141183460469231731687303715884105727"
+                b"ballast-nav-v1:CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC:CETES28:4102444800:170141183460469231731687303715884105727"
             )
         );
     }

@@ -77,8 +77,10 @@ all six contracts against the public Stellar testnet.
 `PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
 e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
 `require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
-issuer key (`configure_issuer_key`, admin-only) over the canonical message
-`"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+issuer key (`configure_issuer_key`, admin-only) over the domain-separated canonical message
+`"ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+Each `asset` address is bound to its `asset_code` (via `configure_asset_code` or on first
+`publish_nav`), preventing cross-asset and cross-deployment signature replay.
 
 This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment

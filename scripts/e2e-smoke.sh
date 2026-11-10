@@ -76,7 +76,7 @@ log "  NAV $NAV_VALUE @ $NAV_TS, oracle $FEED_VALUE @ $FEED_TS (1e7 fixed point)
 # asset_code is the hex-encoded UTF-8 bytes of "RWA1" (the ticker this deploy registers).
 # publish_nav verifies the publisher's Ed25519 signature over "RWA1:<ts>:<value>" on-chain.
 RWA1_ASSET_CODE_HEX="52574131"
-NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" RWA1 "$NAV_TS" "$NAV_VALUE")
+NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" RWA1 "$NAV_TS" "$NAV_VALUE" "$PRICE_GUARD_CID")
 inv --id "$PRICE_GUARD_CID" --source price_publisher -- publish_nav \
   --publisher "$PRICE_PUBLISHER" --asset "$RWA_SAC" --asset_code "$RWA1_ASSET_CODE_HEX" \
   --value "$NAV_VALUE" --ts "$NAV_TS" --sig "$NAV_SIG" >/dev/null
