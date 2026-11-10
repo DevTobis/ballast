@@ -116,6 +116,53 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
 
+## Registry
+
+- **`register_asset` is not timelocked** (`contracts/registry/src/lib.rs:128–146`). Onboarding a
+  brand-new asset touches no existing positions or funds (`!env.storage().persistent().has(&DataKey::Asset(asset))`).
+  Once an asset is registered, any modification to its parameters (`haircut_base_bps`, `haircut_fx_bps`,
+  `price_band_bps`, `daily_move_band_bps`, `redemption_lag_days`, `status`) must go through the
+  48-hour timelocked `queue_param` / `execute_param` flow (`contracts/registry/src/lib.rs:160–245`).
+- **Pending changes live in persistent storage with a 48h + 7-day grace TTL**
+  (`contracts/registry/src/lib.rs:168–178`, `290–300`; `contracts/common/src/timelock.rs:15–31`,
+  `53–59`). Queued parameter updates (`DataKey::PendingParam(id)`) and unpause entries
+  (`DataKey::PendingUnpause(id)`) are written to `.persistent()` storage and extended via
+  `timelock::extend_entry_ttl` to `TIMELOCK_LEDGER_TTL` (`155,520` ledgers, ~9 days at ~5s/ledger:
+  48h delay + 7-day execution window) so they cannot expire mid-timelock.
+- **`execute_param` and `execute_unpause` are permissionless; queueing is access-controlled**
+  (`contracts/registry/src/lib.rs:160–245`, `286–339`). Only the stored `admin` may call
+  `queue_param`, `cancel_param`, `queue_unpause`, or `cancel_unpause`. Once `timelock::is_ready`
+  (`now >= executes_at`) holds, any account or keeper may trigger `execute_param` or
+  `execute_unpause`.
+- **`raise_haircut_now` is increase-only and bounded by `<= 10_000`**
+  (`contracts/registry/src/lib.rs:247–270`). The `risk` role can raise `haircut_base_bps`
+  immediately as an emergency brake (`checked_add(add_bps)`), subject to the combined ceiling
+  `u64::from(new_haircut) + u64::from(config.haircut_fx_bps) <= 10_000` (100%). Lowering a haircut
+  loosens risk and therefore requires the 48-hour `queue_param` timelock.
+- **Registry parameters and pause flags are not cross-called at runtime by the position contracts in
+  this pass** (`contracts/registry/src/lib.rs:9–13`, `contracts/pledge-vault/src/lib.rs:28–31`,
+  `contracts/credit-line/src/lib.rs:12–16`, `contracts/repo-dvp/src/lib.rs:13–17`, `472–475`).
+  `PledgeVault`, `CreditLine`, `ExitDesk`, and `RepoDvP` each hold their own admin-configured
+  per-asset parameters (`configure_asset`) and instance-scoped pause flags (`pause::set_paused`),
+  rather than cross-calling `Registry::asset` or `Registry::is_paused` on the hot path. Operators
+  must pause or update parameters on the target contract directly (in addition to `Registry` for
+  off-chain indexers).
+
+## ballast-common
+
+- **Caller trust for non-negative amounts** (`contracts/common/src/risk.rs:8–48`). Pure math helpers
+  in `ballast_common::risk` (`collateral_value` and `ltv_bps`) treat `units <= 0`,
+  `guarded_price <= 0`, or `debt <= 0` as zero rather than panicking, and rely on the calling
+  contract entry points (`pledge`, `draw`, `propose`, `publish_source`) to validate and reject
+  non-positive token amounts at the contract boundary.
+- **Panics trap the Soroban host transaction** (`contracts/common/src/lib.rs`,
+  `contracts/common/src/access.rs:28–56`, `contracts/common/src/pause.rs:41–45`,
+  `contracts/common/src/risk.rs:19–47`). Authorization failures (`require_admin`, `require_pauser`,
+  `require_keeper`, `require_price_publisher`, `require_risk`), pause gates (`require_not_paused`),
+  validation checks (`MarginThresholds::validate`, `AssetConfig::validate`), and arithmetic
+  overflows (`checked_mul` / `expect`) panic, which aborts the host invocation and rolls back all
+  state changes and token transfers in the transaction atomically.
+
 ## Known limits
 
 - Real RWAs cannot be held by these contracts unless the issuer allows it (`AUTH_REQUIRED`
