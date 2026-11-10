@@ -1431,4 +1431,52 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    #[should_panic(expected = "registry: already initialized")]
+    fn initialize_cannot_run_more_than_once() {
+        let (env, client, _admin, _risk, _asset) = setup();
+
+        let attacker_admin = Address::generate(&env);
+        let attacker_pauser = Address::generate(&env);
+        let attacker_keeper = Address::generate(&env);
+        let attacker_publisher = Address::generate(&env);
+        let attacker_risk = Address::generate(&env);
+
+        client.initialize(
+            &attacker_admin,
+            &attacker_pauser,
+            &attacker_keeper,
+            &attacker_publisher,
+            &attacker_risk,
+        );
+    }
+
+    #[test]
+    fn failed_second_initialize_leaves_original_roles_intact() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        let original_roles = client.roles();
+
+        let attacker_admin = Address::generate(&env);
+        let attacker_pauser = Address::generate(&env);
+        let attacker_keeper = Address::generate(&env);
+        let attacker_publisher = Address::generate(&env);
+        let attacker_risk = Address::generate(&env);
+
+        let second_init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.initialize(
+                &attacker_admin,
+                &attacker_pauser,
+                &attacker_keeper,
+                &attacker_publisher,
+                &attacker_risk,
+            );
+        }));
+        assert!(second_init.is_err());
+
+        assert_eq!(client.roles(), original_roles);
+        env.as_contract(&client.address, || {
+            assert_eq!(access::read_roles(&env), original_roles);
+        });
+    }
 }
