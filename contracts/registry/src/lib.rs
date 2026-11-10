@@ -1431,4 +1431,95 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    fn queue_unpause_rejects_stranger_and_creates_no_pending_entry() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _risk, _asset) = setup();
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "queue_unpause",
+                args: (&stranger, PauseScope::Draws).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        assert!(client.try_queue_unpause(&stranger, &PauseScope::Draws).is_err());
+        env.as_contract(&client.address, || {
+            assert!(!env.storage().persistent().has(&DataKey::PendingUnpause(0)));
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn execute_unpause_rejects_unknown_id() {
+        let (_env, client, _admin, _risk, _asset) = setup();
+        client.execute_unpause(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn execute_unpause_cannot_replay_an_already_executed_id() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let pauser = client_pauser(&env, &client);
+
+        client.pause(&pauser, &PauseScope::Draws);
+        assert!(client.is_paused(&PauseScope::Draws));
+
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        client.execute_unpause(&id);
+        assert!(!client.is_paused(&PauseScope::Draws));
+
+        // Second execution of the same unpause id must panic.
+        client.execute_unpause(&id);
+    }
+
+    #[test]
+    fn unpausing_all_leaves_individually_paused_scope_paused() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let pauser = client_pauser(&env, &client);
+
+        // Pause both All and Draws explicitly.
+        client.pause(&pauser, &PauseScope::All);
+        client.pause(&pauser, &PauseScope::Draws);
+
+        // Queue and execute unpause for All only.
+        let id = client.queue_unpause(&admin, &PauseScope::All);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        // Draws retains its own per-scope pause flag, while the other scopes are now unpaused.
+        assert!(client.is_paused(&PauseScope::Draws));
+        assert!(!client.is_paused(&PauseScope::Pledges));
+        assert!(!client.is_paused(&PauseScope::Exits));
+        assert!(!client.is_paused(&PauseScope::Repos));
+        assert!(!client.is_paused(&PauseScope::All));
+    }
+
+    #[test]
+    fn unpausing_an_already_unpaused_scope_is_a_safe_no_op() {
+        let (env, client, admin, _risk, _asset) = setup();
+
+        // Queueing and executing an unpause for a scope that was never paused is allowed by design:
+        // `pause::set_paused(scope, false)` is idempotent, so operators can clear a scope without
+        // racing an in-flight state check.
+        assert!(!client.is_paused(&PauseScope::Repos));
+        let id = client.queue_unpause(&admin, &PauseScope::Repos);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        assert!(!client.is_paused(&PauseScope::Repos));
+    }
 }
