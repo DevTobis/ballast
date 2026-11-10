@@ -29,7 +29,7 @@ pub enum CustodyMode {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetConfig {
     pub issuer: Address,
     pub contract: Address,
@@ -87,7 +87,7 @@ impl AssetConfig {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParamChange {
     HaircutBaseBps(u32),
     HaircutFxBps(u32),

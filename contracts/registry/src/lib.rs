@@ -19,18 +19,31 @@ use ballast_common::{
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
+/// Read-only view of a queued asset parameter change stored under `DataKey::PendingParam(id)`.
 #[contracttype]
-struct PendingParamChange {
-    asset: Address,
-    change: ParamChange,
-    executes_at: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingParamView {
+    /// The registered asset whose configuration will be updated upon execution.
+    pub asset: Address,
+    /// The parameter change to apply once `executes_at` is reached.
+    pub change: ParamChange,
+    /// Ledger timestamp (seconds) at which this change becomes executable.
+    pub executes_at: u64,
 }
 
+type PendingParamChange = PendingParamView;
+
+/// Read-only view of a queued unpause operation stored under `DataKey::PendingUnpause(id)`.
 #[contracttype]
-struct PendingUnpause {
-    scope: PauseScope,
-    executes_at: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUnpauseView {
+    /// The pause scope that will be cleared upon execution.
+    pub scope: PauseScope,
+    /// Ledger timestamp (seconds) at which this unpause becomes executable.
+    pub executes_at: u64,
 }
+
+type PendingUnpause = PendingUnpauseView;
 
 #[contracttype]
 enum DataKey {
@@ -244,6 +257,12 @@ impl Registry {
         );
     }
 
+    /// Returns the queued parameter change for `id`, including its target asset, `ParamChange`
+    /// payload, and `executes_at` timestamp, or `None` if no such pending change exists.
+    pub fn pending_param(env: Env, id: u64) -> Option<PendingParamView> {
+        env.storage().persistent().get(&DataKey::PendingParam(id))
+    }
+
     /// The emergency brake (PRD §6.4/§8): raises `haircut_base_bps` immediately, with no
     /// timelock. Increase-only — a decrease (loosening risk) must go through the timelocked path,
     /// only tightening risk gets to skip it.
@@ -336,6 +355,12 @@ impl Registry {
         env.storage().persistent().remove(&key);
         env.events()
             .publish((Symbol::new(&env, "unpause_executed"), id), pending.scope);
+    }
+
+    /// Returns the queued unpause operation for `id`, including its `PauseScope` and
+    /// `executes_at` timestamp, or `None` if no such pending unpause exists.
+    pub fn pending_unpause(env: Env, id: u64) -> Option<PendingUnpauseView> {
+        env.storage().persistent().get(&DataKey::PendingUnpause(id))
     }
 
     pub fn is_paused(env: Env, scope: PauseScope) -> bool {
@@ -674,16 +699,9 @@ mod test {
 
     #[test]
     fn pause_is_immediate_unpause_is_timelocked() {
-        let (env, client, admin, _risk, asset) = setup();
-        let _ = asset;
+        let (env, client, admin, _risk, _asset) = setup();
 
-        let pauser = Address::generate(&env);
-        // Re-initialize isn't possible; instead call pause with the actual configured pauser by
-        // reading it back out is not exposed, so this test exercises the read-your-writes path
-        // via `is_paused` using the pauser captured at setup time instead.
-        let _ = pauser;
-
-        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        client.pause(&client.roles().pauser, &PauseScope::Draws);
         assert!(client.is_paused(&PauseScope::Draws));
 
         let id = client.queue_unpause(&admin, &PauseScope::Draws);
@@ -737,7 +755,7 @@ mod test {
             assert!(!client.is_paused(&scope));
         }
 
-        client.pause(&client_pauser(&env, &client), &PauseScope::All);
+        client.pause(&client.roles().pauser, &PauseScope::All);
 
         for scope in [
             PauseScope::Pledges,
@@ -751,8 +769,8 @@ mod test {
 
     #[test]
     fn pausing_twice_is_idempotent() {
-        let (env, client, ..) = setup();
-        let pauser = client_pauser(&env, &client);
+        let (_env, client, ..) = setup();
+        let pauser = client.roles().pauser;
 
         client.pause(&pauser, &PauseScope::Exits);
         client.pause(&pauser, &PauseScope::Exits);
@@ -921,7 +939,7 @@ mod test {
             "raise_haircut_now must emit haircut_raised"
         );
 
-        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        client.pause(&client.roles().pauser, &PauseScope::Draws);
         let paused = expected_event(
             &env,
             &addr,
@@ -1031,10 +1049,6 @@ mod test {
         );
     }
 
-    fn client_pauser(_env: &Env, client: &RegistryClient<'static>) -> Address {
-        client.roles().pauser
-    }
-
     #[test]
     fn execute_param_survives_advancing_sequence_number_past_48h() {
         let (env, client, admin, _risk, asset) = setup();
@@ -1080,7 +1094,7 @@ mod test {
     fn cancel_unpause_removes_pending_unpause_and_prevents_execution() {
         let (env, client, admin, _risk, _asset) = setup();
 
-        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        client.pause(&client.roles().pauser, &PauseScope::Draws);
         assert!(client.is_paused(&PauseScope::Draws));
 
         let id = client.queue_unpause(&admin, &PauseScope::Draws);
@@ -1430,5 +1444,80 @@ mod test {
             assert_eq!(loaded.haircut_base_bps, 300);
             assert_eq!(loaded.status, config.status);
         });
+    }
+
+    #[test]
+    fn roles_and_pending_getters_reflect_queued_executed_and_cancelled_items() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let id = env.register(Registry, ());
+        let client = RegistryClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        assert_eq!(
+            client.roles(),
+            Roles {
+                admin: admin.clone(),
+                pauser: pauser.clone(),
+                keeper: keeper.clone(),
+                price_publisher: price_publisher.clone(),
+                risk: risk.clone(),
+            }
+        );
+
+        let asset = Address::generate(&env);
+        let config = valid_config(&env, &asset);
+        client.register_asset(&admin, &asset, &config);
+
+        assert_eq!(client.pending_param(&999), None);
+        assert_eq!(client.pending_unpause(&999), None);
+
+        let now = env.ledger().timestamp();
+        let expected_exec = now + ballast_common::timelock::TIMELOCK_DELAY_SECONDS;
+
+        let param_id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(650));
+        assert_eq!(
+            client.pending_param(&param_id),
+            Some(PendingParamView {
+                asset: asset.clone(),
+                change: ParamChange::HaircutBaseBps(650),
+                executes_at: expected_exec,
+            })
+        );
+
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        assert_eq!(
+            client.pending_unpause(&unpause_id),
+            Some(PendingUnpauseView {
+                scope: PauseScope::Draws,
+                executes_at: expected_exec,
+            })
+        );
+
+        // Cancelled items disappear from getters
+        let cancel_param_id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(750));
+        client.cancel_param(&admin, &cancel_param_id);
+        assert_eq!(client.pending_param(&cancel_param_id), None);
+
+        let cancel_unpause_id = client.queue_unpause(&admin, &PauseScope::Exits);
+        client.cancel_unpause(&admin, &cancel_unpause_id);
+        assert_eq!(client.pending_unpause(&cancel_unpause_id), None);
+
+        // Executed items disappear from getters
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&param_id);
+        assert_eq!(client.pending_param(&param_id), None);
+
+        client.execute_unpause(&unpause_id);
+        assert_eq!(client.pending_unpause(&unpause_id), None);
     }
 }
