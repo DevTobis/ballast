@@ -1674,4 +1674,43 @@ mod test {
             );
         });
     }
+
+    #[test]
+    fn configure_asset_rejects_invalid_thresholds() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let new_asset = Address::generate(&h.env);
+
+        for invalid in [
+            MarginThresholds {
+                warning_bps: 0,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+            MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+            MarginThresholds {
+                warning_bps: 9_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_500,
+            },
+            MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 10_001,
+            },
+        ] {
+            let res = h.credit_line.try_configure_asset(
+                &h.admin,
+                &new_asset,
+                &h.price_guard.address,
+                &h.token.address,
+                &500,
+                &invalid,
+            );
+            assert!(res.is_err(), "invalid thresholds {:?} must be rejected", invalid);
+        }
+    }
 }

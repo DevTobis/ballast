@@ -1250,4 +1250,44 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn configure_asset_rejects_invalid_thresholds() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let new_asset = Address::generate(&h.env);
+
+        for invalid in [
+            MarginThresholds {
+                warning_bps: 0,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+            MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+            MarginThresholds {
+                warning_bps: 9_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_500,
+            },
+            MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 10_001,
+            },
+        ] {
+            let res = h.vault.try_configure_asset(
+                &h.admin,
+                &new_asset,
+                &h.price_guard.address,
+                &h.credit_line.address,
+                &500,
+                &invalid,
+                &CustodyMode::Escrow,
+            );
+            assert!(res.is_err(), "invalid thresholds {:?} must be rejected", invalid);
+        }
+    }
 }

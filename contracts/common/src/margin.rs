@@ -12,6 +12,9 @@ pub enum MarginState {
     Liquidation,
 }
 
+/// Maximum allowed liquidation threshold in basis points (100% LTV = 10,000 bps).
+pub const MAX_LIQUIDATION_BPS: u32 = 10_000;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct MarginThresholds {
@@ -21,23 +24,25 @@ pub struct MarginThresholds {
 }
 
 impl MarginThresholds {
-    /// Asserts thresholds are strictly positive, ordered, and within 100% (10,000 bps).
-    /// Enforces: 0 < warning_bps <= margin_call_bps <= liquidation_bps <= 10_000.
+    /// Asserts thresholds are strictly positive, strictly increasing, and within
+    /// [`MAX_LIQUIDATION_BPS`] (10,000 bps / 100%).
+    ///
+    /// Enforces: `0 < warning_bps < margin_call_bps < liquidation_bps <= MAX_LIQUIDATION_BPS`.
     pub fn validate(&self) {
         assert!(
             self.warning_bps > 0,
             "margin: warning_bps must be greater than zero"
         );
         assert!(
-            self.warning_bps <= self.margin_call_bps,
-            "margin: warning_bps cannot exceed margin_call_bps"
+            self.warning_bps < self.margin_call_bps,
+            "margin: warning_bps must be strictly less than margin_call_bps"
         );
         assert!(
-            self.margin_call_bps <= self.liquidation_bps,
-            "margin: margin_call_bps cannot exceed liquidation_bps"
+            self.margin_call_bps < self.liquidation_bps,
+            "margin: margin_call_bps must be strictly less than liquidation_bps"
         );
         assert!(
-            self.liquidation_bps <= 10_000,
+            self.liquidation_bps <= MAX_LIQUIDATION_BPS,
             "margin: liquidation_bps cannot exceed 10000 bps (100%)"
         );
     }
@@ -88,23 +93,28 @@ mod test {
 
     #[test]
     fn validates_healthy_thresholds() {
-        thresholds().validate();
+        let valid_cases = [
+            thresholds(),
+            MarginThresholds {
+                warning_bps: 1,
+                margin_call_bps: 2,
+                liquidation_bps: 3,
+            },
+            MarginThresholds {
+                warning_bps: 1,
+                margin_call_bps: 5_000,
+                liquidation_bps: MAX_LIQUIDATION_BPS,
+            },
+            MarginThresholds {
+                warning_bps: 9_998,
+                margin_call_bps: 9_999,
+                liquidation_bps: MAX_LIQUIDATION_BPS,
+            },
+        ];
 
-        // Edge case: equal boundaries are allowed
-        MarginThresholds {
-            warning_bps: 8_000,
-            margin_call_bps: 8_000,
-            liquidation_bps: 8_000,
+        for t in &valid_cases {
+            t.validate();
         }
-        .validate();
-
-        // Maximum boundary 10_000 bps
-        MarginThresholds {
-            warning_bps: 1,
-            margin_call_bps: 5_000,
-            liquidation_bps: 10_000,
-        }
-        .validate();
     }
 
     #[test]
@@ -119,7 +129,18 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "margin: warning_bps cannot exceed margin_call_bps")]
+    #[should_panic(expected = "margin: warning_bps must be strictly less than margin_call_bps")]
+    fn rejects_equal_warning_and_margin_call() {
+        MarginThresholds {
+            warning_bps: 8_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        }
+        .validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: warning_bps must be strictly less than margin_call_bps")]
     fn rejects_warning_exceeding_margin_call() {
         MarginThresholds {
             warning_bps: 8_500,
@@ -130,7 +151,18 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "margin: margin_call_bps cannot exceed liquidation_bps")]
+    #[should_panic(expected = "margin: margin_call_bps must be strictly less than liquidation_bps")]
+    fn rejects_equal_margin_call_and_liquidation() {
+        MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 8_000,
+        }
+        .validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: margin_call_bps must be strictly less than liquidation_bps")]
     fn rejects_margin_call_exceeding_liquidation() {
         MarginThresholds {
             warning_bps: 7_000,
