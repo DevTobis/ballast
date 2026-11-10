@@ -2812,5 +2812,73 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
+    #[test]
+    fn median_of_three_fresh_sources_within_band_returns_middle_value() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let now = env.ledger().timestamp();
+
+        let src1 = Symbol::new(&env, "src1");
+        let src2 = Symbol::new(&env, "src2");
+        let src3 = Symbol::new(&env, "src3");
+
+        // Publish out of order: 1.004, 1.000, 1.002 (all within 50 bps of each other).
+        client.publish_source(&publisher, &asset, &src1, &10_040_000, &now);
+        client.publish_source(&publisher, &asset, &src2, &10_000_000, &now);
+        let guarded = client.publish_source(&publisher, &asset, &src3, &10_020_000, &now);
+
+        assert_eq!(guarded.status, PriceStatus::Ok);
+        assert_eq!(guarded.value, 10_020_000);
+        assert_eq!(guarded.sources.len(), 3);
+    }
+
+    #[test]
+    fn three_fresh_sources_with_out_of_band_outlier_is_degraded_and_keeps_last_good() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let now = env.ledger().timestamp();
+
+        let src1 = Symbol::new(&env, "src1");
+        let src2 = Symbol::new(&env, "src2");
+        let src3 = Symbol::new(&env, "src3");
+
+        // Establish an initial last_good at 1.001 (from 1.000 and 1.002).
+        client.publish_source(&publisher, &asset, &src1, &10_000_000, &now);
+        let initial_ok = client.publish_source(&publisher, &asset, &src2, &10_020_000, &now);
+        assert_eq!(initial_ok.status, PriceStatus::Ok);
+        assert_eq!(initial_ok.value, 10_010_000);
+
+        // A third source at 1.060 (~600 bps away) pushes max-min spread beyond band_bps = 50 ->
+        // within_band checks all fresh values, so status becomes Degraded and value stays at last_good.
+        let degraded = client.publish_source(&publisher, &asset, &src3, &10_600_000, &now);
+        assert_eq!(degraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded.value, 10_010_000);
+    }
+
+    #[test]
+    fn median_of_five_fresh_sources_returns_third_sorted_value() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let now = env.ledger().timestamp();
+
+        // Five distinct values in [1.0000, 1.0035] (35 bps spread <= 50 bps band), published unsorted.
+        // Sorted order: [10_000_000, 10_007_000, 10_019_000, 10_028_000, 10_035_000].
+        // Middle (3rd sorted, index 2) is 10_019_000.
+        let inputs = [
+            ("src1", 10_035_000i128),
+            ("src2", 10_007_000i128),
+            ("src3", 10_028_000i128),
+            ("src4", 10_000_000i128),
+            ("src5", 10_019_000i128),
+        ];
+
+        for (name, val) in inputs.iter() {
+            let sym = Symbol::new(&env, name);
+            client.publish_source(&publisher, &asset, &sym, val, &now);
+        }
+
+        let guarded = client.guarded_price(&asset);
+        assert_eq!(guarded.status, PriceStatus::Ok);
+        assert_eq!(guarded.value, 10_019_000);
+        assert_eq!(guarded.sources.len(), 5);
+    }
+
     mod invariants;
 }
