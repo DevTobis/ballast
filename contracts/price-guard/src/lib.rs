@@ -134,6 +134,9 @@ enum DataKey {
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
+    /// Optional per-source staleness override in seconds (`configure_source`), falling back to
+    /// `AssetGuardConfig::max_staleness_s` when unset.
+    SourceMaxStaleness(Address, Symbol),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -256,6 +259,21 @@ fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
     }
     let key = DataKey::Source(asset.clone(), name.clone());
     env.storage().persistent().remove(&key);
+    env.storage()
+        .instance()
+        .remove(&DataKey::SourceMaxStaleness(asset.clone(), name.clone()));
+}
+
+fn source_max_staleness(
+    env: &Env,
+    asset: &Address,
+    name: &Symbol,
+    default_max_staleness_s: u64,
+) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::SourceMaxStaleness(asset.clone(), name.clone()))
+        .unwrap_or(default_max_staleness_s)
 }
 
 fn read_all_sources(env: &Env, asset: &Address) -> Vec<PriceSource> {
@@ -403,7 +421,9 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let mut fresh_values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
     let mut fresh_sources: soroban_sdk::Vec<PriceSource> = soroban_sdk::Vec::new(&env);
     for source in all_sources.iter() {
-        if is_fresh(&env, &source, config.max_staleness_s) {
+        let max_staleness_s =
+            source_max_staleness(&env, &asset, &source.name, config.max_staleness_s);
+        if is_fresh(&env, &source, max_staleness_s) {
             fresh_values.push_back(source.value);
             fresh_sources.push_back(source.clone());
         }
@@ -787,6 +807,40 @@ impl PriceGuard {
             (Symbol::new(&env, "configure_signature_requirement"),),
             required,
         );
+    }
+
+    /// Admin-only. Sets a per-source staleness window override in seconds for `(asset, name)`.
+    /// When unset, `evaluate` falls back to `AssetGuardConfig::max_staleness_s`.
+    pub fn configure_source(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        name: Symbol,
+        max_staleness_s: u64,
+    ) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+        assert!(
+            max_staleness_s > 0,
+            "price-guard: max_staleness_s must be positive"
+        );
+        env.storage().instance().set(
+            &DataKey::SourceMaxStaleness(asset.clone(), name.clone()),
+            &max_staleness_s,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "configure_source"), asset),
+            (name, max_staleness_s),
+        );
+    }
+
+    /// Read-only inspection of a per-source staleness window override, if configured.
+    pub fn source_staleness(env: Env, asset: Address, name: Symbol) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SourceMaxStaleness(asset, name))
     }
 
     /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
@@ -2810,6 +2864,56 @@ mod test {
         // Real admin succeeds.
         env.mock_all_auths();
         client.remove_source(&admin, &asset, &feed_name);
+    }
+
+    #[test]
+    fn per_source_staleness_window_allows_daily_nav_with_hourly_redstone_feed() {
+        // Default asset staleness is 24h (86_400s), while RedStone ("redston") is overridden to 1h (3_600s).
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 86_400);
+        let redstone = feed(&env);
+        let issuer = Symbol::new(&env, ISSUER_SOURCE);
+
+        assert_eq!(client.source_staleness(&asset, &redstone), None);
+        assert_eq!(client.source_staleness(&asset, &issuer), None);
+
+        client.configure_source(&admin, &asset, &redstone, &3_600);
+        assert_eq!(client.source_staleness(&asset, &redstone), Some(3_600));
+
+        // Optional explicit 24h override on issuer as well (matches asset default)
+        client.configure_source(&admin, &asset, &issuer, &86_400);
+        assert_eq!(client.source_staleness(&asset, &issuer), Some(86_400));
+
+        let t0 = env.ledger().timestamp();
+        publish_signed_nav(&env, &client, &publisher, &asset, SCALE, t0);
+        client.publish_source(&publisher, &asset, &redstone, &SCALE, &t0);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        // At t0 + 30m (1,800s): both NAV (<= 86,400s) and RedStone (<= 3,600s) are fresh -> Ok
+        env.ledger().with_mut(|l| l.timestamp = t0 + 1_800);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        // At t0 + 1h + 1s (3,601s): NAV is still fresh (3,601 <= 86,400), but RedStone is stale
+        // (3,601 > 3,600) -> only 1 fresh source -> Degraded!
+        env.ledger().with_mut(|l| l.timestamp = t0 + 3_601);
+        let degraded = client.guarded_price(&asset);
+        assert_eq!(degraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded.sources.len(), 1);
+        assert_eq!(degraded.sources.get(0).unwrap().name, issuer);
+
+        // Refresh RedStone at t0 + 3,601s without re-publishing NAV: NAV is 3,601s old (fresh under 24h)
+        // and RedStone is 0s old (fresh under 1h) -> back to Ok!
+        client.publish_source(&publisher, &asset, &redstone, &SCALE, &(t0 + 3_601));
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+
+        // At t0 + 24h + 1s (86,401s): even if RedStone is refreshed at that instant, the 24h NAV
+        // has now expired -> Degraded!
+        let t_late = t0 + 86_401;
+        env.ledger().with_mut(|l| l.timestamp = t_late);
+        client.publish_source(&publisher, &asset, &redstone, &SCALE, &t_late);
+        let late_price = client.guarded_price(&asset);
+        assert_eq!(late_price.status, PriceStatus::Degraded);
+        assert_eq!(late_price.sources.len(), 1);
+        assert_eq!(late_price.sources.get(0).unwrap().name, redstone);
     }
 
     mod invariants;
