@@ -201,11 +201,25 @@ fn require_nav_signature(env: &Env) -> bool {
         .unwrap_or(true)
 }
 
+// Per-asset state (`Config`, `LastGood`, `RollingReference`, `RollingReferenceUpdated`, `Halted`,
+// `PendingHaltValue`, `IssuerPubKey`, `NavRecord`, `LastStatus`, and `(Symbol("src_names"), asset)`)
+// lives in persistent storage, one entry per key, so the contract instance entry loaded on every
+// invocation stays small and O(1) in the number of registered assets.
 fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
-    env.storage()
-        .instance()
-        .get(&DataKey::Config(asset.clone()))
-        .expect("price-guard: asset not configured")
+    let key = DataKey::Config(asset.clone());
+    let config: AssetGuardConfig = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .expect("price-guard: asset not configured");
+    ttl::extend_persistent(env, &key);
+    config
+}
+
+fn write_config(env: &Env, asset: &Address, config: &AssetGuardConfig) {
+    let key = DataKey::Config(asset.clone());
+    env.storage().persistent().set(&key, config);
+    ttl::extend_persistent(env, &key);
 }
 
 fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed_at: u64) {
@@ -229,20 +243,21 @@ fn track_source_name(env: &Env, asset: &Address, name: &Symbol) {
     let names_key = (Symbol::new(env, "src_names"), asset.clone());
     let mut names: Vec<Symbol> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&names_key)
         .unwrap_or_else(|| Vec::new(env));
     if !names.contains(name) {
         names.push_back(name.clone());
-        env.storage().instance().set(&names_key, &names);
+        env.storage().persistent().set(&names_key, &names);
     }
+    ttl::extend_persistent(env, &names_key);
 }
 
 fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
     let names_key = (Symbol::new(env, "src_names"), asset.clone());
     let names: Vec<Symbol> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&names_key)
         .unwrap_or_else(|| Vec::new(env));
     if let Some(idx) = names.first_index_of(name) {
@@ -252,7 +267,8 @@ fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
                 new_names.push_back(n);
             }
         }
-        env.storage().instance().set(&names_key, &new_names);
+        env.storage().persistent().set(&names_key, &new_names);
+        ttl::extend_persistent(env, &names_key);
     }
     let key = DataKey::Source(asset.clone(), name.clone());
     env.storage().persistent().remove(&key);
@@ -260,18 +276,22 @@ fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
 
 fn read_all_sources(env: &Env, asset: &Address) -> Vec<PriceSource> {
     let names_key = (Symbol::new(env, "src_names"), asset.clone());
-    let names: Vec<Symbol> = env
-        .storage()
-        .instance()
-        .get(&names_key)
-        .unwrap_or_else(|| Vec::new(env));
+    let names: Vec<Symbol> = match env.storage().persistent().get(&names_key) {
+        Some(n) => {
+            ttl::extend_persistent(env, &names_key);
+            n
+        }
+        None => Vec::new(env),
+    };
     let mut out = Vec::new(env);
     for name in names.iter() {
+        let source_key = DataKey::Source(asset.clone(), name.clone());
         if let Some(source) = env
             .storage()
             .persistent()
-            .get::<_, PriceSource>(&DataKey::Source(asset.clone(), name.clone()))
+            .get::<_, PriceSource>(&source_key)
         {
+            ttl::extend_persistent(env, &source_key);
             out.push_back(source);
         }
     }
@@ -370,18 +390,21 @@ fn within_band(values: &[i128], band_bps: u32) -> bool {
 /// previous one (an asset with no recorded status counts as coming from `Degraded`).
 fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, value: i128) {
     let key = DataKey::LastStatus(asset.clone());
-    let prev: Option<PriceStatus> = env.storage().instance().get(&key);
+    let prev: Option<PriceStatus> = env.storage().persistent().get(&key);
     let changed = match &prev {
         Some(from) => from != &to,
         None => true,
     };
     if changed {
         let from = prev.unwrap_or(PriceStatus::Degraded);
-        env.storage().instance().set(&key, &to);
+        env.storage().persistent().set(&key, &to);
+        ttl::extend_persistent(env, &key);
         env.events().publish(
             (Symbol::new(env, "status_changed"), asset.clone()),
             (from, to, value),
         );
+    } else if prev.is_some() {
+        ttl::extend_persistent(env, &key);
     }
 }
 
@@ -409,19 +432,27 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         }
     }
 
-    let last_good: Option<i128> = env
-        .storage()
-        .instance()
-        .get(&DataKey::LastGood(asset.clone()));
-    let already_halted: bool = env
-        .storage()
-        .instance()
-        .get(&DataKey::Halted(asset.clone()))
-        .unwrap_or(false);
+    let last_good_key = DataKey::LastGood(asset.clone());
+    let last_good: Option<i128> = env.storage().persistent().get(&last_good_key);
+    if last_good.is_some() {
+        ttl::extend_persistent(env, &last_good_key);
+    }
+    let halted_key = DataKey::Halted(asset.clone());
+    let already_halted: bool = match env.storage().persistent().get(&halted_key) {
+        Some(h) => {
+            ttl::extend_persistent(env, &halted_key);
+            h
+        }
+        None => false,
+    };
 
     let now = env.ledger().timestamp();
 
     if already_halted {
+        let pending_key = DataKey::PendingHaltValue(asset.clone());
+        if env.storage().persistent().has(&pending_key) {
+            ttl::extend_persistent(env, &pending_key);
+        }
         let val = last_good.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Halted, val);
         return GuardedPrice {
@@ -475,12 +506,11 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         if last > 0 {
             let move_bps = (((median_value - last).abs()) * 10_000) / last;
             if move_bps > config.daily_move_band_bps as i128 {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Halted(asset.clone()), &true);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                let pending_key = DataKey::PendingHaltValue(asset.clone());
+                env.storage().persistent().set(&halted_key, &true);
+                ttl::extend_persistent(env, &halted_key);
+                env.storage().persistent().set(&pending_key, &median_value);
+                ttl::extend_persistent(env, &pending_key);
                 env.events().publish(
                     (Symbol::new(env, "halt_latched"), asset.clone()),
                     (last, median_value),
@@ -501,25 +531,26 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     // each individual step. The reference is refreshed at most once per `window_seconds`, so a
     // publisher ramping the price a little on every publish eventually trips the window band even
     // though every single step passed the daily band.
-    let rolling_ref: Option<i128> = env
-        .storage()
-        .instance()
-        .get(&DataKey::RollingReference(asset.clone()));
-    let rolling_ref_ts: Option<u64> = env
-        .storage()
-        .instance()
-        .get(&DataKey::RollingReferenceUpdated(asset.clone()));
+    let rolling_ref_key = DataKey::RollingReference(asset.clone());
+    let rolling_ref: Option<i128> = env.storage().persistent().get(&rolling_ref_key);
+    if rolling_ref.is_some() {
+        ttl::extend_persistent(env, &rolling_ref_key);
+    }
+    let rolling_ref_ts_key = DataKey::RollingReferenceUpdated(asset.clone());
+    let rolling_ref_ts: Option<u64> = env.storage().persistent().get(&rolling_ref_ts_key);
+    if rolling_ref_ts.is_some() {
+        ttl::extend_persistent(env, &rolling_ref_ts_key);
+    }
 
     if let Some(reference) = rolling_ref {
         if reference > 0 {
             let drift_bps = (((median_value - reference).abs()) * 10_000) / reference;
             if drift_bps > config.window_move_band_bps as i128 {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Halted(asset.clone()), &true);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                let pending_key = DataKey::PendingHaltValue(asset.clone());
+                env.storage().persistent().set(&halted_key, &true);
+                ttl::extend_persistent(env, &halted_key);
+                env.storage().persistent().set(&pending_key, &median_value);
+                ttl::extend_persistent(env, &pending_key);
                 // Report the last good value, like every other Halted path, not the older reference.
                 let held = last_good.unwrap_or(reference);
                 env.events().publish(
@@ -541,17 +572,14 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     // Refresh the rolling reference only once per window. Leaving it in place between refreshes is
     // what makes a slow ramp accumulate against a fixed baseline instead of chasing the price.
     if rolling_ref_ts.map_or(true, |ts| now.saturating_sub(ts) >= config.window_seconds) {
-        env.storage()
-            .instance()
-            .set(&DataKey::RollingReference(asset.clone()), &median_value);
-        env.storage()
-            .instance()
-            .set(&DataKey::RollingReferenceUpdated(asset.clone()), &now);
+        env.storage().persistent().set(&rolling_ref_key, &median_value);
+        ttl::extend_persistent(env, &rolling_ref_key);
+        env.storage().persistent().set(&rolling_ref_ts_key, &now);
+        ttl::extend_persistent(env, &rolling_ref_ts_key);
     }
 
-    env.storage()
-        .instance()
-        .set(&DataKey::LastGood(asset.clone()), &median_value);
+    env.storage().persistent().set(&last_good_key, &median_value);
+    ttl::extend_persistent(env, &last_good_key);
 
     check_and_emit_status_change(env, &asset, PriceStatus::Ok, median_value);
 
@@ -689,7 +717,7 @@ impl PriceGuard {
 
         let existing: Option<AssetGuardConfig> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Config(asset.clone()));
         if let Some(old) = existing {
             let is_loosening = band_bps > old.band_bps
@@ -703,8 +731,9 @@ impl PriceGuard {
             );
         }
 
-        env.storage().instance().set(
-            &DataKey::Config(asset.clone()),
+        write_config(
+            &env,
+            &asset,
             &AssetGuardConfig {
                 band_bps,
                 daily_move_band_bps,
@@ -713,10 +742,11 @@ impl PriceGuard {
                 max_staleness_s,
             },
         );
-        env.storage().instance().set(
-            &DataKey::LastStatus(asset.clone()),
-            &PriceStatus::Degraded,
-        );
+        let status_key = DataKey::LastStatus(asset.clone());
+        env.storage()
+            .persistent()
+            .set(&status_key, &PriceStatus::Degraded);
+        ttl::extend_persistent(&env, &status_key);
         env.events().publish(
             (Symbol::new(&env, "configure_asset"), asset),
             (
@@ -741,19 +771,16 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
-        let existing: Option<BytesN<32>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::IssuerPubKey(asset.clone()));
+        let key = DataKey::IssuerPubKey(asset.clone());
+        let existing: Option<BytesN<32>> = env.storage().persistent().get(&key);
         if let Some(old) = existing {
             assert!(
                 old == issuer_pubkey,
                 "price-guard: rotating issuer key must be queued via queue_config"
             );
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
+        env.storage().persistent().set(&key, &issuer_pubkey);
+        ttl::extend_persistent(&env, &key);
         env.events().publish(
             (Symbol::new(&env, "configure_issuer_key"), asset),
             issuer_pubkey,
@@ -865,59 +892,29 @@ impl PriceGuard {
 
         match pending.change.clone() {
             ConfigChange::BandBps(asset, val) => {
-                let mut config: AssetGuardConfig = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
-                    .expect("price-guard: asset not configured");
+                let mut config = read_config(&env, &asset);
                 config.band_bps = val;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                write_config(&env, &asset, &config);
             }
             ConfigChange::DailyMoveBandBps(asset, val) => {
-                let mut config: AssetGuardConfig = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
-                    .expect("price-guard: asset not configured");
+                let mut config = read_config(&env, &asset);
                 config.daily_move_band_bps = val;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                write_config(&env, &asset, &config);
             }
             ConfigChange::WindowSeconds(asset, val) => {
-                let mut config: AssetGuardConfig = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
-                    .expect("price-guard: asset not configured");
+                let mut config = read_config(&env, &asset);
                 config.window_seconds = val;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                write_config(&env, &asset, &config);
             }
             ConfigChange::WindowMoveBandBps(asset, val) => {
-                let mut config: AssetGuardConfig = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
-                    .expect("price-guard: asset not configured");
+                let mut config = read_config(&env, &asset);
                 config.window_move_band_bps = val;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                write_config(&env, &asset, &config);
             }
             ConfigChange::MaxStalenessSeconds(asset, val) => {
-                let mut config: AssetGuardConfig = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
-                    .expect("price-guard: asset not configured");
+                let mut config = read_config(&env, &asset);
                 config.max_staleness_s = val;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                write_config(&env, &asset, &config);
             }
             ConfigChange::Asset(asset, band, daily, win_sec, win_move, staleness) => {
                 let config = AssetGuardConfig {
@@ -927,14 +924,12 @@ impl PriceGuard {
                     window_move_band_bps: win_move,
                     max_staleness_s: staleness,
                 };
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                write_config(&env, &asset, &config);
             }
             ConfigChange::IssuerPubKey(asset, key_val) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::IssuerPubKey(asset), &key_val);
+                let pubkey_key = DataKey::IssuerPubKey(asset);
+                env.storage().persistent().set(&pubkey_key, &key_val);
+                ttl::extend_persistent(&env, &pubkey_key);
             }
             ConfigChange::RequireNavSignature(val) => {
                 env.storage()
@@ -961,7 +956,12 @@ impl PriceGuard {
     /// Read-only inspection of an asset guard config.
     pub fn asset_config(env: Env, asset: Address) -> Option<AssetGuardConfig> {
         ttl::extend_instance(&env);
-        env.storage().instance().get(&DataKey::Config(asset))
+        let key = DataKey::Config(asset);
+        let res = env.storage().persistent().get(&key);
+        if res.is_some() {
+            ttl::extend_persistent(&env, &key);
+        }
+        res
     }
 
     /// Read-only inspection of whether NAV signatures are required.
@@ -976,7 +976,12 @@ impl PriceGuard {
     /// Read-only inspection of an asset's issuer public key.
     pub fn issuer_pubkey(env: Env, asset: Address) -> Option<BytesN<32>> {
         ttl::extend_instance(&env);
-        env.storage().instance().get(&DataKey::IssuerPubKey(asset))
+        let key = DataKey::IssuerPubKey(asset);
+        let res = env.storage().persistent().get(&key);
+        if res.is_some() {
+            ttl::extend_persistent(&env, &key);
+        }
+        res
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
@@ -998,21 +1003,24 @@ impl PriceGuard {
         require_sane_reading(&env, value, ts);
 
         if require_nav_signature(&env) {
+            let pubkey_key = DataKey::IssuerPubKey(asset.clone());
             let issuer_pubkey: BytesN<32> = env
                 .storage()
-                .instance()
-                .get(&DataKey::IssuerPubKey(asset.clone()))
+                .persistent()
+                .get(&pubkey_key)
                 .expect("price-guard: no issuer public key configured for asset (call configure_issuer_key)");
+            ttl::extend_persistent(&env, &pubkey_key);
             let message = build_nav_message(&env, &asset_code, ts, value);
             // Panics (traps the whole invocation) if `sig` doesn't verify — see
             // `soroban_sdk::crypto::Crypto::ed25519_verify`'s doc comment.
             env.crypto().ed25519_verify(&issuer_pubkey, &message, &sig);
         }
 
-        env.storage().instance().set(
-            &DataKey::NavRecord(asset.clone()),
-            &NavRecord { value, ts, sig },
-        );
+        let nav_key = DataKey::NavRecord(asset.clone());
+        env.storage()
+            .persistent()
+            .set(&nav_key, &NavRecord { value, ts, sig });
+        ttl::extend_persistent(&env, &nav_key);
 
         let name = Symbol::new(&env, ISSUER_SOURCE);
         track_source_name(&env, &asset, &name);
@@ -1086,36 +1094,29 @@ impl PriceGuard {
         access::require_risk(&env);
         ttl::extend_instance(&env);
 
+        let pending_key = DataKey::PendingHaltValue(asset.clone());
+        let last_good_key = DataKey::LastGood(asset.clone());
         let mut new_last_good = 0i128;
-        if let Some(pending) = env
-            .storage()
-            .instance()
-            .get::<_, i128>(&DataKey::PendingHaltValue(asset.clone()))
-        {
-            env.storage()
-                .instance()
-                .set(&DataKey::LastGood(asset.clone()), &pending);
+        if let Some(pending) = env.storage().persistent().get::<_, i128>(&pending_key) {
+            env.storage().persistent().set(&last_good_key, &pending);
+            ttl::extend_persistent(&env, &last_good_key);
             new_last_good = pending;
+            let rolling_ref_key = DataKey::RollingReference(asset.clone());
+            env.storage().persistent().set(&rolling_ref_key, &pending);
+            ttl::extend_persistent(&env, &rolling_ref_key);
+            let rolling_ref_ts_key = DataKey::RollingReferenceUpdated(asset.clone());
             env.storage()
-                .instance()
-                .set(&DataKey::RollingReference(asset.clone()), &pending);
-            env.storage()
-                .instance()
-                .set(
-                    &DataKey::RollingReferenceUpdated(asset.clone()),
-                    &env.ledger().timestamp(),
-                );
-            env.storage()
-                .instance()
-                .remove(&DataKey::PendingHaltValue(asset.clone()));
-        } else if let Some(last) = env
-            .storage()
-            .instance()
-            .get::<_, i128>(&DataKey::LastGood(asset.clone()))
-        {
+                .persistent()
+                .set(&rolling_ref_ts_key, &env.ledger().timestamp());
+            ttl::extend_persistent(&env, &rolling_ref_ts_key);
+            env.storage().persistent().remove(&pending_key);
+        } else if let Some(last) = env.storage().persistent().get::<_, i128>(&last_good_key) {
+            ttl::extend_persistent(&env, &last_good_key);
             new_last_good = last;
         }
-        env.storage().instance().remove(&DataKey::Halted(asset.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Halted(asset.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "halt_cleared"), asset.clone()),
@@ -2614,11 +2615,73 @@ mod test {
 
         // State persists: the last good price and config established before upgrade are still in storage
         env.as_contract(&client.address, || {
-            let last_good: Option<i128> = env.storage().instance().get(&DataKey::LastGood(asset.clone()));
+            let last_good: Option<i128> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastGood(asset.clone()));
             assert_eq!(last_good, Some(SCALE));
             let config = read_config(&env, &asset);
             assert_eq!(config.band_bps, 50);
             assert_eq!(config.daily_move_band_bps, 10_000);
+        });
+    }
+
+    #[test]
+    fn per_asset_state_lives_in_persistent_storage_and_keeps_instance_entry_bounded_across_20_assets() {
+        use soroban_sdk::testutils::storage::Instance as _;
+
+        let (env, client, admin, publisher, _risk, first_asset) = setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        let feed_name = feed(&env);
+
+        client.publish_nav(&publisher, &first_asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &first_asset, &feed_name, &SCALE, &now);
+        assert_eq!(client.guarded_price(&first_asset).status, PriceStatus::Ok);
+
+        let instance_keys_after_one_asset =
+            env.as_contract(&client.address, || env.storage().instance().all().len());
+
+        // Register and publish NAV + feed for 20 additional assets.
+        let mut assets = std::vec::Vec::with_capacity(20);
+        for _ in 0..20 {
+            let asset = Address::generate(&env);
+            client.configure_asset(
+                &admin,
+                &asset,
+                &50,
+                &10_000,
+                &DEFAULT_WINDOW_SECONDS,
+                &DEFAULT_WINDOW_MOVE_BAND_BPS,
+                &3600,
+            );
+            let (pubkey, _) = test_issuer_keypair(&env);
+            client.configure_issuer_key(&admin, &asset, &pubkey);
+            client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+            client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+            assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+            assets.push(asset);
+        }
+
+        env.as_contract(&client.address, || {
+            // Contract instance storage entry count does not grow with the number of registered assets.
+            assert_eq!(
+                env.storage().instance().all().len(),
+                instance_keys_after_one_asset
+            );
+
+            for asset in &assets {
+                let cfg_key = DataKey::Config(asset.clone());
+                let last_good_key = DataKey::LastGood(asset.clone());
+                let names_key = (Symbol::new(&env, "src_names"), asset.clone());
+                assert!(env.storage().persistent().has(&cfg_key));
+                assert!(!env.storage().instance().has(&cfg_key));
+                assert!(env.storage().persistent().has(&last_good_key));
+                assert!(!env.storage().instance().has(&last_good_key));
+                assert!(env.storage().persistent().has(&names_key));
+                assert!(!env.storage().instance().has(&names_key));
+            }
         });
     }
 

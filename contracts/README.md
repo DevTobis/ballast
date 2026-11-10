@@ -186,6 +186,12 @@ current admin, then `accept_admin` signed by the proposed successor.
      execute_upgrade --id "$UPGRADE_ID"
    ```
 
+### Storage Layout Migration (`PriceGuard` Per-Asset Persistent Storage)
+
+To prevent the single contract instance entry from approaching Soroban's ledger entry size limit (~64 KiB) as the number of registered assets grows, all per-asset `PriceGuard` keys (`Config(asset)`, `LastGood(asset)`, `RollingReference(asset)`, `RollingReferenceUpdated(asset)`, `Halted(asset)`, `PendingHaltValue(asset)`, `IssuerPubKey(asset)`, `NavRecord(asset)`, `LastStatus(asset)`, and `(Symbol("src_names"), asset)`) are stored in **persistent** storage (`env.storage().persistent()`) with per-entry TTL extension (`ballast_common::ttl::extend_persistent`) on read and write, matching `DataKey::Source(asset, name)` and `Registry`'s per-asset storage layout. Only true contract-wide singletons (`Roles`, `TimelockDataKey::NextId`, and `RequireNavSignature`) remain in `.instance()` storage.
+
+> **Upgrade Note:** Upgrading an existing `PriceGuard` deployment that wrote per-asset state under the legacy `.instance()` layout requires re-running `configure_asset` and `configure_issuer_key` (e.g., via `scripts/deploy.sh` / `scripts/configure-nav-key.sh` or `scripts/deploy-mainnet-prices.sh`) after `execute_upgrade` so per-asset entries are populated in persistent storage, followed by publishing fresh NAV and secondary feed readings.
+
 ### Freeze-after-audit decision
 
 The upgrade entry points are essential during pre-audit development, testnet deployments, and protocol parameter stabilization to safely fix bugs and update storage layouts in place without state loss.
