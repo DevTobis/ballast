@@ -2812,5 +2812,96 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
+    fn setup_without_signature_override(
+        band_bps: u32,
+        daily_move_band_bps: u32,
+        max_staleness_s: u64,
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        let asset = Address::generate(&env);
+        client.configure_asset(
+            &admin,
+            &asset,
+            &band_bps,
+            &daily_move_band_bps,
+            &DEFAULT_WINDOW_SECONDS,
+            &DEFAULT_WINDOW_MOVE_BAND_BPS,
+            &max_staleness_s,
+        );
+
+        (env, client, admin, price_publisher, risk, asset)
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: already initialized")]
+    fn initialize_cannot_run_more_than_once() {
+        let (env, client, _admin, _publisher, _risk, _asset) =
+            setup_without_signature_override(50, 100, 3_600);
+
+        let attacker_admin = Address::generate(&env);
+        let attacker_pauser = Address::generate(&env);
+        let attacker_keeper = Address::generate(&env);
+        let attacker_publisher = Address::generate(&env);
+        let attacker_risk = Address::generate(&env);
+
+        client.initialize(
+            &attacker_admin,
+            &attacker_pauser,
+            &attacker_keeper,
+            &attacker_publisher,
+            &attacker_risk,
+        );
+    }
+
+    #[test]
+    fn signature_requirement_defaults_to_true_until_explicitly_disabled() {
+        let (env, client, admin, publisher, _risk, asset) =
+            setup_without_signature_override(50, 100, 3_600);
+        let code = asset_code(&env);
+        let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Default when unset must be `true`.
+        assert!(client.require_nav_signature());
+
+        // 1. Before any issuer key is configured, publish_nav with a zero signature fails.
+        let without_key = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &zero_sig);
+        }));
+        assert!(
+            without_key.is_err(),
+            "publish_nav must fail by default when no issuer key is configured"
+        );
+
+        // 2. Even after configuring an issuer key, a zero signature fails verification.
+        let (pubkey, _signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        let with_zero_sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &zero_sig);
+        }));
+        assert!(
+            with_zero_sig.is_err(),
+            "publish_nav must reject an invalid signature when require_nav_signature defaults to true"
+        );
+
+        // 3. Disabling signature requirement makes the same zero-signature call succeed.
+        client.configure_signature_requirement(&admin, &false);
+        assert!(!client.require_nav_signature());
+        let res = client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &zero_sig);
+        assert_eq!(res.sources.len(), 1);
+    }
+
     mod invariants;
 }
