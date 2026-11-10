@@ -1431,4 +1431,66 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_rejects_unknown_id() {
+        let (_env, client, _admin, _risk, _asset) = setup();
+        client.execute_param(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_cannot_replay_an_already_executed_id() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(650));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        // First execution succeeds and removes PendingParam(id).
+        client.execute_param(&id);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 650);
+
+        // Second execution must panic with "registry: no such pending change".
+        client.execute_param(&id);
+    }
+
+    #[test]
+    fn replaying_execute_param_preserves_state_from_first_execution() {
+        let (env, client, admin, risk, asset) = setup();
+
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(400));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 400);
+
+        // Emergency tightening raises base haircut to 600; replaying `id` must fail and must NOT
+        // overwrite haircut_base_bps back to 400.
+        client.raise_haircut_now(&risk, &asset, &200);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 600);
+
+        let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_param(&id);
+        }));
+        assert!(replay.is_err());
+        assert_eq!(client.asset(&asset).haircut_base_bps, 600);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn execute_param_rejects_an_id_from_queue_unpause() {
+        let (env, client, admin, _risk, _asset) = setup();
+
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        // PendingUnpause(id) and PendingParam(id) live under distinct DataKey variants.
+        client.execute_param(&unpause_id);
+    }
 }
