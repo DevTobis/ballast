@@ -43,7 +43,8 @@
 //! exposes its own `pause` and timelocked unpause (#32), so its `Repos` gate works; `exit-desk`
 //! still has no writer for its flag (see #30).
 
-use soroban_sdk::{contracttype, Env};
+use crate::error::Error;
+use soroban_sdk::{contracttype, panic_with_error, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +90,7 @@ pub fn is_paused(env: &Env, scope: &PauseScope) -> bool {
 /// the full scope map and the entry points that are deliberately left ungated.
 pub fn require_not_paused(env: &Env, scope: &PauseScope) {
     if is_paused(env, scope) {
-        panic!("ballast-common: paused");
+        panic_with_error!(env, Error::Paused);
     }
 }
 
@@ -264,6 +265,10 @@ mod test {
         assert!(
             all.is_err(),
             "require_not_paused must panic while All is paused"
+        );
+        assert_eq!(
+            client.try_gate(&PauseScope::Pledges),
+            Err(Ok(soroban_sdk::Error::from_contract_error(Error::Paused as u32)))
         );
     }
 }

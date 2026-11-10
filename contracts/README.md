@@ -194,3 +194,19 @@ However, once Ballast undergoes external security audit and reaches production m
 - After completing the formal security audit and deployment verification on mainnet, upgrade authority will be permanently renounced or burned (e.g. by setting the contract admin to an unspendable burn address or locking the upgrade mechanism).
 - Freezing post-audit guarantees immutability, ensuring neither compromised admin keys nor rogue governance actions can replace contract code or drain user collateral, fulfilling Ballast's core security commitments.
 
+## Shared Contract Error Codes (`ballast_common::Error`)
+
+Shared helpers in `ballast-common` emit typed `#[contracterror]` codes via `panic_with_error!(env, Error::...)` so off-chain services (`services/margin-monitor`, `services/indexer`) and `try_*` test clients can distinguish failure modes on stripped mainnet builds without relying on panic strings:
+
+| Code (`u32`) | Variant | Meaning |
+|---:|---|---|
+| `1` | `Error::NotInitialized` | Contract roles or state have not been initialized yet (`initialize` has not been called). |
+| `2` | `Error::AlreadyInitialized` | Contract has already been initialized (`initialize` called more than once). |
+| `3` | `Error::Paused` | The requested operation is blocked because its `PauseScope` (or `PauseScope::All`) is paused. |
+| `4` | `Error::TimelockNotElapsed` | A queued timelocked change or unpause was invoked before its `executes_at` timestamp. |
+| `5` | `Error::NotFound` | The requested asset, position, trade, or pending timelock entry does not exist. |
+| `6` | `Error::InvalidInput` | An input argument failed validation (e.g., non-positive amount, out-of-range bps, or invalid status). |
+| `7` | `Error::Unauthorized` | The caller is not authorized to perform this action (e.g., neither admin nor keeper). |
+| `8` | `Error::Overflow` | Arithmetic overflow occurred while computing interest, collateral value, or LTV. |
+
+
