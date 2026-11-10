@@ -1431,4 +1431,103 @@ mod test {
             assert_eq!(loaded.status, config.status);
         });
     }
+
+    #[test]
+    fn execute_param_accepts_10_000_bps_and_rolls_back_10_001_bps_across_all_bps_fields() {
+        let (env, client, admin, _risk, _default_asset) = setup();
+
+        type CaseFn = (
+            fn(u32) -> ParamChange,
+            fn(&AssetConfig) -> u32,
+        );
+        let cases: [CaseFn; 4] = [
+            (ParamChange::HaircutBaseBps, |c| c.haircut_base_bps),
+            (ParamChange::HaircutFxBps, |c| c.haircut_fx_bps),
+            (ParamChange::PriceBandBps, |c| c.price_band_bps),
+            (ParamChange::DailyMoveBandBps, |c| c.daily_move_band_bps),
+        ];
+
+        for (make_change, read_field) in cases {
+            // Register a clean asset with 0 initial haircuts so both HaircutBaseBps(10_000) and
+            // HaircutFxBps(10_000) can reach 10_000 without exceeding the combined 10_000 cap.
+            let asset = Address::generate(&env);
+            let mut initial = valid_config(&env, &asset);
+            initial.haircut_base_bps = 0;
+            initial.haircut_fx_bps = 0;
+            client.register_asset(&admin, &asset, &initial);
+
+            // 1. 10_000 bps is accepted after 48h + 1.
+            let ok_id = client.queue_param(&admin, &asset, &make_change(10_000));
+            env.ledger().with_mut(|l| {
+                l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            });
+            client.execute_param(&ok_id);
+            assert_eq!(read_field(&client.asset(&asset)), 10_000);
+            env.as_contract(&client.address, || {
+                assert!(!env.storage().persistent().has(&DataKey::PendingParam(ok_id)));
+            });
+
+            // 2. 10_001 bps panics on execute, leaving the stored config at 10_000 and the
+            // PendingParam entry intact in persistent storage.
+            let bad_id = client.queue_param(&admin, &asset, &make_change(10_001));
+            env.ledger().with_mut(|l| {
+                l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            });
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.execute_param(&bad_id);
+            }));
+            assert!(res.is_err(), "execute_param(10_001) must panic");
+            assert_eq!(read_field(&client.asset(&asset)), 10_000);
+            env.as_contract(&client.address, || {
+                assert!(
+                    env.storage().persistent().has(&DataKey::PendingParam(bad_id)),
+                    "PendingParam entry must remain after a failed execute_param"
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: base haircut cannot exceed 100%")]
+    fn execute_param_rejects_haircut_base_bps_10_001() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(10_001));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: FX haircut cannot exceed 100%")]
+    fn execute_param_rejects_haircut_fx_bps_10_001() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(10_001));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: price band must be in (0, 100%]")]
+    fn execute_param_rejects_price_band_bps_10_001() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::PriceBandBps(10_001));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: daily move band must be in (0, 100%]")]
+    fn execute_param_rejects_daily_move_band_bps_10_001() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::DailyMoveBandBps(10_001));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+    }
 }
