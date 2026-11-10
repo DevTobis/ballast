@@ -2812,5 +2812,45 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
+    fn run_sortbuf(env: &Env, slice: &[i128]) -> std::vec::Vec<i128> {
+        let mut v = Vec::new(env);
+        for &item in slice {
+            v.push_back(item);
+        }
+        let mut buf = alloc_free_sort::SortBuf::from(&v);
+        buf.sort();
+        (0..buf.len()).map(|i| buf.get(i)).collect()
+    }
+
+    #[test]
+    fn sortbuf_sorts_unsorted_already_sorted_duplicates_negatives_and_eight_elements() {
+        let env = Env::default();
+
+        // 1. Unsorted [3, 1, 2] -> [1, 2, 3].
+        assert_eq!(run_sortbuf(&env, &[3, 1, 2]), std::vec![1, 2, 3]);
+
+        // 2. Already sorted [1, 2, 3] -> [1, 2, 3].
+        assert_eq!(run_sortbuf(&env, &[1, 2, 3]), std::vec![1, 2, 3]);
+
+        // 3. All equal [5, 5, 5] -> [5, 5, 5].
+        assert_eq!(run_sortbuf(&env, &[5, 5, 5]), std::vec![5, 5, 5]);
+
+        // 4. Negative numbers [-10, 5, -3] -> [-10, -3, 5].
+        assert_eq!(run_sortbuf(&env, &[-10, 5, -3]), std::vec![-10, -3, 5]);
+
+        // 5. Full 8-element capacity [8, 7, 6, 5, 4, 3, 2, 1] -> [1..=8].
+        assert_eq!(
+            run_sortbuf(&env, &[8, 7, 6, 5, 4, 3, 2, 1]),
+            std::vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "more than 8 fresh sources")]
+    fn sortbuf_panics_when_given_nine_elements() {
+        let env = Env::default();
+        let _ = run_sortbuf(&env, &[9, 8, 7, 6, 5, 4, 3, 2, 1]);
+    }
+
     mod invariants;
 }
