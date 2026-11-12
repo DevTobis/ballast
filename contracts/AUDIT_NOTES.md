@@ -21,6 +21,12 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
   good value is a sticky `Halted` that only `risk` clears.
+- **`LastGood` carries its own timestamp.** `DataKey::LastGood` stores `LastGood { value, ts }`.
+  When `guarded_price` returns `Ok`, `GuardedPrice::ts` is the current evaluation timestamp (`now`);
+  when it returns `Degraded` or `Halted`, `GuardedPrice::ts` is `last_good.ts` (`0` if there was no
+  prior good price or if `LastGood` was read from a pre-upgrade bare `i128` entry before the next
+  `Ok` evaluation or `confirm_halt_cleared`), so callers and monitors can tell how old the held
+  fallback price is.
 - **A rolling reference bounds slow drift over a window.** `daily_move_band_bps` only compares a
   publish against the immediately preceding one, so a publisher (or a bug) moving the price a little
   on every publish could walk it anywhere over an hour without ever tripping a single-step check. The
