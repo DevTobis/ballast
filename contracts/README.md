@@ -39,7 +39,7 @@ invariant 5 ("pausing cannot move funds") requires it.
 | `credit-line` | `repay` | Repayment must always work. |
 | `credit-line` | `liquidate`, `close_liquidated` | Liquidation must run while paused, or a bad line can never be cleared. |
 | `credit-line` | `withdraw_undrawn`, `withdraw_interest` | The lender taking its own capital back out only lowers exposure. |
-| `pledge-vault` | `release` | The borrower returning collateral, checked to leave the line healthy. |
+| `pledge-vault` | `release` | The borrower returning collateral; checked to leave the line healthy when the line still owes something (with zero debt the price and LTV checks are skipped, #182). |
 | `pledge-vault` | `liquidate` | The keeper seizing collateral must work while paused. |
 | `repo-dvp` | `unwind` | Leg 2 at or after maturity closes the trade and returns collateral. |
 | `repo-dvp` | `top_up` | Adds collateral; a borrower must be able to cure a call while paused. |
