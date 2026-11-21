@@ -1270,6 +1270,89 @@ mod test {
         assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
     }
 
+    /// Every field of a `LiquidationRecord`, in one tuple so a test compares all seven at once.
+    fn record_fields(record: &LiquidationRecord) -> (i128, i128, i128, bool, i128, i128, i128) {
+        (
+            record.seized_units,
+            record.price,
+            record.debt,
+            record.closed,
+            record.recovered,
+            record.surplus,
+            record.shortfall,
+        )
+    }
+
+    /// #164: what `liquidate` writes into the record, and that it stays as written. The line has
+    /// a year of interest that was never booked, so `debt` cannot be the principal alone, and the
+    /// crash price differs from the price before and after it, so `price` cannot be a later read.
+    #[test]
+    fn liquidate_freezes_every_field_of_the_liquidation_record() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        // One year at 10% (1_000 bps) on 600 is 60 of interest. Nothing has touched the line
+        // since the draw, so all of it is still pending rather than booked on the line.
+        let year = 365 * 24 * 60 * 60;
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + year);
+        assert_eq!(h.credit_line.line(&id).accrued_interest, 0);
+
+        // $0.70: 1,000 units are worth 700 against 660 owed (LTV 94.28%, past liquidation).
+        let crash = 70 * PRICE_SCALE / 100;
+        h.price_guard.set_price(&crash, &PriceStatus::Ok);
+        h.credit_line.poke(&id);
+        h.env
+            .ledger()
+            .set_sequence_number(h.env.ledger().sequence() + 2);
+        h.credit_line.poke(&id);
+        h.credit_line
+            .liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+
+        let frozen = (
+            1_000 * PRICE_SCALE, // seized_units: the whole pledged position
+            crash,               // price: the one the breach was confirmed at
+            660 * PRICE_SCALE,   // debt: principal plus the pending interest
+            false,               // closed
+            0,                   // recovered
+            0,                   // surplus
+            0,                   // shortfall
+        );
+        assert_eq!(
+            record_fields(&h.credit_line.liquidation_record(&id)),
+            frozen
+        );
+
+        // The price recovers and another year passes. Neither reaches the record.
+        h.price_guard
+            .set_price(&(2 * PRICE_SCALE), &PriceStatus::Ok);
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + year);
+        assert_eq!(
+            record_fields(&h.credit_line.liquidation_record(&id)),
+            frozen
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line was not liquidated")]
+    fn liquidation_record_of_a_line_that_was_never_liquidated_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        h.credit_line.liquidation_record(&id);
+    }
+
     #[test]
     fn unhealthy_since_records_timestamp_on_unhealthy_and_clears_on_recovery() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
