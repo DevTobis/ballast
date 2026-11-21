@@ -89,6 +89,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - `liquidate` has no LTV check by design: it is the liquidation path, keeper-gated. Its safety
   depends on `CreditLine::liquidate` having confirmed the breach first, enforced off-chain by the
   keeper job, not on-chain.
+- `configure_asset` refuses a `haircut_bps` above 10,000 (`risk::validate_haircut_bps`) as well as
+  thresholds that `MarginThresholds::validate` rejects. A haircut above 100% used to be stored, and
+  every `release` against debt then panicked when it valued the remaining collateral.
+  `CreditLine::configure_asset` runs the same two checks, so the two contracts cannot disagree
+  about which configs are usable.
 
 ## ExitDesk
 
