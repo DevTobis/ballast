@@ -333,6 +333,18 @@ impl ExitDesk {
         compute_quote(&env, &asset, units)
     }
 
+    /// The USDC the desk can pay exits from right now: its own balance of the configured USDC
+    /// token, or zero while no USDC token has been set. `exit` refuses a payout larger than this
+    /// (`exit-desk: insufficient USDC float`), so comparing it with a quote's `usdc_out` tells a
+    /// caller whether that quote can be paid before a holder is asked to sign. A read, like
+    /// `quote`: the float can still move before the exit lands.
+    pub fn available_usdc(env: Env) -> i128 {
+        match env.storage().instance().get::<_, Address>(&DataKey::Usdc) {
+            Some(usdc) => token::Client::new(&env, &usdc).balance(&env.current_contract_address()),
+            None => 0,
+        }
+    }
+
     /// Swaps `units` of `asset` from `holder` into USDC paid to `to` (PRD §5 Phase 2
     /// "Settlement", "Anchor payout hop"). Always re-quotes fresh; never trusts a stale
     /// client-supplied price.
@@ -385,14 +397,21 @@ impl ExitDesk {
             panic!("exit-desk: exceeds desk inventory cap");
         }
 
+        // The payout comes out of the USDC the desk holds. Check it can be paid before anything
+        // is taken from the holder, so that a short float fails here, with a message that says
+        // so, rather than in the token's own transfer further down, with one that does not.
+        let usdc = read_usdc(&env);
+        let usdc_client = token::Client::new(&env, &usdc);
+        if usdc_client.balance(&env.current_contract_address()) < quote.usdc_out {
+            panic!("exit-desk: insufficient USDC float");
+        }
+
         // Atomic settlement: RWA in from the holder, USDC out to `to`. Both transfers happen
         // unconditionally in this one call; a panic in either aborts the whole invocation and
         // neither leg applies.
         let rwa_client = token::Client::new(&env, &asset);
         rwa_client.transfer(&holder, to_muxed(&env.current_contract_address()), &units);
 
-        let usdc = read_usdc(&env);
-        let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(
             &env.current_contract_address(),
             to_muxed(&to),
