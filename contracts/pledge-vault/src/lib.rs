@@ -742,6 +742,27 @@ mod test {
         }
     }
 
+    /// `configure_asset` runs `MarginThresholds::validate` (#78): equal margin-call and
+    /// liquidation thresholds would make `MarginCall` unreachable, so they are refused.
+    #[test]
+    #[should_panic(expected = "margin: margin_call_bps must be below liquidation_bps")]
+    fn configure_asset_rejects_equal_margin_call_and_liquidation_thresholds() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_000,
+                liquidation_bps: 9_000,
+            },
+            &CustodyMode::Escrow,
+        );
+    }
+
     #[test]
     fn pledge_then_release_happy_path() {
         // 5% haircut, $500 debt, $1.00 price.

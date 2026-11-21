@@ -16,6 +16,13 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 The keeper is trusted for **timing and completeness**, not for **value**: every amount a settlement
 uses comes from the contract's own state or from the PriceGuard, never from a keeper-supplied number.
 
+The admin is trusted to choose margin thresholds, but not to choose ones that break the state
+machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
+`MarginThresholds::validate`, which refuses anything but
+`0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`. Equal thresholds were accepted
+before #78 and silently removed a state (`Warning` or `MarginCall`). Thresholds stored before that
+change are not re-checked; calling `configure_asset` again is the only way to replace them.
+
 ## PriceGuard
 
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;

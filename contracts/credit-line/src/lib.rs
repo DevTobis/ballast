@@ -992,6 +992,26 @@ mod test {
         id
     }
 
+    /// `configure_asset` runs `MarginThresholds::validate` (#78): equal warning and margin-call
+    /// thresholds would make `Warning` unreachable, so they are refused before anything is stored.
+    #[test]
+    #[should_panic(expected = "margin: warning_bps must be below margin_call_bps")]
+    fn configure_asset_rejects_equal_warning_and_margin_call_thresholds() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.configure_asset(
+            &h.admin,
+            &Address::generate(&h.env),
+            &h.price_guard.address,
+            &h.token.address,
+            &500,
+            &MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }
+
     #[test]
     fn draw_and_repay_happy_path() {
         // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
