@@ -2734,6 +2734,38 @@ mod test {
     }
 
     #[test]
+    fn three_sources_with_an_outlier_beyond_the_band_degrade_and_keep_the_last_good_value() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let mid = SCALE + 20_000; // 1.002
+
+        // Establish a last good value from three agreeing sources.
+        publish_numbered_sources(
+            &env,
+            &client,
+            &publisher,
+            &asset,
+            &[SCALE, mid, SCALE + 40_000],
+        );
+        let good = client.guarded_price(&asset);
+        assert_eq!(good.status, PriceStatus::Ok);
+        assert_eq!(good.value, mid);
+
+        // Replace the third source with 1.060. The extremes (1.000 and 1.060) are 600 bps apart,
+        // well past the 50 bps band, even though the median (1.002) is still close to the others.
+        publish_numbered_sources(
+            &env,
+            &client,
+            &publisher,
+            &asset,
+            &[SCALE, mid, SCALE + 600_000],
+        );
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Degraded);
+        assert_eq!(price.value, mid);
+    }
+
+    #[test]
     fn five_fresh_sources_within_band_return_the_middle_value() {
         // 100 bps band. The five values span 80 bps. The mean is 1.0038 and the mid-range is
         // 1.0040, so neither would be mistaken for the median, 1.0030.
