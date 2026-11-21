@@ -11,7 +11,7 @@ in this skeleton pass.
 | `registry` | [Asset configs, haircut parameters, timelocked param changes](registry/README.md) |
 | `price-guard` | [Median/band/staleness/halt price logic (PRD §6.4)](price-guard/README.md) |
 | `pledge-vault` | [Escrow/lien collateral positions](pledge-vault/README.md) |
-| `credit-line` | Credit lines, draws, repayments, the margin state machine |
+| `credit-line` | [Credit lines, draws, repayments, the margin state machine](credit-line/README.md) |
 | `exit-desk` | [RWA → USDC instant exit](exit-desk/README.md) |
 | `repo-dvp` | Bilateral repo, atomic DvP |
 
