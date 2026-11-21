@@ -1146,6 +1146,45 @@ mod test {
     }
 
     #[test]
+    fn unpausing_all_leaves_a_separately_paused_scope_paused() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let pauser = client_pauser(&env, &client);
+        client.pause(&pauser, &PauseScope::Draws);
+        client.pause(&pauser, &PauseScope::All);
+        assert!(client.is_paused(&PauseScope::Pledges));
+
+        let id = client.queue_unpause(&admin, &PauseScope::All);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        // `All` is its own flag: clearing it does not clear the per-scope flag set earlier.
+        assert!(!client.is_paused(&PauseScope::All));
+        assert!(client.is_paused(&PauseScope::Draws));
+        assert!(!client.is_paused(&PauseScope::Pledges));
+        assert!(!client.is_paused(&PauseScope::Exits));
+        assert!(!client.is_paused(&PauseScope::Repos));
+    }
+
+    /// Recorded behaviour: `queue_unpause` does not check that the scope is currently paused, so
+    /// queuing and executing an unpause for a scope that is not paused succeeds and is a no-op.
+    /// Rejecting it would be a contract change; this test pins the current behaviour.
+    #[test]
+    fn unpausing_a_scope_that_is_not_paused_succeeds_as_a_no_op() {
+        let (env, client, admin, _risk, _asset) = setup();
+        assert!(!client.is_paused(&PauseScope::Exits));
+
+        let id = client.queue_unpause(&admin, &PauseScope::Exits);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        assert!(!client.is_paused(&PauseScope::Exits));
+    }
+
+    #[test]
     fn a_stranger_cannot_queue_param() {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         use soroban_sdk::IntoVal;
