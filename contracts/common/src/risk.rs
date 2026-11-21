@@ -11,6 +11,7 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// `haircut_bps` is basis points out of 10,000 and is the *total* haircut (base + liquidity +
 /// FX + concentration add-ons, already summed by the caller per PRD §6.4).
 pub fn collateral_value(units: i128, guarded_price: i128, haircut_bps: u32) -> i128 {
+    // configure_asset validates this upfront; this assert is defence-in-depth.
     assert!(
         haircut_bps as i128 <= BPS_DENOMINATOR,
         "haircut exceeds 100%"

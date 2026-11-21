@@ -298,6 +298,13 @@ impl CreditLine {
     /// See module docs on the Registry simplification. `admin` is accepted for interface
     /// symmetry; the actual check is `access::require_admin`, which authenticates the *stored*
     /// admin regardless of what's passed here.
+    ///
+    /// # Constraints
+    /// - `haircut_bps <= 10_000`: haircut_bps must be at most 10_000.
+    /// - `warning_bps > 0`: warning_bps must be greater than zero.
+    /// - `warning_bps < margin_call_bps`: warning_bps must be less than margin_call_bps.
+    /// - `margin_call_bps < liquidation_bps`: margin_call_bps must be less than liquidation_bps.
+    /// - `liquidation_bps <= 10_000`: liquidation_bps must be at most 10_000.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -307,6 +314,26 @@ impl CreditLine {
         haircut_bps: u32,
         thresholds: MarginThresholds,
     ) {
+        assert!(
+            haircut_bps <= 10_000,
+            "haircut_bps must be at most 10_000"
+        );
+        assert!(
+            thresholds.warning_bps > 0,
+            "warning_bps must be greater than zero"
+        );
+        assert!(
+            thresholds.warning_bps < thresholds.margin_call_bps,
+            "warning_bps must be less than margin_call_bps"
+        );
+        assert!(
+            thresholds.margin_call_bps < thresholds.liquidation_bps,
+            "margin_call_bps must be less than liquidation_bps"
+        );
+        assert!(
+            thresholds.liquidation_bps <= 10_000,
+            "liquidation_bps must be at most 10_000"
+        );
         ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
@@ -1673,5 +1700,127 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    // --- configure_asset validation (#135) ---------------------------------------
+
+    fn setup_credit_line(
+        env: &Env,
+    ) -> (
+        CreditLineClient<'static>,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        let cl_id = env.register(CreditLine, ());
+        let credit_line = CreditLineClient::new(env, &cl_id);
+        let admin = Address::generate(env);
+        let pauser = Address::generate(env);
+        let keeper = Address::generate(env);
+        let price_publisher = Address::generate(env);
+        let risk = Address::generate(env);
+        credit_line.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+        let asset = Address::generate(env);
+        let price_guard = Address::generate(env);
+        let usdc = Address::generate(env);
+        (credit_line, admin, asset, price_guard, usdc)
+    }
+
+    #[test]
+    #[should_panic(expected = "haircut_bps must be at most 10_000")]
+    fn configure_asset_rejects_haircut_exceeding_10000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 2_000,
+            margin_call_bps: 5_000,
+            liquidation_bps: 8_000,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &10_001, &thresholds);
+    }
+
+    #[test]
+    #[should_panic(expected = "warning_bps must be greater than zero")]
+    fn configure_asset_rejects_zero_warning_bps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 0,
+            margin_call_bps: 5_000,
+            liquidation_bps: 8_000,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &5_000, &thresholds);
+    }
+
+    #[test]
+    #[should_panic(expected = "warning_bps must be less than margin_call_bps")]
+    fn configure_asset_rejects_warning_equal_to_margin_call() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 5_000,
+            margin_call_bps: 5_000,
+            liquidation_bps: 8_000,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &5_000, &thresholds);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin_call_bps must be less than liquidation_bps")]
+    fn configure_asset_rejects_margin_call_equal_to_liquidation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 2_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 8_000,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &5_000, &thresholds);
+    }
+
+    #[test]
+    #[should_panic(expected = "liquidation_bps must be at most 10_000")]
+    fn configure_asset_rejects_liquidation_exceeding_10000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 2_000,
+            margin_call_bps: 5_000,
+            liquidation_bps: 10_001,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &5_000, &thresholds);
+    }
+
+    #[test]
+    #[should_panic(expected = "warning_bps must be less than margin_call_bps")]
+    fn configure_asset_rejects_warning_greater_than_liquidation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 9_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 7_000,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &5_000, &thresholds);
+    }
+
+    #[test]
+    fn configure_asset_valid_thresholds_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (credit_line, admin, asset, price_guard, usdc) = setup_credit_line(&env);
+        let thresholds = MarginThresholds {
+            warning_bps: 2_000,
+            margin_call_bps: 5_000,
+            liquidation_bps: 8_000,
+        };
+        credit_line.configure_asset(&admin, &asset, &price_guard, &usdc, &5_000, &thresholds);
     }
 }
