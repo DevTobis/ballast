@@ -979,16 +979,29 @@ fn configure_asset_accepts_valid_thresholds() {
         },
     );
 
-    // Equal boundaries are valid
+    // Minimum strictly-increasing config (each boundary differs by 1 bps).
     repo.configure_asset(
         &h.admin,
         &new_asset,
         &h.price_guard,
         &500u32,
         &MarginThresholds {
-            warning_bps: 8_000,
-            margin_call_bps: 8_000,
-            liquidation_bps: 8_000,
+            warning_bps: 7_000,
+            margin_call_bps: 7_001,
+            liquidation_bps: 7_002,
+        },
+    );
+
+    // Maximum ceiling: liquidation_bps at exactly 10_000 bps.
+    repo.configure_asset(
+        &h.admin,
+        &new_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 1,
+            margin_call_bps: 5_000,
+            liquidation_bps: 10_000,
         },
     );
 }
@@ -1052,6 +1065,45 @@ fn configure_asset_rejects_out_of_order_thresholds() {
         );
     }));
     assert!(res2.is_err(), "margin_call > liquidation must be rejected");
+}
+
+#[test]
+fn configure_asset_rejects_equal_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // Equal warning_bps and margin_call_bps make Warning unreachable.
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res1.is_err(), "equal warning_bps == margin_call_bps must be rejected");
+
+    // Equal margin_call_bps and liquidation_bps make MarginCall unreachable.
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "equal margin_call_bps == liquidation_bps must be rejected");
 }
 
 #[test]
