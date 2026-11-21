@@ -75,6 +75,17 @@ pub struct AssetGuardConfig {
     pub window_move_band_bps: u32,
 }
 
+/// What a risk operator needs to see before calling `confirm_halt_cleared`, returned by
+/// `halt_info` while an asset is halted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HaltInfo {
+    /// The baseline `guarded_price` keeps returning while halted. `None` if none was ever recorded.
+    pub last_good: Option<i128>,
+    /// The median that tripped the halt; confirming promotes it to the new `last_good`.
+    pub pending: Option<i128>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigChange {
@@ -977,6 +988,35 @@ impl PriceGuard {
     pub fn issuer_pubkey(env: Env, asset: Address) -> Option<BytesN<32>> {
         ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::IssuerPubKey(asset))
+    }
+
+    /// Read-only: the halt latch for `asset`. `None` while the asset is not halted. While halted,
+    /// shows the baseline `guarded_price` is holding and the value `confirm_halt_cleared` would
+    /// promote, so a risk operator can check both before confirming.
+    pub fn halt_info(env: Env, asset: Address) -> Option<HaltInfo> {
+        ttl::extend_instance(&env);
+        let halted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Halted(asset.clone()))
+            .unwrap_or(false);
+        if !halted {
+            return None;
+        }
+        Some(HaltInfo {
+            last_good: env
+                .storage()
+                .instance()
+                .get(&DataKey::LastGood(asset.clone())),
+            pending: env.storage().instance().get(&DataKey::PendingHaltValue(asset)),
+        })
+    }
+
+    /// Read-only: the last guarded value that reached `Ok`, which `guarded_price` falls back to
+    /// while `Degraded` or `Halted`. `None` if the asset has never reached `Ok`.
+    pub fn last_good(env: Env, asset: Address) -> Option<i128> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::LastGood(asset))
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
@@ -2698,6 +2738,74 @@ mod test {
         let price = client.guarded_price(&asset);
         assert_eq!(price.status, PriceStatus::Ok);
         assert_eq!(price.value, v2);
+    }
+
+    #[test]
+    fn last_good_is_none_until_the_asset_reaches_ok_then_tracks_the_median() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        assert_eq!(client.last_good(&asset), None);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        // One source is Degraded, which never records a last good value.
+        assert_eq!(client.last_good(&asset), None);
+
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+    }
+
+    #[test]
+    fn getters_need_no_auth_and_do_not_change_state() {
+        use soroban_sdk::testutils::MockAuth;
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+
+        // Drop every mocked authorisation: a getter that required auth would now panic.
+        env.mock_auths(&[] as &[MockAuth]);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.halt_info(&asset), None);
+    }
+
+    #[test]
+    fn halt_info_shows_baseline_and_tripping_value_then_clears_on_confirm() {
+        let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let t0 = env.ledger().timestamp();
+        let feed = feed(&env);
+        assert_eq!(client.halt_info(&asset), None);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &SCALE, &t0);
+        assert_eq!(client.halt_info(&asset), None);
+
+        // Both sources agree on a jump beyond the daily band, which latches the halt.
+        let jumped = SCALE * 13 / 10;
+        client.publish_nav(&publisher, &asset, &code, &jumped, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &jumped, &t0);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
+        assert_eq!(
+            client.halt_info(&asset),
+            Some(HaltInfo {
+                last_good: Some(SCALE),
+                pending: Some(jumped),
+            })
+        );
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+
+        // Confirming promotes the tripping value and lifts the latch.
+        client.confirm_halt_cleared(&risk, &asset);
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.last_good(&asset), Some(jumped));
     }
 
     // `within_band` boundaries. The band is inclusive: a spread of exactly `band_bps` is still
