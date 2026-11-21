@@ -970,6 +970,80 @@ mod test {
         h.vault.pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
     }
 
+    // ── #185: pledge's error paths ──────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn pledge_of_zero_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn pledge_of_negative_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &-1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: asset not configured")]
+    fn pledge_of_an_unconfigured_asset_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        // A second token that the admin never passed to `configure_asset`. The borrower holds
+        // enough of it, so the missing config is the only thing wrong with the pledge.
+        let other_id = h.env.register(mock_token::MockToken, ());
+        let other = mock_token::MockTokenClient::new(&h.env, &other_id);
+        other.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &other_id, &(10 * PRICE_SCALE));
+    }
+
+    /// The borrower holds fewer units than they pledge, so the token's own `transfer` refuses.
+    #[test]
+    #[should_panic(expected = "mock-token: insufficient balance")]
+    fn pledge_beyond_the_borrowers_balance_panics_in_the_token() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(40 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE + 1));
+    }
+
+    /// The same failed transfer, looked at from outside: the whole pledge fails with it. No units
+    /// are credited, nothing is reported to the credit line, and no tokens move. Pledging what the
+    /// borrower does hold then works, so the amount was the only thing wrong with the first call.
+    #[test]
+    fn pledge_beyond_the_borrowers_balance_changes_nothing() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(40 * PRICE_SCALE));
+
+        let refused = h
+            .vault
+            .try_pledge(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE + 1));
+
+        assert!(
+            refused.is_err(),
+            "a pledge the borrower cannot fund must fail"
+        );
+        assert_eq!(h.vault.position_units(&1, &h.asset), 0);
+        assert_eq!(
+            h.credit_line.synced_units(),
+            -1,
+            "nothing reported to the credit line"
+        );
+        assert_eq!(h.token.balance(&h.borrower), 40 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 40 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 40 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 40 * PRICE_SCALE);
+    }
+
     #[test]
     #[should_panic(expected = "pledge-vault: asset custody mode changed while this position holds units")]
     fn the_custody_mode_cannot_flip_under_live_units() {
