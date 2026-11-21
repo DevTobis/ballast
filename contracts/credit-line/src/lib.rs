@@ -46,6 +46,11 @@
 //! Every read and write to `Line`, `Claimable`, and `Liquidation` extends entry persistent TTL.
 //! In addition, a public `extend_ttl(line)` entry point allows anyone (including keepers or users) to extend
 //! the TTL of a dormant credit line before it archives.
+//!
+//! **Events.** Like `PledgeVault`, state changes publish one event with the shape
+//! `((Symbol, line), payload)`: `line_closed` from `close_liquidated` and `undrawn_withdrawn` from
+//! `withdraw_undrawn` (which moves the lender's funded exposure and so needs an on-chain trace for
+//! the console and indexer). See `README.md`'s events table for the exact topics and payloads.
 
 use ballast_common::{
     access::{self, Roles},
@@ -722,6 +727,9 @@ impl CreditLine {
 
     /// Takes undrawn USDC back out of the line (reducing the commitment). Repaid principal returns
     /// to the undrawn balance, so this is also how a lender gets principal back.
+    ///
+    /// Publishes `(Symbol("undrawn_withdrawn"), line)` with `(lender, amount, funded_after)`, so a
+    /// lender's falling funded exposure is explained on chain (see the crate README's events table).
     pub fn withdraw_undrawn(env: Env, lender: Address, line: u64, amount: i128) {
         ttl::extend_instance(&env);
         lender.require_auth();
@@ -742,6 +750,11 @@ impl CreditLine {
             &env.current_contract_address(),
             muxed(&lender),
             &amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "undrawn_withdrawn"), line),
+            (lender, amount, state.funded),
         );
     }
 
@@ -1146,6 +1159,61 @@ mod test {
         assert_eq!(h.token.balance(&h.lender), 1_000 * PRICE_SCALE);
         assert_eq!(h.token.balance(&h.credit_line.address), 0);
         assert_eq!(h.credit_line.line(&id).funded, 0);
+    }
+
+    #[test]
+    fn withdraw_undrawn_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+
+        let contract_events = || {
+            h.env
+                .events()
+                .all()
+                .events()
+                .into_iter()
+                .filter(|e| e.type_ == ContractEventType::Contract)
+                .cloned()
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        // Failure: the withdrawal reverts, so nothing is published.
+        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line
+                .withdraw_undrawn(&h.lender, &id, &(1_001 * PRICE_SCALE));
+        }));
+        assert!(over.is_err(), "cannot withdraw more than the undrawn balance");
+        assert_eq!(
+            contract_events().len(),
+            0,
+            "no event may be emitted by a reverted withdraw_undrawn"
+        );
+
+        let amount = 400 * PRICE_SCALE;
+        h.credit_line.withdraw_undrawn(&h.lender, &id, &amount);
+
+        // Read the events before any further invocation, which would reset the recorded log.
+        let events = contract_events();
+        assert_eq!(events.len(), 1, "exactly one event on a successful withdrawal");
+        let last_event = events.last().expect("an event must have been published");
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("undrawn_withdrawn".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(id);
+        let val: soroban_sdk::Val = (h.lender.clone(), amount, 600 * PRICE_SCALE).into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+        assert_eq!(h.credit_line.line(&id).funded, 600 * PRICE_SCALE);
     }
 
     #[test]
