@@ -35,7 +35,7 @@ export class EtherfuseNavAdapter implements IssuerNavAdapter {
 
   async fetchNav(assetCode: string): Promise<{ value: bigint; ts: number }> {
     const url = `${this.baseUrl}/lookup/tokens/cost/${encodeURIComponent(assetCode.toUpperCase())}`;
-    const body = await getJson<EtherfuseTokenCost>(url, this.fetchImpl);
+    const body = await getJson<EtherfuseTokenCost>(url, this.fetchImpl, "etherfuse");
 
     const updates = Object.values(body.sources ?? {}).map((s) => s.updated_at);
     const ts = updates.length > 0 ? median(updates) : Math.floor(Date.parse(body.current_time) / 1000);

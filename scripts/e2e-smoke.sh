@@ -66,6 +66,8 @@ log "Price publisher pushes the real issuer NAV and the real oracle reading for 
 # shellcheck source=/dev/null
 source scripts/real-sources.env
 export REDSTONE_RPC_URL REDSTONE_NETWORK_PASSPHRASE REDSTONE_FEED_CONTRACT_IDS ISSUER_NAV_SYMBOLS
+# smoke --json returns {"nav": {"value": string, "ts": number} | null, "feed": {"value": string, "ts": number} | null}
+# Exit code 0 on success; values are scaled 1e7 integers as strings.
 READINGS=$(STELLAR_SIMULATION_SOURCE="$ADMIN" retry pnpm --silent --filter @ballast/service-price-guard exec \
   tsx src/smoke.ts --json RWA1:etherfuse)
 read -r NAV_VALUE NAV_TS FEED_VALUE FEED_TS < <(echo "$READINGS" | node -e '

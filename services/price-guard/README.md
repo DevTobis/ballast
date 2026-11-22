@@ -35,6 +35,66 @@ Shadow mode (`PRICE_GUARD_PUBLISH=false`) records real readings and alerts when 
 than the asset's `price_band_bps`, but sends nothing on-chain, writes no `price_snapshot` and needs no
 contract or publisher key. `scripts/shadow-run.sh` drives it. `smoke` touches neither chain nor database.
 
+## Smoke Test (`smoke.ts`)
+
+Live read-only test: calls each real source once and prints the returned prices. It sends nothing on-chain and touches no database, making it safe to run against mainnet.
+
+### Usage
+
+```bash
+# Human mode (supports multiple ASSET_CODE:issuerCode targets):
+pnpm --filter @ballast/service-price-guard smoke CETES:etherfuse USTBL:spiko BENJI:franklin
+
+# JSON mode (requires exactly one ASSET_CODE:issuerCode target):
+pnpm --filter @ballast/service-price-guard smoke --json CETES:etherfuse
+```
+
+### Flags & Contract
+
+- `--json`: Formats output as a single JSON object `{ nav, feed }`. Requires exactly one target. Price values are formatted as 1e7 scaled integers represented as strings. For issuers with no public NAV API (e.g., Franklin), `nav` is `null`.
+- `ASSET_CODE:issuerCode`: Target asset code and issuer adapter identifier (`etherfuse`, `spiko`, `franklin`).
+
+### Sample Output
+
+**Human mode:**
+```text
+CETES (etherfuse)
+  issuer NAV   $0.0657660  updated 2026-10-08T06:52:59.000Z (2 min ago)
+  RedStone     $0.0657500  updated 2026-10-08T06:25:40.000Z (29 min ago)
+  divergence   2 bps
+
+BENJI (franklin)
+  issuer NAV   none (no public NAV API for this issuer)
+  RedStone     $1.0000000  updated 2026-10-08T06:25:40.000Z (29 min ago)
+```
+
+**JSON mode (`--json CETES:etherfuse`):**
+```json
+{"nav":{"value":"657660","ts":1791447179},"feed":{"value":"657500","ts":1791445540}}
+```
+
+**JSON mode with Franklin (`--json BENJI:franklin`):**
+```json
+{"nav":null,"feed":{"value":"10000000","ts":1791445540}}
+```
+
+### Exit Codes
+
+| Exit Code | Description |
+|-----------|-------------|
+| `0` | Success: every queried source answered successfully (or single target evaluated in `--json` mode). |
+| `1` | Failure: one or more sources failed to answer, invalid arguments, or `--json` invoked without exactly one target. |
+
+### Environment
+
+The smoke test requires:
+- `STELLAR_RPC_URL`: Soroban RPC endpoint (e.g., `https://mainnet.sorobanrpc.com`) for simulating RedStone reads.
+- `STELLAR_HORIZON_URL`: Horizon endpoint.
+- `STELLAR_NETWORK_PASSPHRASE`: Network passphrase (e.g. `"Public Global Stellar Network ; September 2015"`).
+- `STELLAR_SIMULATION_SOURCE`: Any valid funded Stellar account address used to simulate the contract read without submitting transactions.
+- `REDSTONE_FEED_CONTRACT_IDS`: JSON mapping asset codes to RedStone feed contract addresses (e.g. `{"CETES":"CCYGBQZ5..."}`).
+- *Note*: No database connection or signing key is required; no on-chain transactions are sent.
+
 ## Environment
 
 - `DATABASE_URL`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `STELLAR_HORIZON_URL`, `STELLAR_NETWORK_PASSPHRASE`.

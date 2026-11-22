@@ -12,7 +12,8 @@
     "test": "vitest run --passWithNoTests",
     "lint": "echo 'no lint configured'",
     "smoke": "tsx --env-file-if-exists=../../.env src/smoke.ts",
-    "shadow:seed": "tsx --env-file-if-exists=../../.env src/seedShadow.ts"
+    "shadow:seed": "tsx --env-file-if-exists=../../.env src/seedShadow.ts",
+    "seed:shadow": "tsx --env-file-if-exists=../../.env src/seedShadow.ts"
   },
   "dependencies": {
     "@ballast/contract-clients": "workspace:*",
