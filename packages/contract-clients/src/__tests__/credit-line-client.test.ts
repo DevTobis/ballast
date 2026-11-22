@@ -52,6 +52,11 @@ describe("CreditLineClient", () => {
     expect(result).toBeDefined();
   });
 
+  it("ltvAfter() simulates a read and does not throw", async () => {
+    const result = await client.ltvAfter(1n, 500n);
+    expect(result).toBeDefined();
+  });
+
   it("poke() returns non-empty unsigned XDR", async () => {
     const xdr = await client.poke(1n);
     expect(typeof xdr).toBe("string");

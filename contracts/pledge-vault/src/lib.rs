@@ -25,13 +25,13 @@
 //! a fresh LTV check) and `liquidate` (keeper-only, unconditional — see its doc comment for why
 //! that's the designated liquidation path). No admin function moves pledged RWA.
 //!
-//! **Documented simplification — haircut/margin config.** Per-asset haircut, margin thresholds,
-//! and custody mode are set directly by the admin via `configure_asset` rather than cross-called
-//! from `Registry` on every `pledge`/`release`. A later integration pass would sync these from
-//! `Registry` instead of duplicating admin input here.
+//! **Per-asset config.** Custody mode and the linked `CreditLine` address are set directly by
+//! the admin via `configure_asset`. Risk parameters (haircut, margin thresholds, PriceGuard) live
+//! solely on `CreditLine`, eliminating duplicate configuration and ensuring `release` health checks
+//! evaluate against the exact same risk parameters as `poke`, `draw`, and `liquidate`.
 //!
-//! **PledgeVault ↔ CreditLine wiring.** `release` cross-calls `CreditLine::ltv` (read-only) to get
-//! the line's current debt before deciding whether a release keeps the line healthy, and every
+//! **PledgeVault ↔ CreditLine wiring.** `release` cross-calls `CreditLine::ltv_after` (read-only) to
+//! verify that releasing units leaves the line healthy according to `CreditLine`'s own config, and every
 //! change to a position is reported back through `CreditLine::sync_from_vault` in the same
 //! transaction, so the line never counts collateral the vault has already let go of. `pledge` also
 //! requires the line's own borrower and collateral asset.
@@ -51,26 +51,16 @@
 use ballast_common::{
     access::{self, Roles},
     asset::CustodyMode,
-    margin::{self, MarginState, MarginThresholds},
+    margin::MarginState,
     pause::{self, PauseScope},
-    price::{GuardedPrice, PriceStatus},
-    risk,
+    price::PriceStatus,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, token, Address, Bytes, Env, MuxedAddress,
     Symbol,
 };
 
-/// Cross-contract call to PriceGuard, declared as a local trait so PledgeVault never takes a
-/// Cargo dependency on the price-guard crate (which is being rewritten concurrently). Soroban
-/// resolves this purely by address at call time; the wire shape just has to match PriceGuard's
-/// real `guarded_price` function, which returns `ballast_common::price::GuardedPrice` exactly.
-#[contractclient(name = "PriceGuardClient")]
-pub trait PriceGuardInterface {
-    fn guarded_price(env: Env, asset: Address) -> GuardedPrice;
-}
-
-/// Cross-contract call to CreditLine's `ltv` view and its `borrower_of` getter. `LtvView` is
+/// Cross-contract call to CreditLine's `ltv_after` view and its `borrower_of` getter. `LtvView` is
 /// redefined locally (see the struct below) rather than imported, since PledgeVault and CreditLine
 /// are decoupled crates by design — they're built together in this pass, so the shape is
 /// hand-kept in sync between the two rather than shared from a common source. That hand-sync is
@@ -78,6 +68,7 @@ pub trait PriceGuardInterface {
 #[contractclient(name = "CreditLineClient")]
 pub trait CreditLineInterface {
     fn ltv(env: Env, line: u64) -> LtvView;
+    fn ltv_after(env: Env, line: u64, new_units: i128) -> LtvView;
     fn borrower_of(env: Env, line: u64) -> Address;
     fn asset_of(env: Env, line: u64) -> Address;
     fn sync_from_vault(env: Env, vault: Address, line: u64, asset: Address, units: i128);
@@ -85,7 +76,7 @@ pub trait CreditLineInterface {
 
 /// Mirrors `ballast_credit_line::LtvView` field-for-field. Soroban structs are encoded on the
 /// wire as a map keyed by field name, not by Rust type name, so a cross-call into CreditLine's
-/// `ltv` decodes correctly into this independently-defined type as long as the fields line up.
+/// `ltv_after` decodes correctly into this independently-defined type as long as the fields line up.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct LtvView {
@@ -96,14 +87,11 @@ pub struct LtvView {
     pub price_status: PriceStatus,
 }
 
-/// Per-asset config, set directly by the admin (see module docs on the Registry simplification).
+/// Per-asset config, set directly by the admin (see module docs).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AssetConfig {
-    pub price_guard: Address,
     pub credit_line: Address,
-    pub haircut_bps: u32,
-    pub thresholds: MarginThresholds,
     /// Which custody mode this asset uses (PRD §6.3), set once by the admin per asset rather than
     /// accepted from the caller at `pledge` time — a borrower shouldn't get to choose their own
     /// custody mode per call, an issuer/asset does.
@@ -203,20 +191,16 @@ impl PledgeVault {
         );
     }
 
-    /// Admin-set per-asset config: which PriceGuard to query, which CreditLine contract owns
-    /// debt/limit accounting for lines against this asset, and the haircut/margin thresholds to
-    /// apply. See the module-level doc comment on why this isn't synced from Registry in this
-    /// pass. `admin` is accepted for interface symmetry with the rest of Ballast's admin calls;
+    /// Admin-set per-asset config: which CreditLine contract owns debt/limit accounting for lines
+    /// against this asset, and the custody mode to apply. See the module-level doc comment.
+    /// `admin` is accepted for interface symmetry with the rest of Ballast's admin calls;
     /// the actual check is `access::require_admin`, which authenticates the *stored* admin
     /// address regardless of what's passed here.
     pub fn configure_asset(
         env: Env,
         admin: Address,
         asset: Address,
-        price_guard: Address,
         credit_line: Address,
-        haircut_bps: u32,
-        thresholds: MarginThresholds,
         custody_mode: CustodyMode,
     ) {
         let _ = admin;
@@ -224,10 +208,7 @@ impl PledgeVault {
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
             &AssetConfig {
-                price_guard,
                 credit_line,
-                haircut_bps,
-                thresholds,
                 custody_mode,
             },
         );
@@ -329,22 +310,15 @@ impl PledgeVault {
             "pledge-vault: release exceeds pledged units"
         );
 
-        let guarded: GuardedPrice =
-            PriceGuardClient::new(&env, &config.price_guard).guarded_price(&asset);
+        let remaining_units = position.units - units;
+        let ltv_view: LtvView =
+            CreditLineClient::new(&env, &config.credit_line).ltv_after(&line, &remaining_units);
         assert!(
-            guarded.is_usable_for_new_risk(),
+            matches!(ltv_view.price_status, PriceStatus::Ok),
             "pledge-vault: price status is not Ok"
         );
-
-        let ltv_view: LtvView = CreditLineClient::new(&env, &config.credit_line).ltv(&line);
-
-        let remaining_units = position.units - units;
-        let new_collateral_value =
-            risk::collateral_value(remaining_units, guarded.value, config.haircut_bps);
-        let new_ltv_bps = risk::ltv_bps(ltv_view.debt, new_collateral_value);
-        let state = margin::classify(new_ltv_bps, &config.thresholds);
         assert!(
-            matches!(state, MarginState::Healthy | MarginState::Warning),
+            matches!(ltv_view.state, MarginState::Healthy | MarginState::Warning),
             "pledge-vault: release would leave the credit line unhealthy"
         );
 
@@ -503,48 +477,15 @@ mod test {
         }
     }
 
-    // A minimal in-crate mock PriceGuard returning a canned `GuardedPrice` — standard hermetic
-    // cross-contract testing pattern (a real PriceGuard is a whole other contract, built
-    // concurrently, that this crate deliberately doesn't depend on).
-    mod mock_price_guard {
-        use ballast_common::price::{GuardedPrice, PriceStatus};
-        use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env};
-
-        #[contract]
-        pub struct MockPriceGuard;
-
-        #[contracttype]
-        enum DataKey {
-            Value,
-            Status,
-        }
-
-        #[contractimpl]
-        impl MockPriceGuard {
-            pub fn set_price(env: Env, value: i128, status: PriceStatus) {
-                env.storage().instance().set(&DataKey::Value, &value);
-                env.storage().instance().set(&DataKey::Status, &status);
-            }
-
-            pub fn guarded_price(env: Env, asset: Address) -> GuardedPrice {
-                let value: i128 = env.storage().instance().get(&DataKey::Value).unwrap();
-                let status: PriceStatus = env.storage().instance().get(&DataKey::Status).unwrap();
-                GuardedPrice {
-                    asset,
-                    value,
-                    status,
-                    ts: env.ledger().timestamp(),
-                    sources: vec![&env],
-                }
-            }
-        }
-    }
-
-    // A minimal in-crate mock CreditLine exposing just `ltv`/`borrower_of`, returning canned
+    // A minimal in-crate mock CreditLine exposing just `ltv`/`ltv_after`/`borrower_of`, returning canned
     // values — this crate never depends on the real `ballast-credit-line` crate.
     mod mock_credit_line {
         use crate::LtvView;
-        use ballast_common::{margin::MarginState, price::PriceStatus};
+        use ballast_common::{
+            margin::{self, MarginState, MarginThresholds},
+            price::PriceStatus,
+            risk,
+        };
         use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
         #[contract]
@@ -556,6 +497,10 @@ mod test {
             Borrower,
             Asset,
             Synced,
+            HaircutBps,
+            Thresholds,
+            Price,
+            PriceStatus,
         }
 
         #[contractimpl]
@@ -568,6 +513,22 @@ mod test {
                 env.storage().instance().set(&DataKey::Borrower, &borrower);
             }
 
+            pub fn set_haircut_bps(env: Env, haircut_bps: u32) {
+                env.storage().instance().set(&DataKey::HaircutBps, &haircut_bps);
+            }
+
+            pub fn set_thresholds(env: Env, thresholds: MarginThresholds) {
+                env.storage().instance().set(&DataKey::Thresholds, &thresholds);
+            }
+
+            pub fn set_price(env: Env, price: i128) {
+                env.storage().instance().set(&DataKey::Price, &price);
+            }
+
+            pub fn set_price_status(env: Env, status: PriceStatus) {
+                env.storage().instance().set(&DataKey::PriceStatus, &status);
+            }
+
             pub fn ltv(env: Env, _line: u64) -> LtvView {
                 let debt: i128 = env.storage().instance().get(&DataKey::Debt).unwrap_or(0);
                 LtvView {
@@ -576,6 +537,26 @@ mod test {
                     ltv_bps: 0,
                     state: MarginState::Healthy,
                     price_status: PriceStatus::Ok,
+                }
+            }
+
+            pub fn ltv_after(env: Env, _line: u64, new_units: i128) -> LtvView {
+                let debt: i128 = env.storage().instance().get(&DataKey::Debt).unwrap_or(0);
+                let price: i128 = env.storage().instance().get(&DataKey::Price).unwrap_or(0);
+                let haircut_bps: u32 = env.storage().instance().get(&DataKey::HaircutBps).unwrap_or(0);
+                let thresholds: MarginThresholds = env.storage().instance().get(&DataKey::Thresholds).unwrap();
+                let price_status: PriceStatus = env.storage().instance().get(&DataKey::PriceStatus).unwrap_or(PriceStatus::Ok);
+
+                let collateral_value = risk::collateral_value(new_units, price, haircut_bps);
+                let ltv_bps = risk::ltv_bps(debt, collateral_value);
+                let state = margin::classify(ltv_bps, &thresholds);
+
+                LtvView {
+                    debt,
+                    collateral_value,
+                    ltv_bps,
+                    state,
+                    price_status,
                 }
             }
 
@@ -615,12 +596,10 @@ mod test {
         env: Env,
         vault: PledgeVaultClient<'static>,
         token: mock_token::MockTokenClient<'static>,
-        price_guard: mock_price_guard::MockPriceGuardClient<'static>,
         credit_line: mock_credit_line::MockCreditLineClient<'static>,
         admin: Address,
         borrower: Address,
         asset: Address,
-        thresholds: MarginThresholds,
     }
 
     fn setup(haircut_bps: u32, debt: i128, price: i128) -> Harness {
@@ -632,9 +611,6 @@ mod test {
 
         let token_id = env.register(mock_token::MockToken, ());
         let token = mock_token::MockTokenClient::new(&env, &token_id);
-
-        let pg_id = env.register(mock_price_guard::MockPriceGuard, ());
-        let price_guard = mock_price_guard::MockPriceGuardClient::new(&env, &pg_id);
 
         let cl_id = env.register(mock_credit_line::MockCreditLine, ());
         let credit_line = mock_credit_line::MockCreditLineClient::new(&env, &cl_id);
@@ -648,36 +624,35 @@ mod test {
 
         vault.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
 
+        vault.configure_asset(
+            &admin,
+            &token_id,
+            &cl_id,
+            &CustodyMode::Escrow,
+        );
+
         let thresholds = MarginThresholds {
             warning_bps: 7_000,
             margin_call_bps: 8_000,
             liquidation_bps: 9_000,
         };
-        vault.configure_asset(
-            &admin,
-            &token_id,
-            &pg_id,
-            &cl_id,
-            &haircut_bps,
-            &thresholds,
-            &CustodyMode::Escrow,
-        );
 
-        price_guard.set_price(&price, &ballast_common::price::PriceStatus::Ok);
         credit_line.set_debt(&debt);
         credit_line.set_borrower(&borrower);
         credit_line.set_asset(&token_id);
+        credit_line.set_haircut_bps(&haircut_bps);
+        credit_line.set_thresholds(&thresholds);
+        credit_line.set_price(&price);
+        credit_line.set_price_status(&ballast_common::price::PriceStatus::Ok);
 
         Harness {
             env,
             vault,
             token,
-            price_guard,
             credit_line,
             admin,
             borrower,
             asset: token_id,
-            thresholds,
         }
     }
 
@@ -743,10 +718,7 @@ mod test {
         h.vault.configure_asset(
             &h.admin,
             &h.asset,
-            &h.price_guard.address,
             &h.credit_line.address,
-            &500,
-            &h.thresholds,
             &CustodyMode::IssuerLien,
         );
 
@@ -784,10 +756,7 @@ mod test {
         h.vault.configure_asset(
             &h.admin,
             &h.asset,
-            &h.price_guard.address,
             &h.credit_line.address,
-            &500,
-            &h.thresholds,
             &CustodyMode::IssuerLien,
         );
 
@@ -845,7 +814,9 @@ mod test {
         h.vault.pledge(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
 
         h.vault.configure_asset(
-            &h.admin, &h.asset, &h.price_guard.address, &h.credit_line.address, &500, &h.thresholds,
+            &h.admin,
+            &h.asset,
+            &h.credit_line.address,
             &CustodyMode::IssuerLien,
         );
         h.vault.pledge(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
@@ -861,10 +832,7 @@ mod test {
         h.vault.configure_asset(
             &h.admin,
             &h.asset,
-            &h.price_guard.address,
             &h.credit_line.address,
-            &500,
-            &h.thresholds,
             &CustodyMode::IssuerLien,
         );
 
@@ -926,5 +894,33 @@ mod test {
                 assert_eq!(v0.data, expected_data);
             }
         }
+    }
+
+    #[test]
+    fn release_outcome_governed_by_credit_line_ltv_after() {
+        // Vault has no haircut or thresholds configured.
+        // CreditLine controls haircut, price, and thresholds via ltv_after.
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE); // 5% haircut, $500 debt, $1.00 price
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        // Releasing 50 units leaves 950. With 5% haircut, collateral value = 950 * 0.95 = 902.50.
+        // Debt = 500 -> LTV ~ 5540 bps (Healthy) -> succeeds.
+        h.vault
+            .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 950 * PRICE_SCALE);
+
+        // Adjust CreditLine's haircut to 50% (5,000 bps) on CreditLine alone (vault has no haircut field).
+        h.credit_line.set_haircut_bps(&5_000);
+
+        // Releasing another 50 units would leave 900.
+        // Collateral value = 900 * 1.0 * 0.50 = 450.
+        // Debt = 500 -> LTV = 11,111 bps (> 9000 bps Liquidation) -> MUST PANIC!
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        }));
+        assert!(res.is_err(), "release must follow credit-line's updated haircut");
     }
 }

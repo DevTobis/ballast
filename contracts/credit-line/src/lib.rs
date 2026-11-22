@@ -237,20 +237,14 @@ fn interest_delta(line: &Line, now: u64) -> i128 {
     (line.drawn * line.rate_bps as i128 * elapsed) / SECONDS_PER_YEAR / BPS_DENOMINATOR
 }
 
-/// Recomputes debt, collateral value, and LTV for `line` from a fresh guarded price read. Doesn't
-/// persist anything — read-only, used by the `ltv` view, `poke`, `draw`, and `liquidate`.
-fn compute_ltv(env: &Env, line: &Line) -> LtvView {
-    read_ltv(env, line).0
-}
-
-/// Same as `compute_ltv`, also returning the guarded price the view was computed from.
-fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
+/// Recomputes debt, collateral value, and LTV for `line` using `units` from a fresh guarded price read.
+fn compute_ltv_with_units(env: &Env, line: &Line, units: i128) -> (LtvView, i128) {
     let config = read_asset_config(env, &line.asset);
     let guarded = PriceGuardClient::new(env, &config.price_guard).guarded_price(&line.asset);
 
     let debt = line.drawn + line.accrued_interest + interest_delta(line, env.ledger().timestamp());
     let collateral_value =
-        risk::collateral_value(line.pledged_units, guarded.value, config.haircut_bps);
+        risk::collateral_value(units, guarded.value, config.haircut_bps);
     let ltv_bps = risk::ltv_bps(debt, collateral_value);
     let margin_state = margin::classify(ltv_bps, &config.thresholds);
 
@@ -264,6 +258,17 @@ fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
         },
         guarded.value,
     )
+}
+
+/// Recomputes debt, collateral value, and LTV for `line` from a fresh guarded price read. Doesn't
+/// persist anything — read-only, used by the `ltv` view, `poke`, `draw`, and `liquidate`.
+fn compute_ltv(env: &Env, line: &Line) -> LtvView {
+    read_ltv(env, line).0
+}
+
+/// Same as `compute_ltv`, also returning the guarded price the view was computed from.
+fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
+    compute_ltv_with_units(env, line, line.pledged_units)
 }
 
 #[contract]
@@ -550,11 +555,21 @@ impl CreditLine {
     }
 
     /// Pure read (no auth): PRD §8 `{ debt, collateral_value, ltv_bps, state, price_status }`.
-    /// This is what `PledgeVault::release` cross-calls.
+    /// This is what consoles/tests call to inspect the line's current standing.
     pub fn ltv(env: Env, line: u64) -> LtvView {
         ttl::extend_instance(&env);
         let state = read_line(&env, line);
         compute_ltv(&env, &state)
+    }
+
+    /// Read-only: simulated LTV computed with credit-line's own config as if pledged units were
+    /// `new_units`. Used by `PledgeVault::release` so the vault never duplicates haircut,
+    /// thresholds, or PriceGuard address.
+    pub fn ltv_after(env: Env, line: u64, new_units: i128) -> LtvView {
+        ttl::extend_instance(&env);
+        assert!(new_units >= 0, "credit-line: units cannot be negative");
+        let state = read_line(&env, line);
+        compute_ltv_with_units(&env, &state, new_units).0
     }
 
     /// Permissionless: recomputes the margin state via a fresh price read and persists it, also
@@ -1480,5 +1495,38 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn ltv_after_computes_simulated_standing_using_credit_line_config() {
+        // Line has 5% haircut, $1.00 price, 7000/8000/9000 thresholds.
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let line = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+
+        // Sync 1,000 units pledged.
+        h.credit_line
+            .sync_collateral(&h.admin, &line, &(1_000 * PRICE_SCALE));
+        // Draw 500 USDC against it: debt = $500.
+        h.credit_line
+            .draw(&h.borrower, &line, &(500 * PRICE_SCALE), &Address::generate(&h.env));
+
+        // Current LTV with 1,000 units (collateral = 1,000 * 0.95 = $950): ~5263 bps (Healthy).
+        let current = h.credit_line.ltv(&line);
+        assert_eq!(current.state, MarginState::Healthy);
+        assert_eq!(current.collateral_value, 950 * PRICE_SCALE);
+
+        // ltv_after with 950 units: collateral = 950 * 0.95 = $902.50 -> ~5540 bps (Healthy).
+        let after_safe = h.credit_line.ltv_after(&line, &(950 * PRICE_SCALE));
+        assert_eq!(after_safe.state, MarginState::Healthy);
+        assert_eq!(after_safe.collateral_value, 902_5000000);
+
+        // ltv_after with 50 units: collateral = 50 * 0.95 = $47.50 -> >9000 bps (Liquidation).
+        let after_unsafe = h.credit_line.ltv_after(&line, &(50 * PRICE_SCALE));
+        assert_eq!(after_unsafe.state, MarginState::Liquidation);
+
+        // ltv_after does not modify the line's actual pledged units or margin state.
+        let unchanged = h.credit_line.ltv(&line);
+        assert_eq!(unchanged.collateral_value, current.collateral_value);
+        assert_eq!(unchanged.state, current.state);
     }
 }

@@ -71,10 +71,7 @@ if [[ -f .env ]]; then set_var .env PRICE_GUARD_CONTRACT_ID "$NEW"; fi
 log "Registering the NAV attestor key and requiring signatures"
 scripts/configure-nav-key.sh "$NETWORK"
 
-log "Pointing PledgeVault and CreditLine at it"
-inv --id "$PLEDGE_VAULT_CID" -- configure_asset \
-  --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$NEW" --credit_line "$CREDIT_LINE_CID" \
-  --haircut_bps 500 --thresholds "$THRESHOLDS" --custody_mode '"Escrow"' >/dev/null
+log "Pointing CreditLine at it"
 inv --id "$CREDIT_LINE_CID" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$NEW" --usdc "$USDC_SAC" \
   --haircut_bps 500 --thresholds "$THRESHOLDS" >/dev/null

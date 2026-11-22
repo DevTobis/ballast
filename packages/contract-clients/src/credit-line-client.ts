@@ -106,6 +106,11 @@ export class CreditLineClient extends BaseContractClient {
     return this.read<LtvView>("ltv", [scU64(line)]);
   }
 
+  /** Read-only: simulated LTV computed with line's own config as if pledged units were newUnits. */
+  ltvAfter(line: bigint, newUnits: bigint): Promise<LtvView> {
+    return this.read<LtvView>("ltv_after", [scU64(line), scI128(newUnits)]);
+  }
+
   /** Read-only: the line's raw on-chain state (principal `drawn`, `funded`, `pledgedUnits`...). */
   line(line: bigint): Promise<OnChainLine> {
     return this.read<OnChainLine>("line", [scU64(line)]);

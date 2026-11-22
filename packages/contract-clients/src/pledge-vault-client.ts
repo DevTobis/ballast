@@ -1,7 +1,32 @@
+import type { CustodyMode } from "@ballast/domain-types";
 import { BaseContractClient } from "./base-client.js";
-import { scAddress, scBytes, scI128, scU64 } from "./scval.js";
+import { enumToScVal, scAddress, scBytes, scI128, scU64 } from "./scval.js";
+
+const CUSTODY_MODE_VARIANT: Record<CustodyMode, string> = {
+  escrow: "Escrow",
+  issuer_lien: "IssuerLien",
+  custodian_lien: "CustodianLien",
+};
 
 export class PledgeVaultClient extends BaseContractClient {
+  /**
+   * Admin-only. Configures the asset with its linked credit line and custody mode.
+   * Haircut, thresholds, and PriceGuard are managed solely by CreditLine.
+   */
+  configureAsset(
+    source: string,
+    assetAddress: string,
+    creditLineAddress: string,
+    custodyMode: CustodyMode,
+  ): Promise<string> {
+    return this.invoke(source, "configure_asset", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scAddress(creditLineAddress),
+      enumToScVal(CUSTODY_MODE_VARIANT[custodyMode]),
+    ]);
+  }
+
   /**
    * `pledge` takes no custody-mode argument on-chain — the contract derives it from the asset's
    * own `configure_asset` record (an asset has one custody mode, a borrower doesn't choose one

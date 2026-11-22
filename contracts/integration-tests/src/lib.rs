@@ -148,10 +148,7 @@ fn setup_harness() -> TestHarness {
     pledge_vault.configure_asset(
         &admin,
         &rwa_id,
-        &pg_id,
         &cl_id,
-        &1_000,
-        &thresholds,
         &CustodyMode::Escrow,
     );
 
@@ -410,4 +407,87 @@ fn test_real_credit_line_and_pledge_vault_liquidation_with_surplus() {
     assert!(record.closed);
     assert_eq!(record.surplus, 50 * PRICE_SCALE);
     assert_eq!(record.shortfall, 0);
+}
+
+#[test]
+fn test_release_respects_credit_line_config_not_vault() {
+    let h = setup_harness();
+
+    let agreement = BytesN::from_array(&h.env, &[2u8; 32]);
+    let limit = 5_000 * PRICE_SCALE;
+    let line_id = h.credit_line.open(
+        &h.lender,
+        &h.borrower,
+        &h.rwa_id,
+        &limit,
+        &0,
+        &86_400,
+        &agreement,
+    );
+
+    // Fund and pledge
+    let fund_amount = 5_000 * PRICE_SCALE;
+    h.usdc.mint(&h.lender, &fund_amount);
+    h.credit_line.fund(&h.lender, &line_id, &fund_amount);
+
+    let pledge_units = 1_000 * PRICE_SCALE;
+    h.rwa.mint(&h.borrower, &pledge_units);
+    h.pledge_vault
+        .pledge(&h.borrower, &line_id, &h.rwa_id, &pledge_units);
+
+    // Draw 600 USDC: with price $2.00 and 10% haircut (1000 bps),
+    // 1000 units = $1800 collateral value -> LTV = 3333 bps (Healthy).
+    let draw_amount = 600 * PRICE_SCALE;
+    let borrower_wallet = Address::generate(&h.env);
+    h.credit_line
+        .draw(&h.borrower, &line_id, &draw_amount, &borrower_wallet);
+
+    // Reconfigure CreditLine to 50% haircut (5,000 bps) without touching PledgeVault
+    // (PledgeVault stores no haircut or thresholds).
+    let strict_thresholds = MarginThresholds {
+        warning_bps: 7_000,
+        margin_call_bps: 8_000,
+        liquidation_bps: 9_000,
+    };
+    h.credit_line.configure_asset(
+        &h.admin,
+        &h.rwa_id,
+        &h.price_guard.address,
+        &h.usdc_id,
+        &5_000,
+        &strict_thresholds,
+    );
+
+    // Releasing 400 units:
+    // Remaining units = 600.
+    // If haircut were 0%: value = 600 * $2 = $1,200 -> LTV = 600 / 1200 = 50% (Healthy).
+    // But CreditLine has 50% haircut: value = 600 * $2 * 0.50 = $600 -> LTV = 600 / 600 = 100% (> 9,000 bps Liquidation).
+    // PledgeVault::release cross-calls CreditLine::ltv_after and must reject the release!
+    let release_units = 400 * PRICE_SCALE;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.pledge_vault
+            .release(&h.borrower, &line_id, &h.rwa_id, &release_units);
+    }));
+    assert!(
+        res.is_err(),
+        "release must be refused based on credit-line's own haircut"
+    );
+
+    // Now restore CreditLine haircut to 10% (1,000 bps):
+    // Remaining units = 600 -> value = 600 * $2 * 0.90 = $1,080 -> LTV = 600 / 1080 = 55.5% (Healthy).
+    // Releasing 400 units now succeeds immediately without reconfiguring the vault!
+    h.credit_line.configure_asset(
+        &h.admin,
+        &h.rwa_id,
+        &h.price_guard.address,
+        &h.usdc_id,
+        &1_000,
+        &strict_thresholds,
+    );
+    h.pledge_vault
+        .release(&h.borrower, &line_id, &h.rwa_id, &release_units);
+    assert_eq!(
+        h.pledge_vault.position_units(&line_id, &h.rwa_id),
+        600 * PRICE_SCALE
+    );
 }

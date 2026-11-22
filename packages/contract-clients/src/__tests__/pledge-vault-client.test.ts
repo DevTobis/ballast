@@ -32,4 +32,10 @@ describe("PledgeVaultClient", () => {
     const xdr = await client.recordLien(source, 1n, asset, 500n, Buffer.from("lien-ref"));
     expect(xdr.length).toBeGreaterThan(0);
   });
+
+  it("configureAsset() returns non-empty unsigned XDR", async () => {
+    const creditLine = randomAccountId();
+    const xdr = await client.configureAsset(source, asset, creditLine, "escrow");
+    expect(xdr.length).toBeGreaterThan(0);
+  });
 });
