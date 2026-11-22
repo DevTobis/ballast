@@ -139,7 +139,7 @@ enum DataKey {
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
 /// NAV message's `ts`/`value` segments on-chain — mirrors `alloc_free_sort` above in spirit
 /// (stack-only buffers, no heap).
-mod decimal_ascii {
+pub(crate) mod decimal_ascii {
     use soroban_sdk::{Bytes, Env};
 
     /// u64::MAX is 20 digits.
@@ -2810,6 +2810,183 @@ mod test {
         // Real admin succeeds.
         env.mock_all_auths();
         client.remove_source(&admin, &asset, &feed_name);
+    }
+
+    // Issue #116: Test publish_nav failure modes: unconfigured asset and missing issuer key
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn publish_nav_unconfigured_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let unconfigured_asset = Address::generate(&env);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &unconfigured_asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic(expected = "no issuer public key configured")]
+    fn publish_nav_missing_issuer_key_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let asset = Address::generate(&env);
+        client.configure_asset(
+            &admin,
+            &asset,
+            &50,
+            &100,
+            &DEFAULT_WINDOW_SECONDS,
+            &DEFAULT_WINDOW_MOVE_BAND_BPS,
+            &3600,
+        );
+
+        // Signature requirement is enabled by default, but configure_issuer_key is not called.
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    }
+
+    #[test]
+    fn publish_nav_with_signature_requirement_off_succeeds_without_issuer_key() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let asset = Address::generate(&env);
+        client.configure_asset(
+            &admin,
+            &asset,
+            &50,
+            &100,
+            &DEFAULT_WINDOW_SECONDS,
+            &DEFAULT_WINDOW_MOVE_BAND_BPS,
+            &3600,
+        );
+
+        // Turn signature requirement off
+        client.configure_signature_requirement(&admin, &false);
+
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+
+        // Verify guarded price can be queried
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Degraded);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn guarded_price_unconfigured_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let unconfigured_asset = Address::generate(&env);
+        client.guarded_price(&unconfigured_asset);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn publish_source_unconfigured_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let unconfigured_asset = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        client.publish_source(
+            &publisher,
+            &unconfigured_asset,
+            &Symbol::new(&env, "redston"),
+            &SCALE,
+            &now,
+        );
+    }
+
+    // Issue #121: Test the decimal_ascii u64 and i128 encoders against std formatting
+    #[test]
+    fn decimal_ascii_u64_matches_std_formatting() {
+        let env = Env::default();
+        let vectors: [u64; 5] = [
+            0,
+            9,
+            10,
+            1_700_000_000,
+            u64::MAX,
+        ];
+
+        for n in vectors {
+            let bytes = decimal_ascii::u64_to_bytes(&env, n);
+            let expected = format!("{}", n);
+            let mut actual = [0u8; 32];
+            let len = bytes.len() as usize;
+            bytes.copy_into_slice(&mut actual[..len]);
+            assert_eq!(&actual[..len], expected.as_bytes(), "Mismatch for u64: {n}");
+            if n == u64::MAX {
+                assert_eq!(bytes.len(), 20, "u64::MAX must fill 20 digits");
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_ascii_i128_matches_std_formatting() {
+        let env = Env::default();
+        let vectors: [i128; 6] = [
+            0,
+            1,
+            -1,
+            10_000_000,
+            i128::MAX,
+            i128::MIN,
+        ];
+
+        for n in vectors {
+            let bytes = decimal_ascii::i128_to_bytes(&env, n);
+            let expected = format!("{}", n);
+            let mut actual = [0u8; 64];
+            let len = bytes.len() as usize;
+            bytes.copy_into_slice(&mut actual[..len]);
+            assert_eq!(&actual[..len], expected.as_bytes(), "Mismatch for i128: {n}");
+            if n == i128::MIN {
+                assert_eq!(bytes.len(), 40, "i128::MIN must be exactly 40 bytes (39 digits + minus)");
+            }
+        }
     }
 
     mod invariants;
