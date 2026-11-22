@@ -395,8 +395,12 @@ done
 
 log "Requiring NAV signatures"
 if step_done SIGNATURES; then log "  already required, skipping"; else
-  run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
-    --admin "$ADMIN" --required true >/dev/null
+  for row in "${MAINNET_ASSETS[@]}"; do
+    IFS=$'\t' read -r CODE ISSUER CCY <<<"$row"
+    SAC=$(retry stellar contract id asset --asset "$CODE:$ISSUER" --network "$NETWORK")
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
+      --admin "$ADMIN" --asset "$SAC" --required true >/dev/null
+  done
   mark_step SIGNATURES
 fi
 

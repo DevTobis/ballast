@@ -32,13 +32,18 @@
 //! representation this contract can cheaply reconstruct) so both sides build byte-for-byte the
 //! same message.
 //!
-//! An admin-settable `require_nav_signature` flag (default `true`, global — not per-asset; see
+//! An admin-settable `require_nav_signature` flag (default `true`, per-asset; see
 //! `configure_signature_requirement`) exists as a local-testing/bring-up affordance: a fresh
 //! local/testnet deploy has no issuer keys registered yet, and forcing signature checks on from
 //! the very first `publish_nav` call would brick the smoke-test flow before anyone's had a chance
 //! to run `configure_issuer_key`. It is NOT a security control — production deploys should leave
 //! it at its default `true` once real issuer keys are configured. See `contracts/README.md` for
 //! the testnet-smoke-flow implication.
+//!
+//! All per-asset state (`Config`, `LastGood`, `Halted`, `PendingHaltValue`, `IssuerPubKey`,
+//! `SourceNames`, `NavRecord`, `RollingReference`, `LastStatus`, `RequireNavSignature`) lives in
+//! persistent storage with TTL extended on access, keeping the single instance storage entry
+//! size independent of asset count.
 //!
 //! The real trust boundary is still `require_price_publisher`'s `require_auth()`: only the
 //! configured off-chain publisher may call `publish_nav`/`publish_source` at all. Signature
@@ -106,7 +111,7 @@ pub enum ConfigChange {
     MaxStalenessSeconds(Address, u64),
     Asset(Address, u32, u32, u64, u32, u64),
     IssuerPubKey(Address, BytesN<32>),
-    RequireNavSignature(bool),
+    RequireNavSignature(Address, bool),
 }
 
 #[contracttype]
@@ -131,6 +136,7 @@ enum DataKey {
     /// One raw reading per (asset, source-name) — `publish_nav`/`publish_source` overwrite the
     /// prior reading for that source each time, matching PRD §6.4's "per-source" inputs table.
     Source(Address, Symbol),
+    SourceNames(Address),
     NavRecord(Address),
     /// The last guarded value that reached `Ok` status, returned by `guarded_price` whenever the
     /// live computation comes back `Degraded`/`Halted` (PRD §6.4: "existing positions keep the
@@ -149,9 +155,9 @@ enum DataKey {
     /// `configure_issuer_key`. `publish_nav` verifies `sig` against this when
     /// `require_nav_signature` is `true`.
     IssuerPubKey(Address),
-    /// Global (not per-asset) admin-settable flag, default `true` when unset — see the module doc
+    /// Per-asset admin-settable flag, default `true` when unset — see the module doc
     /// comment on why this exists and why it isn't a security control.
-    RequireNavSignature,
+    RequireNavSignature(Address),
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
@@ -215,18 +221,24 @@ fn build_nav_message(env: &Env, asset_code: &Bytes, ts: u64, value: i128) -> Byt
     message
 }
 
-fn require_nav_signature(env: &Env) -> bool {
-    env.storage()
-        .instance()
-        .get(&DataKey::RequireNavSignature)
-        .unwrap_or(true)
+fn require_nav_signature(env: &Env, asset: &Address) -> bool {
+    let key = DataKey::RequireNavSignature(asset.clone());
+    let res: Option<bool> = env.storage().persistent().get(&key);
+    if res.is_some() {
+        ttl::extend_persistent(env, &key);
+    }
+    res.unwrap_or(true)
 }
 
 fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
-    env.storage()
-        .instance()
-        .get(&DataKey::Config(asset.clone()))
-        .expect("price-guard: asset not configured")
+    let key = DataKey::Config(asset.clone());
+    let config: AssetGuardConfig = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .expect("price-guard: asset not configured");
+    ttl::extend_persistent(env, &key);
+    config
 }
 
 fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed_at: u64) {
@@ -247,23 +259,24 @@ fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed
 /// prefix", so this skeleton tracks the known source names explicitly per asset rather than
 /// scanning storage — a short, explicit list, updated on first publish of a new source name.
 fn track_source_name(env: &Env, asset: &Address, name: &Symbol) {
-    let names_key = (Symbol::new(env, "src_names"), asset.clone());
+    let names_key = DataKey::SourceNames(asset.clone());
     let mut names: Vec<Symbol> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&names_key)
         .unwrap_or_else(|| Vec::new(env));
     if !names.contains(name) {
         names.push_back(name.clone());
-        env.storage().instance().set(&names_key, &names);
+        env.storage().persistent().set(&names_key, &names);
     }
+    ttl::extend_persistent(env, &names_key);
 }
 
 fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
-    let names_key = (Symbol::new(env, "src_names"), asset.clone());
+    let names_key = DataKey::SourceNames(asset.clone());
     let names: Vec<Symbol> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&names_key)
         .unwrap_or_else(|| Vec::new(env));
     if let Some(idx) = names.first_index_of(name) {
@@ -273,26 +286,32 @@ fn remove_source_internal(env: &Env, asset: &Address, name: &Symbol) {
                 new_names.push_back(n);
             }
         }
-        env.storage().instance().set(&names_key, &new_names);
+        env.storage().persistent().set(&names_key, &new_names);
+        ttl::extend_persistent(env, &names_key);
     }
     let key = DataKey::Source(asset.clone(), name.clone());
     env.storage().persistent().remove(&key);
 }
 
 fn read_all_sources(env: &Env, asset: &Address) -> Vec<PriceSource> {
-    let names_key = (Symbol::new(env, "src_names"), asset.clone());
+    let names_key = DataKey::SourceNames(asset.clone());
     let names: Vec<Symbol> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&names_key)
         .unwrap_or_else(|| Vec::new(env));
+    if env.storage().persistent().has(&names_key) {
+        ttl::extend_persistent(env, &names_key);
+    }
     let mut out = Vec::new(env);
     for name in names.iter() {
+        let key = DataKey::Source(asset.clone(), name.clone());
         if let Some(source) = env
             .storage()
             .persistent()
-            .get::<_, PriceSource>(&DataKey::Source(asset.clone(), name.clone()))
+            .get::<_, PriceSource>(&key)
         {
+            ttl::extend_persistent(env, &key);
             out.push_back(source);
         }
     }
@@ -391,28 +410,33 @@ fn within_band(values: &[i128], band_bps: u32) -> bool {
 /// previous one (an asset with no recorded status counts as coming from `Degraded`).
 fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, value: i128) {
     let key = DataKey::LastStatus(asset.clone());
-    let prev: Option<PriceStatus> = env.storage().instance().get(&key);
+    let prev: Option<PriceStatus> = env.storage().persistent().get(&key);
     let changed = match &prev {
         Some(from) => from != &to,
         None => true,
     };
     if changed {
         let from = prev.unwrap_or(PriceStatus::Degraded);
-        env.storage().instance().set(&key, &to);
+        env.storage().persistent().set(&key, &to);
+        ttl::extend_persistent(env, &key);
         env.events().publish(
             (Symbol::new(env, "status_changed"), asset.clone()),
             (from, to, value),
         );
+    } else {
+        ttl::extend_persistent(env, &key);
     }
 }
 
 /// Reads the `LastGood` baseline. A value stored by an earlier version as a bare `i128` decodes
 /// with `ts = 0` until the next `Ok` evaluation rewrites it.
 fn read_last_good(env: &Env, asset: &Address) -> Option<LastGood> {
+    let key = DataKey::LastGood(asset.clone());
     let raw: Val = env
         .storage()
-        .instance()
-        .get(&DataKey::LastGood(asset.clone()))?;
+        .persistent()
+        .get(&key)?;
+    ttl::extend_persistent(env, &key);
     if let Ok(value) = i128::try_from_val(env, &raw) {
         return Some(LastGood { value, ts: 0 });
     }
@@ -420,9 +444,11 @@ fn read_last_good(env: &Env, asset: &Address) -> Option<LastGood> {
 }
 
 fn write_last_good(env: &Env, asset: &Address, value: i128, ts: u64) {
+    let key = DataKey::LastGood(asset.clone());
     env.storage()
-        .instance()
-        .set(&DataKey::LastGood(asset.clone()), &LastGood { value, ts });
+        .persistent()
+        .set(&key, &LastGood { value, ts });
+    ttl::extend_persistent(env, &key);
 }
 
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
@@ -452,15 +478,17 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let last_good = read_last_good(env, &asset);
     let last_good_val = last_good.as_ref().map(|lg| lg.value);
     let last_good_ts = last_good.as_ref().map_or(0, |lg| lg.ts);
+    let halted_key = DataKey::Halted(asset.clone());
     let already_halted: bool = env
         .storage()
-        .instance()
-        .get(&DataKey::Halted(asset.clone()))
+        .persistent()
+        .get(&halted_key)
         .unwrap_or(false);
 
     let now = env.ledger().timestamp();
 
     if already_halted {
+        ttl::extend_persistent(env, &halted_key);
         let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Halted, val);
         return GuardedPrice {
@@ -514,12 +542,16 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         if last > 0 {
             let move_bps = (((median_value - last).abs()) * 10_000) / last;
             if move_bps > config.daily_move_band_bps as i128 {
+                let halted_key = DataKey::Halted(asset.clone());
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Halted(asset.clone()), &true);
+                    .persistent()
+                    .set(&halted_key, &true);
+                ttl::extend_persistent(env, &halted_key);
+                let pending_key = DataKey::PendingHaltValue(asset.clone());
                 env.storage()
-                    .instance()
-                    .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                    .persistent()
+                    .set(&pending_key, &median_value);
+                ttl::extend_persistent(env, &pending_key);
                 env.events().publish(
                     (Symbol::new(env, "halt_latched"), asset.clone()),
                     (last, median_value),
@@ -540,25 +572,37 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     // each individual step. The reference is refreshed at most once per `window_seconds`, so a
     // publisher ramping the price a little on every publish eventually trips the window band even
     // though every single step passed the daily band.
+    let ref_key = DataKey::RollingReference(asset.clone());
     let rolling_ref: Option<i128> = env
         .storage()
-        .instance()
-        .get(&DataKey::RollingReference(asset.clone()));
+        .persistent()
+        .get(&ref_key);
+    if rolling_ref.is_some() {
+        ttl::extend_persistent(env, &ref_key);
+    }
+    let ref_ts_key = DataKey::RollingReferenceUpdated(asset.clone());
     let rolling_ref_ts: Option<u64> = env
         .storage()
-        .instance()
-        .get(&DataKey::RollingReferenceUpdated(asset.clone()));
+        .persistent()
+        .get(&ref_ts_key);
+    if rolling_ref_ts.is_some() {
+        ttl::extend_persistent(env, &ref_ts_key);
+    }
 
     if let Some(reference) = rolling_ref {
         if reference > 0 {
             let drift_bps = (((median_value - reference).abs()) * 10_000) / reference;
             if drift_bps > config.window_move_band_bps as i128 {
+                let halted_key = DataKey::Halted(asset.clone());
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Halted(asset.clone()), &true);
+                    .persistent()
+                    .set(&halted_key, &true);
+                ttl::extend_persistent(env, &halted_key);
+                let pending_key = DataKey::PendingHaltValue(asset.clone());
                 env.storage()
-                    .instance()
-                    .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                    .persistent()
+                    .set(&pending_key, &median_value);
+                ttl::extend_persistent(env, &pending_key);
                 // Report the last good value, like every other Halted path, not the older reference.
                 let held = last_good_val.unwrap_or(reference);
                 let held_ts = if last_good_val.is_some() {
@@ -585,12 +629,16 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     // Refresh the rolling reference only once per window. Leaving it in place between refreshes is
     // what makes a slow ramp accumulate against a fixed baseline instead of chasing the price.
     if rolling_ref_ts.map_or(true, |ts| now.saturating_sub(ts) >= config.window_seconds) {
+        let ref_key = DataKey::RollingReference(asset.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::RollingReference(asset.clone()), &median_value);
+            .persistent()
+            .set(&ref_key, &median_value);
+        ttl::extend_persistent(env, &ref_key);
+        let ref_ts_key = DataKey::RollingReferenceUpdated(asset.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::RollingReferenceUpdated(asset.clone()), &now);
+            .persistent()
+            .set(&ref_ts_key, &now);
+        ttl::extend_persistent(env, &ref_ts_key);
     }
 
     write_last_good(env, &asset, median_value, now);
@@ -729,10 +777,11 @@ impl PriceGuard {
         access::require_admin(&env);
         ttl::extend_instance(&env);
 
+        let config_key = DataKey::Config(asset.clone());
         let existing: Option<AssetGuardConfig> = env
             .storage()
-            .instance()
-            .get(&DataKey::Config(asset.clone()));
+            .persistent()
+            .get(&config_key);
         if let Some(old) = existing {
             let is_loosening = band_bps > old.band_bps
                 || daily_move_band_bps > old.daily_move_band_bps
@@ -745,8 +794,8 @@ impl PriceGuard {
             );
         }
 
-        env.storage().instance().set(
-            &DataKey::Config(asset.clone()),
+        env.storage().persistent().set(
+            &config_key,
             &AssetGuardConfig {
                 band_bps,
                 daily_move_band_bps,
@@ -755,10 +804,13 @@ impl PriceGuard {
                 max_staleness_s,
             },
         );
-        env.storage().instance().set(
-            &DataKey::LastStatus(asset.clone()),
+        ttl::extend_persistent(&env, &config_key);
+        let status_key = DataKey::LastStatus(asset.clone());
+        env.storage().persistent().set(
+            &status_key,
             &PriceStatus::Degraded,
         );
+        ttl::extend_persistent(&env, &status_key);
         env.events().publish(
             (Symbol::new(&env, "configure_asset"), asset),
             (
@@ -783,10 +835,11 @@ impl PriceGuard {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+        let key = DataKey::IssuerPubKey(asset.clone());
         let existing: Option<BytesN<32>> = env
             .storage()
-            .instance()
-            .get(&DataKey::IssuerPubKey(asset.clone()));
+            .persistent()
+            .get(&key);
         if let Some(old) = existing {
             assert!(
                 old == issuer_pubkey,
@@ -794,39 +847,42 @@ impl PriceGuard {
             );
         }
         env.storage()
-            .instance()
-            .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
+            .persistent()
+            .set(&key, &issuer_pubkey);
+        ttl::extend_persistent(&env, &key);
         env.events().publish(
             (Symbol::new(&env, "configure_issuer_key"), asset),
             issuer_pubkey,
         );
     }
 
-    /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all.
+    /// Admin-only. Per-asset toggle for whether `publish_nav` verifies `sig`.
     /// Tightening (requiring signatures) is immediate; loosening (disabling verification) requires 48h timelock.
-    pub fn configure_signature_requirement(env: Env, admin: Address, required: bool) {
+    pub fn configure_signature_requirement(env: Env, admin: Address, asset: Address, required: bool) {
         admin.require_auth();
         access::require_admin(&env);
         ttl::extend_instance(&env);
+        let key = DataKey::RequireNavSignature(asset.clone());
         let has_existing = env
             .storage()
-            .instance()
-            .has(&DataKey::RequireNavSignature);
+            .persistent()
+            .has(&key);
         if has_existing {
             let existing: bool = env
                 .storage()
-                .instance()
-                .get(&DataKey::RequireNavSignature)
+                .persistent()
+                .get(&key)
                 .unwrap_or(true);
             if existing && !required {
                 panic!("price-guard: disabling signature requirement must be queued via queue_config");
             }
         }
         env.storage()
-            .instance()
-            .set(&DataKey::RequireNavSignature, &required);
+            .persistent()
+            .set(&key, &required);
+        ttl::extend_persistent(&env, &key);
         env.events().publish(
-            (Symbol::new(&env, "configure_signature_requirement"),),
+            (Symbol::new(&env, "configure_signature_requirement"), asset),
             required,
         );
     }
@@ -907,61 +963,72 @@ impl PriceGuard {
 
         match pending.change.clone() {
             ConfigChange::BandBps(asset, val) => {
+                let key = DataKey::Config(asset.clone());
                 let mut config: AssetGuardConfig = env
                     .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
+                    .persistent()
+                    .get(&key)
                     .expect("price-guard: asset not configured");
                 config.band_bps = val;
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                    .persistent()
+                    .set(&key, &config);
+                ttl::extend_persistent(&env, &key);
             }
             ConfigChange::DailyMoveBandBps(asset, val) => {
+                let key = DataKey::Config(asset.clone());
                 let mut config: AssetGuardConfig = env
                     .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
+                    .persistent()
+                    .get(&key)
                     .expect("price-guard: asset not configured");
                 config.daily_move_band_bps = val;
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                    .persistent()
+                    .set(&key, &config);
+                ttl::extend_persistent(&env, &key);
             }
             ConfigChange::WindowSeconds(asset, val) => {
+                let key = DataKey::Config(asset.clone());
                 let mut config: AssetGuardConfig = env
                     .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
+                    .persistent()
+                    .get(&key)
                     .expect("price-guard: asset not configured");
                 config.window_seconds = val;
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                    .persistent()
+                    .set(&key, &config);
+                ttl::extend_persistent(&env, &key);
             }
             ConfigChange::WindowMoveBandBps(asset, val) => {
+                let key = DataKey::Config(asset.clone());
                 let mut config: AssetGuardConfig = env
                     .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
+                    .persistent()
+                    .get(&key)
                     .expect("price-guard: asset not configured");
                 config.window_move_band_bps = val;
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                    .persistent()
+                    .set(&key, &config);
+                ttl::extend_persistent(&env, &key);
             }
             ConfigChange::MaxStalenessSeconds(asset, val) => {
+                let key = DataKey::Config(asset.clone());
                 let mut config: AssetGuardConfig = env
                     .storage()
-                    .instance()
-                    .get(&DataKey::Config(asset.clone()))
+                    .persistent()
+                    .get(&key)
                     .expect("price-guard: asset not configured");
                 config.max_staleness_s = val;
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                    .persistent()
+                    .set(&key, &config);
+                ttl::extend_persistent(&env, &key);
             }
             ConfigChange::Asset(asset, band, daily, win_sec, win_move, staleness) => {
+                let key = DataKey::Config(asset.clone());
                 let config = AssetGuardConfig {
                     band_bps: band,
                     daily_move_band_bps: daily,
@@ -970,18 +1037,23 @@ impl PriceGuard {
                     max_staleness_s: staleness,
                 };
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Config(asset), &config);
+                    .persistent()
+                    .set(&key, &config);
+                ttl::extend_persistent(&env, &key);
             }
             ConfigChange::IssuerPubKey(asset, key_val) => {
+                let key = DataKey::IssuerPubKey(asset);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::IssuerPubKey(asset), &key_val);
+                    .persistent()
+                    .set(&key, &key_val);
+                ttl::extend_persistent(&env, &key);
             }
-            ConfigChange::RequireNavSignature(val) => {
+            ConfigChange::RequireNavSignature(asset, val) => {
+                let key = DataKey::RequireNavSignature(asset);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::RequireNavSignature, &val);
+                    .persistent()
+                    .set(&key, &val);
+                ttl::extend_persistent(&env, &key);
             }
         }
         env.storage().persistent().remove(&key);
@@ -1003,22 +1075,29 @@ impl PriceGuard {
     /// Read-only inspection of an asset guard config.
     pub fn asset_config(env: Env, asset: Address) -> Option<AssetGuardConfig> {
         ttl::extend_instance(&env);
-        env.storage().instance().get(&DataKey::Config(asset))
+        let key = DataKey::Config(asset);
+        let res = env.storage().persistent().get(&key);
+        if res.is_some() {
+            ttl::extend_persistent(&env, &key);
+        }
+        res
     }
 
-    /// Read-only inspection of whether NAV signatures are required.
-    pub fn require_nav_signature(env: Env) -> bool {
+    /// Read-only inspection of whether NAV signatures are required for `asset`.
+    pub fn require_nav_signature(env: Env, asset: Address) -> bool {
         ttl::extend_instance(&env);
-        env.storage()
-            .instance()
-            .get(&DataKey::RequireNavSignature)
-            .unwrap_or(true)
+        require_nav_signature(&env, &asset)
     }
 
     /// Read-only inspection of an asset's issuer public key.
     pub fn issuer_pubkey(env: Env, asset: Address) -> Option<BytesN<32>> {
         ttl::extend_instance(&env);
-        env.storage().instance().get(&DataKey::IssuerPubKey(asset))
+        let key = DataKey::IssuerPubKey(asset);
+        let res = env.storage().persistent().get(&key);
+        if res.is_some() {
+            ttl::extend_persistent(&env, &key);
+        }
+        res
     }
 
     /// Read-only: the halt latch for `asset`. `None` while the asset is not halted. While halted,
@@ -1026,17 +1105,24 @@ impl PriceGuard {
     /// promote, so a risk operator can check both before confirming.
     pub fn halt_info(env: Env, asset: Address) -> Option<HaltInfo> {
         ttl::extend_instance(&env);
+        let halted_key = DataKey::Halted(asset.clone());
         let halted: bool = env
             .storage()
-            .instance()
-            .get(&DataKey::Halted(asset.clone()))
+            .persistent()
+            .get(&halted_key)
             .unwrap_or(false);
         if !halted {
             return None;
         }
+        ttl::extend_persistent(&env, &halted_key);
+        let pending_key = DataKey::PendingHaltValue(asset.clone());
+        let pending = env.storage().persistent().get(&pending_key);
+        if pending.is_some() {
+            ttl::extend_persistent(&env, &pending_key);
+        }
         Some(HaltInfo {
             last_good: read_last_good(&env, &asset).map(|lg| lg.value),
-            pending: env.storage().instance().get(&DataKey::PendingHaltValue(asset)),
+            pending,
         })
     }
 
@@ -1065,22 +1151,26 @@ impl PriceGuard {
         read_config(&env, &asset); // asserts the asset is configured
         require_sane_reading(&env, value, ts);
 
-        if require_nav_signature(&env) {
+        if require_nav_signature(&env, &asset) {
+            let key = DataKey::IssuerPubKey(asset.clone());
             let issuer_pubkey: BytesN<32> = env
                 .storage()
-                .instance()
-                .get(&DataKey::IssuerPubKey(asset.clone()))
+                .persistent()
+                .get(&key)
                 .expect("price-guard: no issuer public key configured for asset (call configure_issuer_key)");
+            ttl::extend_persistent(&env, &key);
             let message = build_nav_message(&env, &asset_code, ts, value);
             // Panics (traps the whole invocation) if `sig` doesn't verify — see
             // `soroban_sdk::crypto::Crypto::ed25519_verify`'s doc comment.
             env.crypto().ed25519_verify(&issuer_pubkey, &message, &sig);
         }
 
-        env.storage().instance().set(
-            &DataKey::NavRecord(asset.clone()),
+        let nav_key = DataKey::NavRecord(asset.clone());
+        env.storage().persistent().set(
+            &nav_key,
             &NavRecord { value, ts, sig },
         );
+        ttl::extend_persistent(&env, &nav_key);
 
         let name = Symbol::new(&env, ISSUER_SOURCE);
         track_source_name(&env, &asset, &name);
@@ -1156,29 +1246,34 @@ impl PriceGuard {
 
         let now = env.ledger().timestamp();
         let mut new_last_good = 0i128;
+        let pending_key = DataKey::PendingHaltValue(asset.clone());
         if let Some(pending) = env
             .storage()
-            .instance()
-            .get::<_, i128>(&DataKey::PendingHaltValue(asset.clone()))
+            .persistent()
+            .get::<_, i128>(&pending_key)
         {
             write_last_good(&env, &asset, pending, now);
             new_last_good = pending;
+            let ref_key = DataKey::RollingReference(asset.clone());
             env.storage()
-                .instance()
-                .set(&DataKey::RollingReference(asset.clone()), &pending);
+                .persistent()
+                .set(&ref_key, &pending);
+            ttl::extend_persistent(&env, &ref_key);
+            let ref_ts_key = DataKey::RollingReferenceUpdated(asset.clone());
             env.storage()
-                .instance()
+                .persistent()
                 .set(
-                    &DataKey::RollingReferenceUpdated(asset.clone()),
+                    &ref_ts_key,
                     &now,
                 );
+            ttl::extend_persistent(&env, &ref_ts_key);
             env.storage()
-                .instance()
-                .remove(&DataKey::PendingHaltValue(asset.clone()));
+                .persistent()
+                .remove(&pending_key);
         } else if let Some(last) = read_last_good(&env, &asset) {
             new_last_good = last.value;
         }
-        env.storage().instance().remove(&DataKey::Halted(asset.clone()));
+        env.storage().persistent().remove(&DataKey::Halted(asset.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "halt_cleared"), asset.clone()),
@@ -1190,6 +1285,7 @@ impl PriceGuard {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
     /// Default rolling window used by most tests: 24h, with a 1% (100 bp) window band. A publisher
@@ -1246,7 +1342,7 @@ mod test {
         // These tests exercise the median/band/staleness/halt logic, not signature verification
         // (which has its own dedicated tests below) — turn the check off so a zero-filled `sig`
         // doesn't panic every call here.
-        client.configure_signature_requirement(&admin, &false);
+        client.configure_signature_requirement(&admin, &asset, &false);
 
         (env, client, admin, price_publisher, risk, asset)
     }
@@ -1399,7 +1495,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
@@ -1421,7 +1517,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         // Signed over a DIFFERENT value than what's actually published -> verification must fail.
@@ -1623,7 +1719,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
@@ -1639,7 +1735,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let sig = sign_nav(&env, &signing_key, &code, now + 1, SCALE);
@@ -1654,7 +1750,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, _signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let other_signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
         let now = env.ledger().timestamp();
@@ -1670,7 +1766,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, _signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         let now = env.ledger().timestamp();
         let random_sig = BytesN::from_array(&env, &[0x5au8; 64]);
@@ -1687,7 +1783,7 @@ mod test {
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
         client.configure_issuer_key(&admin, &asset, &pubkey);
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
 
         env.ledger().set_timestamp(1_000);
         let now = env.ledger().timestamp();
@@ -2145,7 +2241,7 @@ mod test {
         assert!(has_event(&events, "configure_issuer_key"), "configure_issuer_key event must be emitted");
 
         // 3. configure_signature_requirement event
-        client.configure_signature_requirement(&admin, &false);
+        client.configure_signature_requirement(&admin, &asset, &false);
         let events = env.events().all();
         assert!(has_event(&events, "configure_signature_requirement"), "configure_signature_requirement event must be emitted");
 
@@ -2237,7 +2333,7 @@ mod test {
     fn a_stranger_cannot_configure_signature_requirement() {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         use soroban_sdk::IntoVal;
-        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(50, 100, 3600);
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
         let stranger = Address::generate(&env);
 
         env.mock_auths(&[MockAuth {
@@ -2245,19 +2341,19 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "configure_signature_requirement",
-                args: (stranger.clone(), true).into_val(&env),
+                args: (stranger.clone(), asset.clone(), true).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_signature_requirement(&stranger, &true);
+            client.configure_signature_requirement(&stranger, &asset, &true);
         }));
         assert!(result.is_err(), "only the stored admin may configure signature requirement");
 
         // Scoped auths cannot be built for generated contract addresses, so the real admin's
         // success path runs under mock_all_auths like the rest of this module.
         env.mock_all_auths();
-        client.configure_signature_requirement(&admin, &true);
+        client.configure_signature_requirement(&admin, &asset, &true);
     }
 
     #[test]
@@ -2497,18 +2593,18 @@ mod test {
 
     #[test]
     fn timelock_signature_requirement_tighten_vs_loosen() {
-        let (env, client, admin, _publisher, _risk, _asset) = setup_with_admin(100, 200, 3600);
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
 
-        client.configure_signature_requirement(&admin, &true);
-        assert_eq!(client.require_nav_signature(), true);
+        client.configure_signature_requirement(&admin, &asset, &true);
+        assert_eq!(client.require_nav_signature(&asset), true);
 
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_signature_requirement(&admin, &false);
+            client.configure_signature_requirement(&admin, &asset, &false);
         }));
         assert!(res.is_err(), "disabling signature requirement directly must fail");
 
         let t0 = env.ledger().timestamp();
-        let id = client.queue_config(&admin, &ConfigChange::RequireNavSignature(false));
+        let id = client.queue_config(&admin, &ConfigChange::RequireNavSignature(asset.clone(), false));
 
         let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.execute_config(&id);
@@ -2521,7 +2617,7 @@ mod test {
         });
 
         client.execute_config(&id);
-        assert_eq!(client.require_nav_signature(), false);
+        assert_eq!(client.require_nav_signature(&asset), false);
     }
 
     #[test]
@@ -3003,7 +3099,7 @@ mod test {
         // Simulate a pre-migration contract instance that stored a bare i128 under DataKey::LastGood.
         env.as_contract(&client.address, || {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::LastGood(asset.clone()), &SCALE);
         });
 
@@ -3026,6 +3122,156 @@ mod test {
         assert_eq!(degraded_upgraded.status, PriceStatus::Degraded);
         assert_eq!(degraded_upgraded.value, SCALE);
         assert_eq!(degraded_upgraded.ts, 3_000);
+    }
+
+    #[test]
+    fn nav_signature_requirement_is_per_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let asset_a = Address::generate(&env);
+        let asset_b = Address::generate(&env);
+
+        client.configure_asset(&admin, &asset_a, &50, &100, &86_400, &100, &3600);
+        client.configure_asset(&admin, &asset_b, &50, &100, &86_400, &100, &3600);
+
+        // Asset B registers an issuer key and keeps the default require_nav_signature == true
+        let (pubkey_b, signing_key_b) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset_b, &pubkey_b);
+
+        // Asset A has signature requirement disabled
+        client.configure_signature_requirement(&admin, &asset_a, &false);
+
+        assert_eq!(client.require_nav_signature(&asset_a), false);
+        assert_eq!(client.require_nav_signature(&asset_b), true);
+
+        let code_a = Bytes::from_slice(&env, b"ASSETA");
+        let code_b = Bytes::from_slice(&env, b"ASSETB");
+        let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // Asset A: unsigned / zero sig allowed!
+        client.publish_nav(&publisher, &asset_a, &code_a, &SCALE, &now, &zero_sig);
+
+        // Asset B: zero sig panics!
+        let invalid_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset_b, &code_b, &SCALE, &now, &zero_sig);
+        }));
+        assert!(invalid_b.is_err(), "asset B must require a valid signature");
+
+        // Asset B: valid sig succeeds!
+        let valid_sig_b = sign_nav(&env, &signing_key_b, &code_b, now, SCALE);
+        client.publish_nav(&publisher, &asset_b, &code_b, &SCALE, &now, &valid_sig_b);
+    }
+
+    #[test]
+    fn instance_storage_is_independent_of_asset_count_with_20_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+
+        let mut assets = std::vec::Vec::new();
+        for _ in 0..20 {
+            let asset = Address::generate(&env);
+            client.configure_asset(&admin, &asset, &50, &100, &86_400, &100, &3600);
+            assets.push(asset);
+        }
+
+        // Assert instance storage contains 0 per-asset keys (only Roles/instance metadata)
+        env.as_contract(&client.address, || {
+            for asset in assets.iter() {
+                assert!(!env.storage().instance().has(&DataKey::Config(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::LastGood(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::Halted(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::PendingHaltValue(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::IssuerPubKey(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::RequireNavSignature(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::LastStatus(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::SourceNames(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::NavRecord(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::RollingReference(asset.clone())));
+                assert!(!env.storage().instance().has(&DataKey::RollingReferenceUpdated(asset.clone())));
+
+                // And assert each asset's config lives in persistent storage
+                assert!(env.storage().persistent().has(&DataKey::Config(asset.clone())));
+            }
+        });
+    }
+
+    #[test]
+    fn per_asset_keys_are_persistent_and_ttl_extended_on_access() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_signature_requirement(&admin, &asset, &true);
+
+        let t0 = env.ledger().timestamp();
+        let sig = sign_nav(&env, &signing_key, &code, t0, SCALE);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &t0);
+
+        let config_key = DataKey::Config(asset.clone());
+        let last_good_key = DataKey::LastGood(asset.clone());
+        let issuer_key = DataKey::IssuerPubKey(asset.clone());
+        let req_sig_key = DataKey::RequireNavSignature(asset.clone());
+        let source_names_key = DataKey::SourceNames(asset.clone());
+        let source_key = DataKey::Source(asset.clone(), feed(&env));
+
+        env.as_contract(&client.address, || {
+            assert!(env.storage().persistent().has(&config_key));
+            assert!(env.storage().persistent().has(&last_good_key));
+            assert!(env.storage().persistent().has(&issuer_key));
+            assert!(env.storage().persistent().has(&req_sig_key));
+            assert!(env.storage().persistent().has(&source_names_key));
+            assert!(env.storage().persistent().has(&source_key));
+
+            assert_eq!(
+                env.storage().persistent().get_ttl(&config_key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+            assert_eq!(
+                env.storage().persistent().get_ttl(&last_good_key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+        });
+
+        // Advance ledger sequences so persistent TTL decreases
+        env.ledger().with_mut(|l| l.sequence_number += 505_000);
+
+        // Reading guarded price extends persistent TTL on access
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+
+        env.as_contract(&client.address, || {
+            assert_eq!(
+                env.storage().persistent().get_ttl(&config_key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+            assert_eq!(
+                env.storage().persistent().get_ttl(&last_good_key),
+                ballast_common::ttl::PERSISTENT_EXTEND_TO_LEDGERS
+            );
+        });
     }
 
     mod invariants;

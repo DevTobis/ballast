@@ -43,10 +43,14 @@ export class PriceGuardClient extends BaseContractClient {
     ]);
   }
 
-  /** Admin-only. Global (not per-asset) toggle for whether `publishNav` verifies `sig` on-chain —
+  /** Admin-only. Per-asset toggle for whether `publishNav` verifies `sig` on-chain —
    * see `configure_signature_requirement` in contracts/price-guard/src/lib.rs. */
-  configureSignatureRequirement(source: string, required: boolean): Promise<string> {
-    return this.invoke(source, "configure_signature_requirement", [scAddress(source), scBool(required)]);
+  configureSignatureRequirement(source: string, assetAddress: string, required: boolean): Promise<string> {
+    return this.invoke(source, "configure_signature_requirement", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scBool(required),
+    ]);
   }
 
   /**

@@ -16,7 +16,7 @@ To support real-time monitoring (PRD §11 alerts for `Degraded` and `Halted` sta
 |---|---|---|---|---|
 | `configure_asset` | `(Symbol("configure_asset"), asset: Address)` | `(band_bps: u32, daily_move_band_bps: u32, window_seconds: u64, window_move_band_bps: u32, max_staleness_s: u64)` | `configure_asset` | Emitted when an asset's guard thresholds and staleness bounds are configured or updated. |
 | `configure_issuer_key` | `(Symbol("configure_issuer_key"), asset: Address)` | `issuer_pubkey: BytesN<32>` | `configure_issuer_key` | Emitted when an asset's Ed25519 issuer public key is registered or rotated. |
-| `configure_signature_requirement` | `(Symbol("configure_signature_requirement"),)` | `required: bool` | `configure_signature_requirement` | Emitted when the global signature verification toggle is flipped. |
+| `configure_signature_requirement` | `(Symbol("configure_signature_requirement"), asset: Address)` | `required: bool` | `configure_signature_requirement` | Emitted when an asset's signature verification toggle is flipped. |
 | `nav_published` | `(Symbol("nav_published"), asset: Address)` | `(source: Symbol, value: i128, ts: u64)` | `publish_nav` | Emitted when an issuer-signed NAV reading is published. |
 | `source_published` | `(Symbol("source_published"), asset: Address)` | `(source: Symbol, value: i128, ts: u64)` | `publish_source` | Emitted when a secondary oracle feed (e.g., RedStone, redemption price) is published. |
 | `status_changed` | `(Symbol("status_changed"), asset: Address)` | `(from: PriceStatus, to: PriceStatus, value: i128)` | `evaluate` | Emitted whenever evaluation produces a `PriceStatus` differing from the previous status (`Ok`, `Degraded`, or `Halted`). |
@@ -48,8 +48,33 @@ None of these require auth and none change guard state.
 |---|---|---|
 | `asset_config(asset)` | `Option<AssetGuardConfig>` | Bands, window and staleness settings for the asset. |
 | `issuer_pubkey(asset)` | `Option<BytesN<32>>` | Ed25519 key `publish_nav` verifies against. |
-| `require_nav_signature()` | `bool` | Defaults to `true` when never configured. |
+| `require_nav_signature(asset)` | `bool` | Per-asset signature requirement flag (#95). Defaults to `true` when never configured for asset. |
 | `last_good(asset)` | `Option<i128>` | Last value that reached `Ok`; `None` if it never has. |
 | `halt_info(asset)` | `Option<HaltInfo>` | `None` unless the asset is halted. While halted, `last_good` is the baseline being held and `pending` is the value `confirm_halt_cleared` would promote. |
 
 Operators can read `halt_info` before calling `confirm_halt_cleared` to see both values.
+
+---
+
+## Storage Layout & Migration (#96)
+
+All per-asset state is stored in Soroban persistent storage rather than the single contract instance entry:
+- `DataKey::Config(Address)`
+- `DataKey::Source(Address, Symbol)`
+- `DataKey::SourceNames(Address)`
+- `DataKey::NavRecord(Address)`
+- `DataKey::LastGood(Address)`
+- `DataKey::RollingReference(Address)`
+- `DataKey::RollingReferenceUpdated(Address)`
+- `DataKey::Halted(Address)`
+- `DataKey::PendingHaltValue(Address)`
+- `DataKey::IssuerPubKey(Address)`
+- `DataKey::RequireNavSignature(Address)`
+- `DataKey::LastStatus(Address)`
+
+Only contract roles (`access::Roles`) and pending timelock entries live in instance / upgrade storage.
+Every per-asset entry's TTL is automatically extended on access (`ttl::extend_persistent`).
+
+### Migration / Redeploy Note
+When migrating from earlier versions that stored per-asset keys in instance storage:
+Because existing testnet/mainnet instances held per-asset state inside the single instance entry, deployments should be upgraded or redeployed via `scripts/redeploy-price-guard.sh`. Then re-run `configure_asset`, `configure_issuer_key`, and `configure_signature_requirement` for each asset to establish persistent entries.

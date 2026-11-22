@@ -108,16 +108,25 @@ This was a breaking change to `publish_nav`'s call signature. Both `scripts/depl
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
 — see `TESTNET_DEPLOYMENT.md`):
 
-- `scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
-  after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
-  key for its test `RWA1` asset.
+- `configure_signature_requirement` takes `--asset <Address>` (`configure_signature_requirement(admin, asset, required)`).
+  The requirement is per-asset rather than global (#95), defaulting to `true` when unset.
 - `scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
   bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
 
-`require_nav_signature` defaults to `true` on a fresh deploy (see the crate's module doc comment on
+`require_nav_signature(asset)` defaults to `true` on a fresh deploy (see the crate's module doc comment on
 why this flag exists — it's a local-testing/bring-up affordance, not a security control) — a real
 testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if
 it was ever turned off, and should leave it at its default `true` otherwise.
+
+### Storage Layout and Migration Note (#96)
+
+PriceGuard stores all per-asset state in persistent storage (`Config`, `LastGood`, `Halted`, `PendingHaltValue`,
+`IssuerPubKey`, `SourceNames`, `NavRecord`, `RollingReference`, `LastStatus`, `RequireNavSignature`), each with its
+own TTL extended on access, keeping the single contract instance entry size independent of asset count.
+
+For existing deployments that used legacy instance storage: redeploy PriceGuard (e.g. via `scripts/redeploy-price-guard.sh`)
+and re-run asset registration/configuration (`configure_asset`, `configure_issuer_key`, `configure_signature_requirement`)
+so entries are cleanly initialized in persistent storage.
 
 ## Rotating the price publisher without redeploying
 
@@ -146,7 +155,7 @@ stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
   configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
-  configure_signature_requirement --admin "$ADMIN" --required true
+  configure_signature_requirement --admin "$ADMIN" --asset "$RWA_SAC" --required true
 ```
 
 Update `PRICE_PUBLISHER` in `.env.<network>-deploy` before re-running
