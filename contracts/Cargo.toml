@@ -9,6 +9,7 @@ members = [
     "exit-desk",
     "repo-dvp",
     "integration-tests",
+    "ltv-view-wire-shape",
 ]
 
 [workspace.package]
