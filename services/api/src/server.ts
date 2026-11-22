@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { ZodError } from "zod";
+import { sql } from "drizzle-orm";
 import type { Database } from "@ballast/db";
 import { ContractRejectedError } from "@ballast/contract-clients";
 import { isTransientRpcError } from "@ballast/network-config";
@@ -140,6 +141,46 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   // GET /v1/assets and /v1/assets/:id/price are public per PRD §9 (no auth required to browse
   // supported assets/prices); everything else needs a resolved partyId.
   app.get("/healthz", { config: { public: true, rateLimit: false } }, async () => ({ ok: true }));
+
+  app.get("/readyz", { config: { public: true, rateLimit: false } }, async (_request, reply) => {
+    const TIMEOUT_MS = 3000;
+    const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+      Promise.race([
+        promise,
+        new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} check timed out`)), ms)),
+      ]);
+
+    let dbOk = false;
+    let rpcOk = false;
+
+    try {
+      if ((db as any).execute) {
+        await withTimeout((db as any).execute(sql`SELECT 1`), TIMEOUT_MS, "database");
+      }
+      dbOk = true;
+    } catch {
+      dbOk = false;
+    }
+
+    try {
+      if (chain.getLatestLedger) {
+        await withTimeout(chain.getLatestLedger(), TIMEOUT_MS, "rpc");
+      }
+      rpcOk = true;
+    } catch {
+      rpcOk = false;
+    }
+
+    const dependencies = {
+      database: dbOk ? "ok" : "failed",
+      rpc: rpcOk ? "ok" : "failed",
+    };
+
+    if (dbOk && rpcOk) {
+      return reply.code(200).send({ ok: true, dependencies });
+    }
+    return reply.code(503).send({ ok: false, dependencies });
+  });
 
   registerAuthRoutes(app, db, config);
 

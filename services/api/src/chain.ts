@@ -1,3 +1,4 @@
+import { rpc } from "@stellar/stellar-sdk";
 import { loadNetworkConfig } from "@ballast/network-config";
 import { getTxOutcome, sendSignedTx, txHashOf, type TxOutcome } from "@ballast/contract-clients";
 
@@ -10,6 +11,7 @@ export interface ChainGateway {
   txHash(envelopeXdr: string): string;
   send(signedXdr: string): Promise<string>;
   outcome(hash: string): Promise<TxOutcome>;
+  getLatestLedger?(): Promise<unknown>;
 }
 
 /**
@@ -23,5 +25,9 @@ export function getChainGateway(): ChainGateway {
     txHash: (envelopeXdr) => txHashOf(envelopeXdr, config().networkPassphrase),
     send: (signedXdr) => sendSignedTx(config(), signedXdr),
     outcome: (hash) => getTxOutcome(config(), hash),
+    getLatestLedger: async () => {
+      const server = new rpc.Server(config().rpcUrl);
+      return server.getLatestLedger();
+    },
   };
 }

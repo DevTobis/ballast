@@ -20,6 +20,15 @@ const createSchema = z.object({
   events: z.array(z.enum(DELIVERABLE_WEBHOOK_EVENTS)).min(1),
 });
 
+const patchSchema = z
+  .object({
+    url: z.string().min(1).max(2048).optional(),
+    events: z.array(z.enum(DELIVERABLE_WEBHOOK_EVENTS)).min(1).optional(),
+  })
+  .refine((data) => data.url !== undefined || data.events !== undefined, {
+    message: "at least one of url or events must be provided",
+  });
+
 export function registerWebhookRoutes(app: FastifyInstance, db: Database, config: ApiConfig): void {
   const allowHttp = process.env.NODE_ENV !== "production";
 
@@ -91,6 +100,51 @@ export function registerWebhookRoutes(app: FastifyInstance, db: Database, config
       .set({ active: false })
       .where(eq(schema.webhookSubscription.id, sub.id));
     return reply.code(204).send();
+  });
+
+  app.patch<{ Params: { id: string } }>("/v1/webhooks/subscriptions/:id", async (request, reply) => {
+    const [sub] = await db
+      .select()
+      .from(schema.webhookSubscription)
+      .where(
+        and(
+          eq(schema.webhookSubscription.id, request.params.id),
+          eq(schema.webhookSubscription.partyId, request.partyId),
+        ),
+      )
+      .limit(1);
+    if (!sub || !sub.active || sub.partyId !== request.partyId || sub.id !== request.params.id) {
+      return reply.code(404).send({ error: "subscription not found" });
+    }
+
+    const parsed = patchSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+
+    if (parsed.data.url !== undefined) {
+      try {
+        await assertSafeWebhookUrl(parsed.data.url, { allowHttp });
+      } catch (err) {
+        if (err instanceof UnsafeWebhookUrlError) return reply.code(400).send({ error: err.message });
+        throw err;
+      }
+    }
+
+    const updates: Partial<{ url: string; events: string[] }> = {};
+    if (parsed.data.url !== undefined) updates.url = parsed.data.url;
+    if (parsed.data.events !== undefined) updates.events = [...new Set(parsed.data.events)];
+
+    await db
+      .update(schema.webhookSubscription)
+      .set(updates)
+      .where(eq(schema.webhookSubscription.id, sub.id));
+
+    return reply.code(200).send({
+      id: sub.id,
+      url: updates.url ?? sub.url,
+      events: updates.events ?? sub.events,
+      active: sub.active,
+      createdAt: sub.createdAt,
+    });
   });
 
   app.get<{ Params: { id: string } }>("/v1/webhooks/subscriptions/:id/deliveries", async (request, reply) => {
