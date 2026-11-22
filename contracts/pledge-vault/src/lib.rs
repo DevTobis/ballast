@@ -1250,4 +1250,96 @@ mod test {
             }
         }
     }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: already initialized")]
+    fn initialize_twice_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let alt = Address::generate(&h.env);
+        h.vault.initialize(&alt, &alt, &alt, &alt, &alt);
+    }
+
+    #[test]
+    fn configure_asset_and_set_gateway_require_stored_admin() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let impostor = Address::generate(&h.env);
+        let alt_pg = Address::generate(&h.env);
+        let alt_cl = Address::generate(&h.env);
+
+        h.env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "configure_asset",
+                args: (
+                    impostor.clone(),
+                    h.asset.clone(),
+                    alt_pg.clone(),
+                    alt_cl.clone(),
+                    2_500u32,
+                    h.thresholds.clone(),
+                    CustodyMode::IssuerLien,
+                )
+                    .into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res_cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.configure_asset(
+                &impostor,
+                &h.asset,
+                &alt_pg,
+                &alt_cl,
+                &2_500,
+                &h.thresholds,
+                &CustodyMode::IssuerLien,
+            );
+        }));
+        assert!(res_cfg.is_err(), "impostor cannot reconfigure asset");
+
+        h.env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "set_gateway",
+                args: (impostor.clone(), impostor.clone()).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res_gw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.set_gateway(&impostor, &impostor);
+        }));
+        assert!(res_gw.is_err(), "impostor cannot set gateway");
+
+        h.env.as_contract(&h.vault.address, || {
+            let cfg = read_asset_config(&h.env, &h.asset);
+            assert_eq!(cfg.haircut_bps, 500);
+            assert_eq!(cfg.custody_mode, CustodyMode::Escrow);
+            let gw: Option<Address> = h.env.storage().instance().get(&DataKey::Gateway);
+            assert_eq!(gw, None);
+        });
+
+        h.env.mock_all_auths();
+        let gateway = Address::generate(&h.env);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &alt_pg,
+            &alt_cl,
+            &2_500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+        h.vault.set_gateway(&h.admin, &gateway);
+
+        h.env.as_contract(&h.vault.address, || {
+            let cfg = read_asset_config(&h.env, &h.asset);
+            assert_eq!(cfg.haircut_bps, 2_500);
+            assert_eq!(cfg.custody_mode, CustodyMode::IssuerLien);
+            let gw: Option<Address> = h.env.storage().instance().get(&DataKey::Gateway);
+            assert_eq!(gw, Some(gateway));
+        });
+    }
 }
