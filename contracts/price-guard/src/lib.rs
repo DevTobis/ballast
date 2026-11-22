@@ -1035,10 +1035,7 @@ impl PriceGuard {
             return None;
         }
         Some(HaltInfo {
-            last_good: env
-                .storage()
-                .instance()
-                .get(&DataKey::LastGood(asset.clone())),
+            last_good: read_last_good(&env, &asset).map(|lg| lg.value),
             pending: env.storage().instance().get(&DataKey::PendingHaltValue(asset)),
         })
     }
@@ -1047,7 +1044,7 @@ impl PriceGuard {
     /// while `Degraded` or `Halted`. `None` if the asset has never reached `Ok`.
     pub fn last_good(env: Env, asset: Address) -> Option<i128> {
         ttl::extend_instance(&env);
-        env.storage().instance().get(&DataKey::LastGood(asset))
+        read_last_good(&env, &asset).map(|lg| lg.value)
     }
 
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
