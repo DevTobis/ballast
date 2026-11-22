@@ -222,6 +222,13 @@ fn hash(h: &Harness, b: u8) -> BytesN<32> {
 }
 
 fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_at: u64) -> u64 {
+    // A trade's kind has to fit its term (#216): intraday up to a day out, a term repo beyond.
+    let term_seconds = maturity_at.saturating_sub(h.env.ledger().timestamp());
+    let kind = if term_seconds <= MAX_INTRADAY_TERM_SECONDS {
+        RepoKind::Intraday
+    } else {
+        RepoKind::Term
+    };
     RepoDvpClient::new(&h.env, &h.repo).propose(
         &h.cash_lender,
         &h.cash_borrower,
@@ -229,10 +236,172 @@ fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_
         &units,
         &cash_amount,
         &rate_bps,
-        &RepoKind::Intraday,
+        &kind,
         &maturity_at,
         &hash(h, 7),
     )
+}
+
+// --- #216: a repo's term has to fit its kind, and its rate has a ceiling -------------------
+
+/// Proposes 100 units against 90 cash with the given kind and rate, maturing `term_seconds`
+/// from now.
+fn propose_kind(h: &Harness, kind: &RepoKind, rate_bps: u32, term_seconds: u64) -> u64 {
+    RepoDvpClient::new(&h.env, &h.repo).propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &h.rwa,
+        &(100 * PRICE_SCALE),
+        &(90 * PRICE_SCALE),
+        &rate_bps,
+        kind,
+        &(h.env.ledger().timestamp() + term_seconds),
+        &hash(h, 7),
+    )
+}
+
+/// The same proposal through `try_propose`: whether it was refused.
+fn is_refused(h: &Harness, kind: &RepoKind, rate_bps: u32, term_seconds: u64) -> bool {
+    RepoDvpClient::new(&h.env, &h.repo)
+        .try_propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &h.rwa,
+            &(100 * PRICE_SCALE),
+            &(90 * PRICE_SCALE),
+            &rate_bps,
+            kind,
+            &(h.env.ledger().timestamp() + term_seconds),
+            &hash(h, 7),
+        )
+        .is_err()
+}
+
+#[test]
+fn the_bounds_are_the_ones_the_prd_names() {
+    assert_eq!(MAX_INTRADAY_TERM_SECONDS, 24 * 3_600);
+    assert_eq!(MAX_OVERNIGHT_TERM_SECONDS, 48 * 3_600);
+    assert_eq!(MAX_TERM_REPO_SECONDS, 30 * 24 * 3_600);
+    assert_eq!(MAX_OPEN_TERM_SECONDS, MAX_TERM_REPO_SECONDS);
+    assert_eq!(MAX_RATE_BPS, 10_000);
+}
+
+#[test]
+fn every_kind_accepts_a_term_of_exactly_its_bound() {
+    let h = setup();
+    for (kind, bound) in [
+        (RepoKind::Intraday, MAX_INTRADAY_TERM_SECONDS),
+        (RepoKind::Overnight, MAX_OVERNIGHT_TERM_SECONDS),
+        (RepoKind::Open, MAX_OPEN_TERM_SECONDS),
+        (RepoKind::Term, MAX_TERM_REPO_SECONDS),
+    ] {
+        let id = propose_kind(&h, &kind, 500, bound);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        assert_eq!(trade.kind, kind);
+        assert_eq!(trade.maturity_at, h.env.ledger().timestamp() + bound);
+    }
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: an intraday repo must mature within 24 hours")]
+fn an_intraday_repo_one_second_over_a_day_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, 500, MAX_INTRADAY_TERM_SECONDS + 1);
+}
+
+/// The input from the report: `Intraday`, maturing 400 days out.
+#[test]
+#[should_panic(expected = "repo-dvp: an intraday repo must mature within 24 hours")]
+fn an_intraday_repo_400_days_out_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, 500, 400 * 24 * 3_600);
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: an overnight repo must mature within 48 hours")]
+fn an_overnight_repo_one_second_over_two_days_is_refused() {
+    let h = setup();
+    propose_kind(
+        &h,
+        &RepoKind::Overnight,
+        500,
+        MAX_OVERNIGHT_TERM_SECONDS + 1,
+    );
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: an open repo must mature within 30 days")]
+fn an_open_repo_one_second_over_thirty_days_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Open, 500, MAX_OPEN_TERM_SECONDS + 1);
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: a term repo must mature within 30 days")]
+fn a_term_repo_one_second_over_thirty_days_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Term, 500, MAX_TERM_REPO_SECONDS + 1);
+}
+
+/// Each kind is held to its own bound, not to a shared one: 36 hours is too long for intraday
+/// only, and 3 days is too long for intraday and overnight.
+#[test]
+fn a_term_one_kind_refuses_is_accepted_under_a_longer_kind() {
+    let h = setup();
+    let thirty_six_hours = 36 * 3_600;
+    let three_days = 3 * 24 * 3_600;
+
+    assert!(is_refused(&h, &RepoKind::Intraday, 500, thirty_six_hours));
+    assert!(!is_refused(&h, &RepoKind::Overnight, 500, thirty_six_hours));
+    assert!(!is_refused(&h, &RepoKind::Open, 500, thirty_six_hours));
+    assert!(!is_refused(&h, &RepoKind::Term, 500, thirty_six_hours));
+
+    assert!(is_refused(&h, &RepoKind::Intraday, 500, three_days));
+    assert!(is_refused(&h, &RepoKind::Overnight, 500, three_days));
+    assert!(!is_refused(&h, &RepoKind::Open, 500, three_days));
+    assert!(!is_refused(&h, &RepoKind::Term, 500, three_days));
+}
+
+#[test]
+fn a_rate_of_zero_and_of_exactly_the_maximum_are_accepted() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    let free = propose_kind(&h, &RepoKind::Intraday, 0, 3_600);
+    assert_eq!(repo.trade(&free).rate_bps, 0);
+
+    let dearest = propose_kind(&h, &RepoKind::Intraday, MAX_RATE_BPS, 3_600);
+    assert_eq!(repo.trade(&dearest).rate_bps, MAX_RATE_BPS);
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: rate_bps exceeds the maximum rate")]
+fn a_rate_one_bp_over_the_maximum_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, MAX_RATE_BPS + 1, 3_600);
+}
+
+/// The rate from the report: 4,000,000,000 bps, forty million percent.
+#[test]
+#[should_panic(expected = "repo-dvp: rate_bps exceeds the maximum rate")]
+fn a_rate_of_four_billion_bps_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, 4_000_000_000, 3_600);
+}
+
+/// A proposal refused for its term or its rate leaves the lender's allowance at zero, and a
+/// proposal that fits then goes through as usual.
+#[test]
+fn a_proposal_refused_for_its_term_or_rate_grants_no_leg1_allowance() {
+    let h = setup();
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+
+    assert!(is_refused(&h, &RepoKind::Intraday, 500, 400 * 24 * 3_600));
+    assert!(is_refused(&h, &RepoKind::Intraday, MAX_RATE_BPS + 1, 3_600));
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), 0);
+
+    propose_kind(&h, &RepoKind::Intraday, 500, 3_600);
+    assert!(usdc.allowance(&h.cash_lender, &h.repo) >= 90 * PRICE_SCALE);
 }
 
 #[test]
@@ -979,18 +1148,57 @@ fn configure_asset_accepts_valid_thresholds() {
         },
     );
 
-    // Equal boundaries are valid
+    // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
     repo.configure_asset(
         &h.admin,
         &new_asset,
         &h.price_guard,
         &500u32,
         &MarginThresholds {
-            warning_bps: 8_000,
-            margin_call_bps: 8_000,
-            liquidation_bps: 8_000,
+            warning_bps: 9_998,
+            margin_call_bps: 9_999,
+            liquidation_bps: 10_000,
         },
     );
+}
+
+#[test]
+fn configure_asset_rejects_equal_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // warning == margin_call: Warning could never be reported (#78)
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res1.is_err(), "warning == margin_call must be rejected");
+
+    // margin_call == liquidation: MarginCall could never be reported (#78)
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "margin_call == liquidation must be rejected");
 }
 
 #[test]
@@ -1013,6 +1221,22 @@ fn configure_asset_rejects_zero_thresholds() {
         );
     }));
     assert!(res.is_err(), "zero thresholds must be rejected");
+
+    // A zero margin_call_bps alone: call_margin divides by it, so it must never be stored (#78)
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 0,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "zero margin_call_bps must be rejected");
 }
 
 #[test]
@@ -1695,5 +1919,375 @@ mod sac {
         let id = propose(&h, 100, 1_000, 500, h.env.ledger().timestamp() + 3_600);
         assert!(MockTokenClient::new(&h.env, &h.usdc).allowance(&h.cash_lender, &h.repo) >= 1_000);
         assert_eq!(RepoDvpClient::new(&h.env, &h.repo).trade(&id).status, RepoStatus::Proposed);
+    }
+}
+
+// --- #219: storage lifetime ------------------------------------------------------------------
+
+mod storage_lifetime {
+    use super::*;
+    use ballast_common::ttl::{INSTANCE_EXTEND_TO_LEDGERS, PERSISTENT_EXTEND_TO_LEDGERS};
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+
+    const DAY_LEDGERS: u32 = 17_280;
+    const THIRTY_DAYS: u64 = 30 * 24 * 3_600;
+    const THIRTY_DAYS_LEDGERS: u32 = 30 * DAY_LEDGERS;
+    const UNITS: i128 = 100 * PRICE_SCALE;
+    const CASH: i128 = 50 * PRICE_SCALE;
+
+    /// Ledgers a persistent entry of the repo contract has left.
+    fn entry_ttl(h: &Harness, key: &DataKey) -> u32 {
+        h.env
+            .as_contract(&h.repo, || h.env.storage().persistent().get_ttl(key))
+    }
+
+    fn trade_ttl(h: &Harness, id: u64) -> u32 {
+        entry_ttl(h, &DataKey::Trade(id))
+    }
+
+    fn instance_ttl(h: &Harness) -> u32 {
+        h.env
+            .as_contract(&h.repo, || h.env.storage().instance().get_ttl())
+    }
+
+    /// Moves the ledger on by `ledgers`, and the clock by the same stretch of time.
+    fn age(h: &Harness, ledgers: u32) {
+        h.env.ledger().with_mut(|li| {
+            li.sequence_number += ledgers;
+            li.timestamp += ledgers as u64 * SECONDS_PER_LEDGER;
+        });
+    }
+
+    /// Proposes a trade maturing `term_seconds` from now, without settling it.
+    fn proposed(h: &Harness, term_seconds: u64) -> u64 {
+        propose(
+            h,
+            UNITS,
+            CASH,
+            500,
+            h.env.ledger().timestamp() + term_seconds,
+        )
+    }
+
+    /// Funds both parties and settles `id`. The borrower is left with enough USDC to unwind.
+    fn settle(h: &Harness, id: u64) {
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &UNITS);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &CASH);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &CASH);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+    }
+
+    #[test]
+    fn propose_gives_a_trade_a_lifetime_past_its_maturity_and_the_unwind_grace() {
+        let h = setup();
+        let id = proposed(&h, THIRTY_DAYS);
+
+        let needed = THIRTY_DAYS_LEDGERS + UNWIND_ALLOWANCE_GRACE_LEDGERS;
+        assert!(trade_ttl(&h, id) >= needed, "trade: {}", trade_ttl(&h, id));
+        assert!(instance_ttl(&h) >= needed, "instance: {}", instance_ttl(&h));
+    }
+
+    #[test]
+    fn accept_and_settle_keeps_the_trade_and_the_borrowers_due_sum_alive_past_maturity() {
+        let h = setup();
+        let id = proposed(&h, THIRTY_DAYS);
+        age(&h, DAY_LEDGERS);
+        settle(&h, id);
+
+        let needed = THIRTY_DAYS_LEDGERS - DAY_LEDGERS + UNWIND_ALLOWANCE_GRACE_LEDGERS;
+        assert!(trade_ttl(&h, id) >= needed, "trade: {}", trade_ttl(&h, id));
+        assert!(instance_ttl(&h) >= needed, "instance: {}", instance_ttl(&h));
+        let due = DataKey::BorrowerDue(h.cash_borrower.clone());
+        let expiry = DataKey::BorrowerDueExpiry(h.cash_borrower.clone());
+        assert!(
+            entry_ttl(&h, &due) >= needed,
+            "due: {}",
+            entry_ttl(&h, &due)
+        );
+        assert!(
+            entry_ttl(&h, &expiry) >= needed,
+            "due expiry: {}",
+            entry_ttl(&h, &expiry)
+        );
+    }
+
+    /// A trade that matures within the hour is still kept for the shared ~30 days, so its
+    /// outcome stays readable after it closes.
+    #[test]
+    fn a_short_trade_is_still_kept_for_the_shared_thirty_days() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+
+        assert!(trade_ttl(&h, id) >= PERSISTENT_EXTEND_TO_LEDGERS - 1);
+        assert!(instance_ttl(&h) >= INSTANCE_EXTEND_TO_LEDGERS - 1);
+    }
+
+    /// The case from the report: a 30-day repo that nothing touches between settlement and
+    /// maturity. The ledger moves on by the whole term, far past the lifetime a new entry starts
+    /// with, and the trade, the instance and the borrower's due sum are all still live, with the
+    /// unwind grace still ahead of them. The keeper then unwinds out of the borrower's allowance.
+    #[test]
+    fn a_thirty_day_trade_left_alone_is_still_live_at_maturity_and_unwinds() {
+        let h = setup();
+        let id = proposed(&h, THIRTY_DAYS);
+        settle(&h, id);
+        let starts_with = h.env.ledger().get().min_persistent_entry_ttl;
+
+        age(&h, THIRTY_DAYS_LEDGERS);
+        assert!(THIRTY_DAYS_LEDGERS > starts_with);
+
+        assert!(trade_ttl(&h, id) >= UNWIND_ALLOWANCE_GRACE_LEDGERS);
+        assert!(instance_ttl(&h) >= UNWIND_ALLOWANCE_GRACE_LEDGERS);
+        let due = DataKey::BorrowerDue(h.cash_borrower.clone());
+        assert!(entry_ttl(&h, &due) >= UNWIND_ALLOWANCE_GRACE_LEDGERS);
+
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.keeper, &id);
+        assert_eq!(
+            RepoDvpClient::new(&h.env, &h.repo).trade(&id).status,
+            RepoStatus::Unwound
+        );
+    }
+
+    /// The same proposal on a ledger with testnet's own minimum lifetime for a new entry, 120,960
+    /// ledgers (about 7 days), instead of the test default of a few thousand. This is the gap in
+    /// the report: seven days is well short of a 30-day trade, and it is also well above the
+    /// one-day threshold at which the shared `ttl::extend_persistent` starts to act, so that
+    /// helper would leave the new entry exactly as it found it.
+    #[test]
+    fn a_trade_is_given_its_whole_lifetime_even_when_a_new_entry_already_has_a_week() {
+        let h = setup();
+        h.env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = UNWIND_ALLOWANCE_GRACE_LEDGERS;
+        });
+        let id = proposed(&h, THIRTY_DAYS);
+        settle(&h, id);
+
+        let needed = THIRTY_DAYS_LEDGERS + UNWIND_ALLOWANCE_GRACE_LEDGERS;
+        assert!(trade_ttl(&h, id) >= needed, "trade: {}", trade_ttl(&h, id));
+        assert!(instance_ttl(&h) >= needed, "instance: {}", instance_ttl(&h));
+        let due = DataKey::BorrowerDue(h.cash_borrower.clone());
+        assert!(
+            entry_ttl(&h, &due) >= needed,
+            "due: {}",
+            entry_ttl(&h, &due)
+        );
+    }
+
+    /// `trade_ttl_ledgers` on hand-built trades, so the arithmetic is pinned without going
+    /// through `propose`.
+    #[test]
+    fn a_trades_lifetime_runs_to_maturity_plus_the_grace_plus_the_margin() {
+        let h = setup();
+        let now = h.env.ledger().timestamp();
+        let lifetime = |maturity_at: u64| {
+            let trade = RepoTrade {
+                id: 1,
+                cash_lender: h.cash_lender.clone(),
+                cash_borrower: h.cash_borrower.clone(),
+                asset: h.rwa.clone(),
+                units: UNITS,
+                cash_amount: CASH,
+                rate_bps: 500,
+                kind: RepoKind::Term,
+                maturity_at,
+                agreement_hash: hash(&h, 7),
+                proposed_at: now,
+                status: RepoStatus::Proposed,
+                leg1_ledger: None,
+                settled_at: None,
+                pending_margin_call: false,
+                margin_call_amount: 0,
+                cure_deadline: None,
+            };
+            h.env
+                .as_contract(&h.repo, || trade_ttl_ledgers(&h.env, &trade))
+        };
+        let grace_and_margin = UNWIND_ALLOWANCE_GRACE_LEDGERS + 2 * DAY_LEDGERS;
+        let max_ttl = h.env.as_contract(&h.repo, || h.env.storage().max_ttl());
+
+        // 60 days out: the 60 days, the week of unwind grace and the two-day margin.
+        assert_eq!(
+            lifetime(now + 2 * THIRTY_DAYS),
+            2 * THIRTY_DAYS_LEDGERS + grace_and_margin
+        );
+        // A part of a ledger is rounded up: 60 days and one second is one ledger more.
+        assert_eq!(
+            lifetime(now + 2 * THIRTY_DAYS + 1),
+            2 * THIRTY_DAYS_LEDGERS + 1 + grace_and_margin
+        );
+        // Already at or past maturity: the grace and margin alone are under 30 days, so the
+        // shared 30-day floor applies.
+        assert_eq!(lifetime(now), PERSISTENT_EXTEND_TO_LEDGERS);
+        assert_eq!(lifetime(now - 500), PERSISTENT_EXTEND_TO_LEDGERS);
+        // Further out than an entry may live: capped at the network's maximum.
+        assert_eq!(lifetime(now + 20 * 365 * 24 * 3_600), max_ttl);
+        assert_eq!(lifetime(u64::MAX), max_ttl);
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: trade not found")]
+    fn extend_ttl_refuses_a_trade_that_does_not_exist() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).extend_ttl(&42);
+    }
+
+    /// The keep-alive on a trade that closed 29 days ago: nothing has touched it since, so it
+    /// and the instance are a day from expiring, and anyone can push them out again.
+    #[test]
+    fn extend_ttl_tops_up_a_trade_and_the_instance_that_are_about_to_lapse() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let id = proposed(&h, 3_600);
+        repo.cancel_proposal(&h.cash_lender, &id);
+
+        age(&h, THIRTY_DAYS_LEDGERS - DAY_LEDGERS);
+        assert!(trade_ttl(&h, id) <= DAY_LEDGERS);
+        assert!(instance_ttl(&h) <= DAY_LEDGERS);
+
+        repo.extend_ttl(&id);
+        assert!(trade_ttl(&h, id) >= PERSISTENT_EXTEND_TO_LEDGERS - 1);
+        assert!(instance_ttl(&h) >= INSTANCE_EXTEND_TO_LEDGERS - 1);
+    }
+
+    /// For a settled trade the keep-alive also covers the borrower's due sum.
+    #[test]
+    fn extend_ttl_also_tops_up_a_settled_trades_due_sum() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        let due = DataKey::BorrowerDue(h.cash_borrower.clone());
+        let expiry = DataKey::BorrowerDueExpiry(h.cash_borrower.clone());
+
+        age(&h, THIRTY_DAYS_LEDGERS - DAY_LEDGERS);
+        assert!(entry_ttl(&h, &due) <= DAY_LEDGERS);
+
+        RepoDvpClient::new(&h.env, &h.repo).extend_ttl(&id);
+        assert!(entry_ttl(&h, &due) >= PERSISTENT_EXTEND_TO_LEDGERS - 1);
+        assert!(entry_ttl(&h, &expiry) >= PERSISTENT_EXTEND_TO_LEDGERS - 1);
+    }
+
+    /// Runs the instance down to its last hundred ledgers, makes one call, and checks the call
+    /// pushed the instance back out to the shared target.
+    fn extends_the_instance(h: &Harness, call: impl FnOnce(&RepoDvpClient)) {
+        age(h, instance_ttl(h) - 100);
+        call(&RepoDvpClient::new(&h.env, &h.repo));
+        assert!(
+            instance_ttl(h) >= INSTANCE_EXTEND_TO_LEDGERS - 1,
+            "instance left with {} ledgers",
+            instance_ttl(h)
+        );
+    }
+
+    #[test]
+    fn initialize_extends_the_instance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let repo = env.register(RepoDvp, ());
+        let ttl = || env.as_contract(&repo, || env.storage().instance().get_ttl());
+        assert!(ttl() < INSTANCE_EXTEND_TO_LEDGERS - 1);
+
+        RepoDvpClient::new(&env, &repo).initialize(
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert!(ttl() >= INSTANCE_EXTEND_TO_LEDGERS - 1);
+    }
+
+    #[test]
+    fn the_admin_entry_points_extend_the_instance() {
+        let h = setup();
+        let thresholds = MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_500,
+        };
+        extends_the_instance(&h, |repo| repo.set_usdc(&h.admin, &h.usdc));
+        extends_the_instance(&h, |repo| repo.set_cure_grace(&h.admin, &3_600));
+        extends_the_instance(&h, |repo| repo.set_maturity_grace(&h.admin, &3_600));
+        extends_the_instance(&h, |repo| {
+            repo.configure_asset(&h.admin, &h.rwa, &h.price_guard, &500, &thresholds)
+        });
+        extends_the_instance(&h, |repo| repo.disable_asset(&h.admin, &h.rwa));
+        extends_the_instance(&h, |repo| repo.enable_asset(&h.admin, &h.rwa));
+    }
+
+    #[test]
+    fn the_pause_entry_points_extend_the_instance() {
+        let h = setup();
+        extends_the_instance(&h, |repo| repo.pause(&h.pauser, &PauseScope::Repos));
+        let id = std::cell::Cell::new(0);
+        extends_the_instance(&h, |repo| {
+            id.set(repo.queue_unpause(&h.admin, &PauseScope::Repos))
+        });
+        extends_the_instance(&h, |repo| repo.execute_unpause(&id.get()));
+        extends_the_instance(&h, |repo| {
+            id.set(repo.queue_unpause(&h.admin, &PauseScope::Repos))
+        });
+        extends_the_instance(&h, |repo| repo.cancel_unpause(&h.admin, &id.get()));
+    }
+
+    #[test]
+    fn the_read_only_entry_points_extend_the_instance() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        extends_the_instance(&h, |repo| {
+            repo.cure_grace_seconds();
+        });
+        extends_the_instance(&h, |repo| {
+            repo.maturity_grace_seconds();
+        });
+        extends_the_instance(&h, |repo| {
+            repo.is_paused(&PauseScope::Repos);
+        });
+        extends_the_instance(&h, |repo| {
+            repo.is_asset_enabled(&h.rwa);
+        });
+        extends_the_instance(&h, |repo| {
+            repo.margin_view(&id);
+        });
+        extends_the_instance(&h, |repo| {
+            repo.trade(&id);
+        });
+    }
+
+    #[test]
+    fn the_trade_entry_points_extend_the_instance() {
+        let h = setup();
+        let cancelled = std::cell::Cell::new(0);
+        extends_the_instance(&h, |_| cancelled.set(proposed(&h, 3_600)));
+        extends_the_instance(&h, |repo| {
+            repo.cancel_proposal(&h.cash_lender, &cancelled.get())
+        });
+
+        // Settled, then left until long after maturity and its grace: the borrower can still
+        // unwind, and a second trade left the same way can still be defaulted.
+        let unwound = proposed(&h, 3_600);
+        settle(&h, unwound);
+        extends_the_instance(&h, |repo| repo.unwind(&h.cash_borrower, &unwound));
+
+        let defaulted = proposed(&h, 3_600);
+        settle(&h, defaulted);
+        extends_the_instance(&h, |repo| {
+            repo.default_at_maturity(&h.cash_lender, &defaulted)
+        });
+    }
+
+    /// Why each entry point extends the instance itself, even those that go on to write a
+    /// trade (which extends it too): not every path through them writes one. `call_margin` on a
+    /// healthy position with no call open changes nothing and writes nothing.
+    #[test]
+    fn call_margin_extends_the_instance_even_when_it_has_nothing_to_write() {
+        let h = setup();
+        // 50 cash against 100 units at $1 with a 5% haircut: about 53% LTV, healthy.
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        extends_the_instance(&h, |repo| repo.call_margin(&h.keeper, &id));
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        assert!(!trade.pending_margin_call);
     }
 }
