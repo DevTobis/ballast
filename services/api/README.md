@@ -172,7 +172,7 @@ Decimal strings appear only where routes return raw database rows without going 
 | Endpoint | Request Amount(s) | Internal Handling | Response Amount(s) & Format |
 | --- | --- | --- | --- |
 | `POST /v1/credit-lines` | `limit` (`bigintish`, scaled) | Passed to contract as `BigInt`; stored via `scaledToDecimalString` as `limitAmount` | `xdr`, `txHash`, `creditLineId` (no monetary fields) |
-| `GET /v1/credit-lines/:id` | — | `limitAmount` (decimal string) converted via `decimalStringToScaled`; on-chain values arrive as `BigInt` | `limit` (scaled string via `decimalStringToScaled`); `drawn`, `funded`, `undrawn`, `claimableInterest`, `collateralValue`, `liquidation.*` (scaled strings via serialiser); `ltvBps`, `rateBps`, `feeBps` (bps) |
+| `GET /v1/credit-lines/:id` | — | `limitAmount` (decimal string) converted via `decimalStringToScaled`; on-chain values arrive as `BigInt` | `limit` (scaled string via `decimalStringToScaled`); `drawn`, `funded`, `undrawn`, `claimableInterest`, `collateralValue`, `liquidation.*` (scaled strings via serialiser); `accruedInterest` (scaled string or null); `onChainStatus` (`"Open" \| "Liquidating" \| "Closed"` or null); `breachLedger` (integer or null); `ltvBps`, `rateBps`, `feeBps` (bps) |
 | `POST /v1/credit-lines/:id/fund` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt`; `amount.toString()` (scaled digits) in intent payload | `xdr`, `txHash` (no monetary fields) |
 | `POST /v1/credit-lines/:id/withdrawals` | `amount` (`bigintish`, scaled), `kind` (enum) | Passed to contract as `BigInt`; `amount.toString()` in intent payload | `xdr`, `txHash` (no monetary fields) |
 | `POST /v1/credit-lines/:id/close-liquidation` | — | Calls `closeLiquidated` on contract directly; no amount | `xdr`, `txHash` (no monetary fields) |
@@ -255,4 +255,13 @@ Before passing values from `GET /v1/positions` or `GET /v1/reports/daily` into c
 import { decimalStringToScaled } from "@ballast/domain-types";
 const scaled = decimalStringToScaled(position.creditLines[0].limitAmount);
 ```
+
+## Margin thresholds configuration
+
+The API's fallback margin classification and pledge release gates use three configurable thresholds in basis points:
+- `API_MARGIN_WARNING_BPS` (default: `7000` / 70%)
+- `API_MARGIN_CALL_BPS` (default: `8000` / 80%)
+- `API_MARGIN_LIQUIDATION_BPS` (default: `9000` / 90%)
+
+These must satisfy `API_MARGIN_WARNING_BPS < API_MARGIN_CALL_BPS < API_MARGIN_LIQUIDATION_BPS <= 10000`. They should match the per-asset thresholds configured on the `CreditLine` and `PledgeVault` smart contracts via `configure_asset`.
 

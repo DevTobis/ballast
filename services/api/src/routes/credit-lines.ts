@@ -4,6 +4,7 @@ import { schema, type Database } from "@ballast/db";
 import { classifyMargin, decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-types";
 import type { ChainGateway } from "../chain.js";
 import type { ContractClients } from "../contract-clients.js";
+import type { ApiConfig } from "../config.js";
 import { recordIntent, withTransaction } from "../intents.js";
 import {
   createDrawSchema,
@@ -15,14 +16,18 @@ import {
 } from "../schemas.js";
 import { estimateLtvBps, isLineParty, outstandingDebt, requireAsset, requireCreditLine, requireStellarAccount } from "./helpers.js";
 
-const MARGIN_THRESHOLDS = { warningBps: 7000, marginCallBps: 8000, liquidationBps: 9000 };
-
 export function registerCreditLineRoutes(
   app: FastifyInstance,
   db: Database,
   contracts: ContractClients,
   chain: ChainGateway,
+  config?: ApiConfig,
 ): void {
+  const marginThresholds = config?.marginThresholds ?? {
+    warningBps: 7000,
+    marginCallBps: 8000,
+    liquidationBps: 9000,
+  };
   app.post("/v1/credit-lines", async (request, reply) => {
     const body = openCreditLineSchema.parse(request.body);
     if (body.lenderId !== request.partyId) {
@@ -87,12 +92,15 @@ export function registerCreditLineRoutes(
       outstandingDebt(db, line.id),
       estimateLtvBps(db, line.id),
     ]);
-    let marginState = classifyMargin(ltvBps, MARGIN_THRESHOLDS);
+    let marginState = classifyMargin(ltvBps, marginThresholds);
     let priceStatus: string | null = null;
     let collateralValue: string | null = null;
     let funded: string | null = null;
     let undrawn: string | null = null;
     let claimableInterest: string | null = null;
+    let accruedInterest: string | null = null;
+    let onChainStatus: "Open" | "Liquidating" | "Closed" | null = null;
+    let breachLedger: number | null = null;
     let liquidation: {
       closed: boolean;
       debt: string;
@@ -118,6 +126,9 @@ export function registerCreditLineRoutes(
         funded = BigInt(onChain.funded).toString();
         undrawn = (BigInt(onChain.funded) - BigInt(onChain.drawn)).toString();
         claimableInterest = BigInt(await contracts.creditLine.claimableInterest(BigInt(line.contractLineId))).toString();
+        accruedInterest = BigInt(onChain.accruedInterest).toString();
+        onChainStatus = onChain.status;
+        breachLedger = onChain.breachLedger ?? null;
         if (onChain.status !== "Open") {
           const record = await contracts.creditLine.liquidationRecord(BigInt(line.contractLineId));
           liquidation = {
@@ -153,6 +164,9 @@ export function registerCreditLineRoutes(
       funded,
       undrawn,
       claimableInterest,
+      accruedInterest,
+      onChainStatus,
+      breachLedger,
       collateralValue,
       priceStatus,
       liquidation,
@@ -351,7 +365,7 @@ export function registerCreditLineRoutes(
 
       const postReleaseLtvBps = await estimateLtvBps(db, line.id, pledge.id, onChainDebt);
       // Same bar as the contract (PledgeVault.release) and CreditLine.draw: the line must stay Healthy.
-      if (postReleaseLtvBps >= MARGIN_THRESHOLDS.warningBps) {
+      if (postReleaseLtvBps >= marginThresholds.warningBps) {
         return reply.code(409).send({
           error: "release would breach the healthy LTV threshold",
           projectedLtvBps: postReleaseLtvBps,

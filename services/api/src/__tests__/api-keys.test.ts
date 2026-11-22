@@ -233,6 +233,21 @@ describe("API-key requests through the server", () => {
     expect(key!.status).toBe("revoked");
     expect(audit[0]).toMatchObject({ action: "api_key.revoke" });
   });
+
+  it("is idempotent: second revoke returns 204 without updating revokedAt or adding duplicate audit log", async () => {
+    const { db, audit, key } = keyDb();
+    const app = buildServer({ config, db, contracts: {} as ContractClients });
+
+    const first = await app.inject({ method: "DELETE", url: `/v1/api-keys/${KEY_ID}`, headers: session });
+    expect(first.statusCode).toBe(204);
+    const originalRevokedAt = key!.revokedAt;
+    expect(audit).toHaveLength(1);
+
+    const second = await app.inject({ method: "DELETE", url: `/v1/api-keys/${KEY_ID}`, headers: session });
+    expect(second.statusCode).toBe(204);
+    expect(key!.revokedAt).toEqual(originalRevokedAt);
+    expect(audit).toHaveLength(1);
+  });
 });
 
 describe("client address behind a proxy", () => {

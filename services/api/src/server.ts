@@ -162,7 +162,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   registerMarketRoutes(app, db);
   registerWebhookRoutes(app, db, config);
   registerApiKeyRoutes(app, db, config);
-  registerCreditLineRoutes(app, db, contracts, chain);
+  registerCreditLineRoutes(app, db, contracts, chain, config);
   registerExitRoutes(app, db, contracts, chain);
   registerRepoRoutes(app, db, contracts, chain);
   registerTxRoutes(app, db, chain, contracts);

@@ -137,6 +137,9 @@ retry stellar contract invoke --id "${CID[price-guard]}" --source admin --networ
   --admin "$ADMIN" --asset "$RWA_SAC" --band_bps 50 --daily_move_band_bps 100 \
   --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s "$PRICE_MAX_STALENESS_S" >/dev/null
 
+# Margin thresholds configured on the contract (70% warning, 80% margin call, 90% liquidation).
+# If changed here, set API_MARGIN_WARNING_BPS, API_MARGIN_CALL_BPS, and API_MARGIN_LIQUIDATION_BPS
+# in services/api config so the API's fallback classification and release checks match the contract.
 log "Configuring PledgeVault for RWA1 (5% haircut, escrow mode)"
 retry stellar contract invoke --id "${CID[pledge-vault]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "${CID[price-guard]}" --credit_line "${CID[credit-line]}" \

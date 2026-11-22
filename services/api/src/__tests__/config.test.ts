@@ -2,7 +2,10 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadApiConfig } from "../config.js";
+import { Keypair } from "@stellar/stellar-sdk";
+import { loadApiConfig, parseMarginThresholds } from "../config.js";
+
+const VALID_SECRET = Keypair.random().secret();
 
 const NETWORK_ENV = {
   STELLAR_RPC_URL: "http://localhost:8000/soroban/rpc",
@@ -13,7 +16,7 @@ const NETWORK_ENV = {
 const PRODUCTION_REQUIRED_ENV = {
   ...NETWORK_ENV,
   NODE_ENV: "production",
-  SEP10_SERVER_SECRET: "SBQWY3JPJKSAKQVQ7Q7TSPZCU5R5PGSWKZ35RQ7Q7TSPZCU5R5PGSWKZ",
+  SEP10_SERVER_SECRET: VALID_SECRET,
   JWT_SIGNING_SECRET: "a-real-jwt-secret",
   WEBHOOK_SECRET_KEY: "ab".repeat(32),
   API_KEY_SECRET_KEY: "cd".repeat(32),
@@ -44,6 +47,12 @@ describe("loadApiConfig", () => {
   it("rejects an encryption key that is not 32 bytes of hex", () => {
     expect(() => loadApiConfig({ ...NETWORK_ENV, API_KEY_SECRET_KEY: "too-short" })).toThrowError(/API_KEY_SECRET_KEY/);
     expect(() => loadApiConfig({ ...NETWORK_ENV, WEBHOOK_SECRET_KEY: "zz".repeat(32) })).toThrowError(/WEBHOOK_SECRET_KEY/);
+  });
+
+  it("rejects a malformed SEP10_SERVER_SECRET naming the variable", () => {
+    expect(() => loadApiConfig({ ...PRODUCTION_REQUIRED_ENV, SEP10_SERVER_SECRET: "not-a-stellar-seed" })).toThrowError(
+      /SEP10_SERVER_SECRET/,
+    );
   });
 
   it("stays permissive outside production even with every secret unset", () => {
@@ -110,5 +119,55 @@ describe("parseComplianceEnforced", () => {
     expect(() => parseComplianceEnforced("yes", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED/);
     expect(() => parseComplianceEnforced("ture", "production")).toThrowError(/invalid COMPLIANCE_ENFORCED/);
     expect(() => parseComplianceEnforced("foo", "development")).toThrowError(/invalid COMPLIANCE_ENFORCED/);
+  });
+});
+
+describe("parseMarginThresholds", () => {
+  it("returns default thresholds when unset", () => {
+    expect(parseMarginThresholds({})).toEqual({
+      warningBps: 7000,
+      marginCallBps: 8000,
+      liquidationBps: 9000,
+    });
+  });
+
+  it("parses valid custom thresholds", () => {
+    expect(
+      parseMarginThresholds({
+        API_MARGIN_WARNING_BPS: "6500",
+        API_MARGIN_CALL_BPS: "7500",
+        API_MARGIN_LIQUIDATION_BPS: "8500",
+      }),
+    ).toEqual({
+      warningBps: 6500,
+      marginCallBps: 7500,
+      liquidationBps: 8500,
+    });
+  });
+
+  it("throws validation error on bad ordering or out-of-range thresholds", () => {
+    expect(() =>
+      parseMarginThresholds({
+        API_MARGIN_WARNING_BPS: "8000",
+        API_MARGIN_CALL_BPS: "7000",
+        API_MARGIN_LIQUIDATION_BPS: "9000",
+      }),
+    ).toThrowError(/margin thresholds/);
+
+    expect(() =>
+      parseMarginThresholds({
+        API_MARGIN_WARNING_BPS: "7000",
+        API_MARGIN_CALL_BPS: "9500",
+        API_MARGIN_LIQUIDATION_BPS: "9000",
+      }),
+    ).toThrowError(/margin thresholds/);
+
+    expect(() =>
+      parseMarginThresholds({
+        API_MARGIN_WARNING_BPS: "7000",
+        API_MARGIN_CALL_BPS: "8000",
+        API_MARGIN_LIQUIDATION_BPS: "10001",
+      }),
+    ).toThrowError(/margin thresholds/);
   });
 });

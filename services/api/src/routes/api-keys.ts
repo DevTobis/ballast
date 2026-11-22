@@ -76,6 +76,9 @@ export function registerApiKeyRoutes(app: FastifyInstance, db: Database, config:
       .where(and(eq(schema.partyApiKey.keyId, request.params.keyId), eq(schema.partyApiKey.partyId, request.partyId)))
       .limit(1);
     if (!key) return reply.code(404).send({ error: "api key not found" });
+    if (key.status === "revoked") {
+      return reply.code(204).send();
+    }
 
     await db
       .update(schema.partyApiKey)

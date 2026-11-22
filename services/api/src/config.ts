@@ -4,10 +4,17 @@
  * `@ballast/network-config`).
  */
 import { readFileSync } from "node:fs";
+import { StrKey } from "@stellar/stellar-sdk";
 import { loadNetworkConfig } from "@ballast/network-config";
 
 export interface ApiConfig {
   port: number;
+  /** Margin classification thresholds in basis points (warning < call < liquidation <= 10000). */
+  marginThresholds?: {
+    warningBps: number;
+    marginCallBps: number;
+    liquidationBps: number;
+  };
   /** HMAC secret used to sign/verify the app's own session JWTs (`{ sub: G-address }`). Not a
    * SEP-10 signing key — SEP-10 challenge transactions are signed by `sep10ServerSecret`, a real
    * Stellar keypair, per `routes/auth.ts`. */
@@ -104,6 +111,38 @@ export function parseTrustProxy(value: string | undefined): boolean | number | s
   return v;
 }
 
+export function parseMarginThresholds(env: NodeJS.ProcessEnv): {
+  warningBps: number;
+  marginCallBps: number;
+  liquidationBps: number;
+} {
+  const warningBps = env.API_MARGIN_WARNING_BPS !== undefined && env.API_MARGIN_WARNING_BPS !== ""
+    ? Number(env.API_MARGIN_WARNING_BPS)
+    : 7000;
+  const marginCallBps = env.API_MARGIN_CALL_BPS !== undefined && env.API_MARGIN_CALL_BPS !== ""
+    ? Number(env.API_MARGIN_CALL_BPS)
+    : 8000;
+  const liquidationBps = env.API_MARGIN_LIQUIDATION_BPS !== undefined && env.API_MARGIN_LIQUIDATION_BPS !== ""
+    ? Number(env.API_MARGIN_LIQUIDATION_BPS)
+    : 9000;
+
+  if (
+    !Number.isInteger(warningBps) ||
+    !Number.isInteger(marginCallBps) ||
+    !Number.isInteger(liquidationBps) ||
+    warningBps <= 0 ||
+    warningBps >= marginCallBps ||
+    marginCallBps >= liquidationBps ||
+    liquidationBps > 10000
+  ) {
+    throw new Error(
+      "services/api: invalid margin thresholds, expected positive integers with API_MARGIN_WARNING_BPS < API_MARGIN_CALL_BPS < API_MARGIN_LIQUIDATION_BPS <= 10000",
+    );
+  }
+
+  return { warningBps, marginCallBps, liquidationBps };
+}
+
 export function loadApiConfig(rawEnv: NodeJS.ProcessEnv = process.env): ApiConfig {
   // Secrets may come from NAME_FILE; resolve them once and let the rest of this function read `env`.
   const env: NodeJS.ProcessEnv = { ...rawEnv };
@@ -119,11 +158,19 @@ export function loadApiConfig(rawEnv: NodeJS.ProcessEnv = process.env): ApiConfi
     }
   }
 
+  if (env.SEP10_SERVER_SECRET) {
+    if (!StrKey.isValidEd25519SecretSeed(env.SEP10_SERVER_SECRET)) {
+      throw new Error("services/api: invalid SEP10_SERVER_SECRET (expected an S... Stellar secret key)");
+    }
+  }
+
   for (const name of ["WEBHOOK_SECRET_KEY", "API_KEY_SECRET_KEY"] as const) {
     if (env[name] && !/^[0-9a-fA-F]{64}$/.test(env[name]!)) {
       throw new Error(`services/api: ${name} must be 32 bytes as 64 hex characters`);
     }
   }
+
+  const marginThresholds = parseMarginThresholds(env);
 
   return {
     port: env.API_PORT ? Number(env.API_PORT) : 3000,
@@ -137,5 +184,6 @@ export function loadApiConfig(rawEnv: NodeJS.ProcessEnv = process.env): ApiConfi
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
     complianceEnforced: parseComplianceEnforced(env.COMPLIANCE_ENFORCED, env.NODE_ENV),
     consoleOrigin: env.CONSOLE_ORIGIN ?? "http://localhost:5173",
+    marginThresholds,
   };
 }
