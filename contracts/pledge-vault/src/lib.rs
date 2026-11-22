@@ -495,8 +495,14 @@ impl PledgeVault {
         ttl::extend_persistent(&env, &key);
     }
 
-    /// Read-only helper for consoles/tests: full position for `(line, asset)`.
+    /// Read-only helper for consoles/tests: full position (`units`, `pending_lien_units`, `mode`,
+    /// `lien_ref`) for `(line, asset)`.
+    ///
+    /// For unknown `(line, asset)` keys with no stored entry, returns a default empty `Position`
+    /// (`units: 0`, `pending_lien_units: 0`, `mode: CustodyMode::Escrow`, `lien_ref: None`)
+    /// without panicking.
     pub fn position(env: Env, line: u64, asset: Address) -> Position {
+        ttl::extend_instance(&env);
         read_position(&env, line, &asset)
     }
 }
@@ -1249,5 +1255,44 @@ mod test {
                 assert_eq!(v0.data, expected_data);
             }
         }
+    }
+
+    #[test]
+    fn position_returns_default_for_unknown_key_and_all_fields_when_populated() {
+        let h = setup(500, 0, PRICE_SCALE);
+
+        let empty = h.vault.position(&999, &h.asset);
+        assert_eq!(empty.units, 0);
+        assert_eq!(empty.pending_lien_units, 0);
+        assert_eq!(empty.mode, CustodyMode::Escrow);
+        assert_eq!(empty.lien_ref, None);
+
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(250 * PRICE_SCALE));
+        let pending = h.vault.position(&1, &h.asset);
+        assert_eq!(pending.units, 0);
+        assert_eq!(pending.pending_lien_units, 250 * PRICE_SCALE);
+        assert_eq!(pending.mode, CustodyMode::IssuerLien);
+        assert_eq!(pending.lien_ref, None);
+
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-view-176");
+        h.vault
+            .record_lien(&gateway, &1, &h.asset, &(100 * PRICE_SCALE), &lien_ref);
+        let confirmed = h.vault.position(&1, &h.asset);
+        assert_eq!(confirmed.units, 100 * PRICE_SCALE);
+        assert_eq!(confirmed.pending_lien_units, 150 * PRICE_SCALE);
+        assert_eq!(confirmed.mode, CustodyMode::IssuerLien);
+        assert_eq!(confirmed.lien_ref, Some(lien_ref));
     }
 }
