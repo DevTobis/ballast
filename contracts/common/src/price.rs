@@ -37,6 +37,13 @@ pub struct GuardedPrice {
     pub asset: Address,
     pub value: i128,
     pub status: PriceStatus,
+    /// Dual-meaning timestamp depending on `status`:
+    /// - When `status` is [`PriceStatus::Ok`], `ts` is the ledger timestamp (`now`) at which the
+    ///   fresh sources were evaluated and `value` was recorded as `LastGood`.
+    /// - When `status` is [`PriceStatus::Degraded`] or [`PriceStatus::Halted`], `ts` is the
+    ///   ledger timestamp at which the returned `last_good` price was originally recorded
+    ///   (`0` if there was no prior good price or if `LastGood` was migrated from a bare `i128`),
+    ///   allowing callers and off-chain monitors to measure how old the fallback price is.
     pub ts: u64,
     pub sources: Vec<PriceSource>,
 }

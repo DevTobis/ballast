@@ -183,6 +183,17 @@ pub fn exit(
 * **Slippage Protection**: Panics if recomputed `quote.usdc_out < min_usdc_out`.
 * **Flexible Destination (`to`)**: Allows routing the USDC proceeds to any address (e.g., an anchor operator account for fiat offramping).
 * **Eligibility**: Enforced via Stellar Asset Contract (SAC) authorization. If the issuer's own controls (SAC authorization or the SEP-57 token's rules) reject the holder, the underlying transfer reverts.
+* **Float check**: Before the holder's RWA is transferred, the desk's own USDC balance is compared with the payout. If it is smaller, the call panics with `"exit-desk: insufficient USDC float"` and nothing moves.
+
+### 3. Checking the Float (`available_usdc`)
+
+Read-only entry point (no auth or transaction signature required):
+
+```rust
+pub fn available_usdc(env: Env) -> i128
+```
+
+Returns the USDC the desk can pay exits from right now: its balance of the configured USDC token, or `0` while no USDC token has been set. A quote can be paid if `quote.usdc_out <= available_usdc()`. Like a quote, it is a read: the float can change before an exit lands, and `exit` checks it again.
 
 ---
 
@@ -214,7 +225,8 @@ All events are emitted during the transaction that executes the state transition
 | Zero payout | `"exit-desk: usdc_out is zero, amount too small to exit"` | `exit` for an amount whose floored payout is `0`. `quote` still returns, with `usdc_out = 0`. |
 | Cap validation | `"...cap must be positive"` | Daily or inventory cap configured with value `0`. |
 | Token mismatch | `"exit-desk: usdc address mismatch"` | Subsequent `fund` calls used a different USDC token. |
-| Unfunded USDC | `"exit-desk: usdc not funded/configured yet"` | `exit` called before `fund` configured the USDC token. |
+| USDC not set | `"exit-desk: usdc not configured"` | `exit` or `fund` called before `set_usdc` recorded the USDC token. |
+| Insufficient float | `"exit-desk: insufficient USDC float"` | `exit` whose payout is larger than the desk's USDC balance. Checked before the holder's RWA moves. |
 | Slippage | `"exit-desk: usdc_out below min_usdc_out (slippage)"` | Execution output lower than holder's minimum tolerance. |
 | Holder Daily Cap | `"exit-desk: exceeds per-holder daily cap"` | Holder exceeds daily RWA allowance for the UTC day. |
 | Desk Inventory Cap| `"exit-desk: exceeds desk inventory cap"` | Total RWA inventory in desk exceeds facility capacity. |
