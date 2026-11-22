@@ -227,6 +227,13 @@ impl PledgeVault {
     /// pass. `admin` is accepted for interface symmetry with the rest of Ballast's admin calls;
     /// the actual check is `access::require_admin`, which authenticates the *stored* admin
     /// address regardless of what's passed here.
+    ///
+    /// Values `release` could not work with are refused here instead of being stored: a
+    /// `haircut_bps` above 10,000 (`risk::validate_haircut_bps`), which would make every release
+    /// against debt panic when it values the remaining collateral, and thresholds that
+    /// `MarginThresholds::validate` rejects, which would let `release` call any LTV healthy.
+    /// `CreditLine::configure_asset` runs the same two checks, so both contracts refuse the same
+    /// inputs.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -241,6 +248,7 @@ impl PledgeVault {
         access::require_admin(&env);
         ttl::extend_instance(&env);
 
+        risk::validate_haircut_bps(haircut_bps);
         thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
@@ -1077,6 +1085,112 @@ mod test {
             &CustodyMode::IssuerLien,
         );
         h.vault.pledge(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+    }
+
+    // ── #177: configure_asset refuses values `release` cannot work with ─────
+
+    fn bands(warning_bps: u32, margin_call_bps: u32, liquidation_bps: u32) -> MarginThresholds {
+        MarginThresholds {
+            warning_bps,
+            margin_call_bps,
+            liquidation_bps,
+        }
+    }
+
+    /// Reconfigures the harness's asset, changing only the haircut and the thresholds.
+    fn reconfigure(h: &Harness, haircut_bps: u32, thresholds: &MarginThresholds) {
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &haircut_bps,
+            thresholds,
+            &CustodyMode::Escrow,
+        );
+    }
+
+    /// The same call through `try_configure_asset`, for when a test asserts that a config is
+    /// refused (or accepted) and not the wording of the refusal.
+    fn is_refused(h: &Harness, haircut_bps: u32, thresholds: &MarginThresholds) -> bool {
+        h.vault
+            .try_configure_asset(
+                &h.admin,
+                &h.asset,
+                &h.price_guard.address,
+                &h.credit_line.address,
+                &haircut_bps,
+                thresholds,
+                &CustodyMode::Escrow,
+            )
+            .is_err()
+    }
+
+    #[test]
+    #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
+    fn configure_asset_rejects_a_haircut_one_bp_over_one_hundred_percent() {
+        let h = setup(500, 0, PRICE_SCALE);
+        reconfigure(&h, 10_001, &h.thresholds);
+    }
+
+    #[test]
+    fn configure_asset_accepts_a_haircut_of_zero_and_of_exactly_one_hundred_percent() {
+        let h = setup(500, 0, PRICE_SCALE);
+        assert!(!is_refused(&h, 0, &h.thresholds));
+        assert!(!is_refused(&h, 10_000, &h.thresholds));
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: warning_bps must be greater than zero")]
+    fn configure_asset_rejects_a_zero_warning_threshold() {
+        let h = setup(500, 0, PRICE_SCALE);
+        reconfigure(&h, 500, &bands(0, 8_000, 9_000));
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: liquidation_bps cannot exceed 10000 bps (100%)")]
+    fn configure_asset_rejects_a_liquidation_threshold_over_one_hundred_percent() {
+        let h = setup(500, 0, PRICE_SCALE);
+        reconfigure(&h, 500, &bands(7_000, 8_000, 10_001));
+    }
+
+    /// The thresholds from the report, all three at `u32::MAX`, which `classify` would read as
+    /// "every LTV is healthy", and two sets that are out of order. Which check in
+    /// `MarginThresholds::validate` refuses each, and in what words, is `ballast-common`'s
+    /// business (#78 is tightening the ordering rule), so this asserts the refusal only.
+    #[test]
+    fn configure_asset_rejects_thresholds_that_would_switch_the_health_check_off() {
+        let h = setup(500, 0, PRICE_SCALE);
+        assert!(is_refused(&h, 500, &bands(u32::MAX, u32::MAX, u32::MAX)));
+        assert!(
+            is_refused(&h, 500, &bands(9_000, 8_000, 9_500)),
+            "warning above margin call"
+        );
+        assert!(
+            is_refused(&h, 500, &bands(7_000, 9_500, 9_000)),
+            "margin call above liquidation"
+        );
+    }
+
+    /// The failure as it was reported, end to end. A haircut above 100% used to be stored, and
+    /// from then on every release against debt panicked in `collateral_value`, trapping the
+    /// collateral. Now the bad config is refused, the config already in place stays, and the
+    /// release goes through.
+    #[test]
+    fn a_refused_config_leaves_the_asset_configured_and_releasable() {
+        // 5% haircut, $500 debt, $1.00 price.
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        assert!(is_refused(&h, 10_001, &h.thresholds));
+        assert!(is_refused(&h, 500, &bands(u32::MAX, u32::MAX, u32::MAX)));
+
+        // 950 units at a 5% haircut are worth $902.50 against $500: healthy, so this is allowed.
+        h.vault
+            .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 950 * PRICE_SCALE);
     }
 
     // ── #24: positions must survive ledger aging ────────────────────────────

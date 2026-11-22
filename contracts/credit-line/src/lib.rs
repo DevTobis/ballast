@@ -315,6 +315,7 @@ impl CreditLine {
         ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
+        risk::validate_haircut_bps(haircut_bps);
         thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
@@ -1320,6 +1321,27 @@ mod test {
         let id = open_and_fund(&h, 500 * PRICE_SCALE, 1_000 * PRICE_SCALE);
         h.credit_line.sync_collateral(&h.admin, &id, &(10_000 * PRICE_SCALE));
         h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    /// `configure_asset` refuses a haircut above 100% with `risk::validate_haircut_bps`, the check
+    /// `PledgeVault::configure_asset` runs too (#177). Stored, such a haircut made every draw, poke
+    /// and liquidation for the asset panic as soon as the collateral was valued.
+    #[test]
+    #[should_panic(expected = "haircut_bps")]
+    fn configure_asset_rejects_a_haircut_above_one_hundred_percent() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.token.address,
+            &10_001,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
     }
 
     // --- liquidation ----------------------------------------------------------------------
