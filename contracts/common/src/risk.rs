@@ -41,6 +41,20 @@ pub fn ltv_bps(debt: i128, collateral_value: i128) -> u32 {
     bps.clamp(0, u32::MAX as i128) as u32
 }
 
+/// Panics unless `haircut_bps` is at most 100% ([`BPS_DENOMINATOR`]).
+///
+/// [`collateral_value`] makes the same check, but only when a position is valued, which is after
+/// the asset's config has been stored: a haircut above 100% would be accepted and would then make
+/// every later valuation of that asset panic. A contract calls this where the haircut is
+/// configured, so a value that cannot be used is refused up front, and every contract that takes
+/// a haircut refuses the same inputs with the same message.
+pub fn validate_haircut_bps(haircut_bps: u32) {
+    assert!(
+        haircut_bps as i128 <= BPS_DENOMINATOR,
+        "risk: haircut_bps cannot exceed 10000 bps (100%)"
+    );
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -63,5 +77,38 @@ mod test {
     fn ltv_bps_zero_collateral_is_max() {
         assert_eq!(ltv_bps(1, 0), u32::MAX);
         assert_eq!(ltv_bps(0, 0), 0);
+    }
+
+    #[test]
+    fn validate_haircut_bps_accepts_zero_up_to_exactly_one_hundred_percent() {
+        validate_haircut_bps(0);
+        validate_haircut_bps(500);
+        validate_haircut_bps(10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
+    fn validate_haircut_bps_rejects_one_bp_over_one_hundred_percent() {
+        validate_haircut_bps(10_001);
+    }
+
+    #[test]
+    #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
+    fn validate_haircut_bps_rejects_the_largest_u32() {
+        validate_haircut_bps(u32::MAX);
+    }
+
+    /// The point of validating up front: whatever passes can always be valued later.
+    #[test]
+    fn a_validated_haircut_never_makes_collateral_value_panic() {
+        for haircut_bps in [0, 1, 5_000, 9_999, 10_000] {
+            validate_haircut_bps(haircut_bps);
+            assert!(collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, haircut_bps) >= 0);
+        }
+        // A 100% haircut is the edge of what is usable: the position is worth nothing.
+        assert_eq!(
+            collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, 10_000),
+            0
+        );
     }
 }
