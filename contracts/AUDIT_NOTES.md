@@ -105,6 +105,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
   `propose` replaces the first one's allowance.
+- **Terms.** `propose` holds a trade's term, counted from the proposal to `maturity_at`, to its
+  `kind`: 24h for intraday, 48h for overnight, 30 days for term and for open. It also refuses a
+  `rate_bps` above 10,000 (100% a year). Both are checked before the lender's allowance is granted.
+  An open repo still carries a `maturity_at`, the date it must be unwound by; calling it earlier is
+  not implemented, so on chain an open repo behaves like a term repo of up to 30 days.
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not

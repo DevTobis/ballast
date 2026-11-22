@@ -129,6 +129,53 @@ pub enum RepoKind {
     Term,
 }
 
+/// The longest a [`RepoKind::Intraday`] repo may run, from `propose` to `maturity_at` (PRD §5
+/// Phase 3: "same-day unwind").
+pub const MAX_INTRADAY_TERM_SECONDS: u64 = 24 * 60 * 60;
+
+/// The longest a [`RepoKind::Overnight`] repo may run: out one day and back the next, with room
+/// for a proposal made early on the first day.
+pub const MAX_OVERNIGHT_TERM_SECONDS: u64 = 48 * 60 * 60;
+
+/// The longest a [`RepoKind::Term`] repo may run (PRD §5 Phase 3: "term (up to 30 days)").
+pub const MAX_TERM_REPO_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// The furthest out a [`RepoKind::Open`] repo's `maturity_at` may be. The PRD's open repo is
+/// callable and has no agreed end date, but this contract needs one: `unwind` is gated on
+/// `maturity_at`, and the borrower's leg-2 allowance and the default path are sized from it. So
+/// for an open repo `maturity_at` is the date it must be unwound by, held to the same 30 days as
+/// the longest term repo. Calling an open repo before that date is not implemented.
+pub const MAX_OPEN_TERM_SECONDS: u64 = MAX_TERM_REPO_SECONDS;
+
+/// The highest `rate_bps` that `propose` accepts: 100% a year. Repo rates are money-market rates,
+/// so nothing real comes close. The cap is a guard against a mistyped rate, refused before the
+/// lender's allowance is granted, and it keeps `accrue_interest` far from overflow.
+pub const MAX_RATE_BPS: u32 = 10_000;
+
+/// Panics unless a repo of `kind` may run for `term_seconds`, counted from `propose` to
+/// `maturity_at`. `kind` is what indexers and the console classify a trade by, so a trade whose
+/// term does not fit its kind is refused rather than stored under a label that misdescribes it.
+fn require_term_fits_kind(kind: &RepoKind, term_seconds: u64) {
+    match kind {
+        RepoKind::Intraday => assert!(
+            term_seconds <= MAX_INTRADAY_TERM_SECONDS,
+            "repo-dvp: an intraday repo must mature within 24 hours"
+        ),
+        RepoKind::Overnight => assert!(
+            term_seconds <= MAX_OVERNIGHT_TERM_SECONDS,
+            "repo-dvp: an overnight repo must mature within 48 hours"
+        ),
+        RepoKind::Open => assert!(
+            term_seconds <= MAX_OPEN_TERM_SECONDS,
+            "repo-dvp: an open repo must mature within 30 days"
+        ),
+        RepoKind::Term => assert!(
+            term_seconds <= MAX_TERM_REPO_SECONDS,
+            "repo-dvp: a term repo must mature within 30 days"
+        ),
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepoStatus {
@@ -617,6 +664,13 @@ impl RepoDvp {
         if maturity_at <= env.ledger().timestamp() {
             panic!("repo-dvp: maturity_at must be in the future");
         }
+        // Both checked before the lender's allowance is granted further down: a mistyped rate, or
+        // a term that does not fit `kind`, should cost the lender nothing.
+        assert!(
+            rate_bps <= MAX_RATE_BPS,
+            "repo-dvp: rate_bps exceeds the maximum rate"
+        );
+        require_term_fits_kind(&kind, maturity_at - env.ledger().timestamp());
         // Refuse before any allowance is granted: a trade in an asset that was never
         // passed to `configure_asset` would settle leg 1 and then strand the lender
         // with no margin protection — `call_margin` and `default_close` read this

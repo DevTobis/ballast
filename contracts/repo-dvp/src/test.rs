@@ -222,6 +222,13 @@ fn hash(h: &Harness, b: u8) -> BytesN<32> {
 }
 
 fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_at: u64) -> u64 {
+    // A trade's kind has to fit its term (#216): intraday up to a day out, a term repo beyond.
+    let term_seconds = maturity_at.saturating_sub(h.env.ledger().timestamp());
+    let kind = if term_seconds <= MAX_INTRADAY_TERM_SECONDS {
+        RepoKind::Intraday
+    } else {
+        RepoKind::Term
+    };
     RepoDvpClient::new(&h.env, &h.repo).propose(
         &h.cash_lender,
         &h.cash_borrower,
@@ -229,10 +236,172 @@ fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_
         &units,
         &cash_amount,
         &rate_bps,
-        &RepoKind::Intraday,
+        &kind,
         &maturity_at,
         &hash(h, 7),
     )
+}
+
+// --- #216: a repo's term has to fit its kind, and its rate has a ceiling -------------------
+
+/// Proposes 100 units against 90 cash with the given kind and rate, maturing `term_seconds`
+/// from now.
+fn propose_kind(h: &Harness, kind: &RepoKind, rate_bps: u32, term_seconds: u64) -> u64 {
+    RepoDvpClient::new(&h.env, &h.repo).propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &h.rwa,
+        &(100 * PRICE_SCALE),
+        &(90 * PRICE_SCALE),
+        &rate_bps,
+        kind,
+        &(h.env.ledger().timestamp() + term_seconds),
+        &hash(h, 7),
+    )
+}
+
+/// The same proposal through `try_propose`: whether it was refused.
+fn is_refused(h: &Harness, kind: &RepoKind, rate_bps: u32, term_seconds: u64) -> bool {
+    RepoDvpClient::new(&h.env, &h.repo)
+        .try_propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &h.rwa,
+            &(100 * PRICE_SCALE),
+            &(90 * PRICE_SCALE),
+            &rate_bps,
+            kind,
+            &(h.env.ledger().timestamp() + term_seconds),
+            &hash(h, 7),
+        )
+        .is_err()
+}
+
+#[test]
+fn the_bounds_are_the_ones_the_prd_names() {
+    assert_eq!(MAX_INTRADAY_TERM_SECONDS, 24 * 3_600);
+    assert_eq!(MAX_OVERNIGHT_TERM_SECONDS, 48 * 3_600);
+    assert_eq!(MAX_TERM_REPO_SECONDS, 30 * 24 * 3_600);
+    assert_eq!(MAX_OPEN_TERM_SECONDS, MAX_TERM_REPO_SECONDS);
+    assert_eq!(MAX_RATE_BPS, 10_000);
+}
+
+#[test]
+fn every_kind_accepts_a_term_of_exactly_its_bound() {
+    let h = setup();
+    for (kind, bound) in [
+        (RepoKind::Intraday, MAX_INTRADAY_TERM_SECONDS),
+        (RepoKind::Overnight, MAX_OVERNIGHT_TERM_SECONDS),
+        (RepoKind::Open, MAX_OPEN_TERM_SECONDS),
+        (RepoKind::Term, MAX_TERM_REPO_SECONDS),
+    ] {
+        let id = propose_kind(&h, &kind, 500, bound);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        assert_eq!(trade.kind, kind);
+        assert_eq!(trade.maturity_at, h.env.ledger().timestamp() + bound);
+    }
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: an intraday repo must mature within 24 hours")]
+fn an_intraday_repo_one_second_over_a_day_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, 500, MAX_INTRADAY_TERM_SECONDS + 1);
+}
+
+/// The input from the report: `Intraday`, maturing 400 days out.
+#[test]
+#[should_panic(expected = "repo-dvp: an intraday repo must mature within 24 hours")]
+fn an_intraday_repo_400_days_out_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, 500, 400 * 24 * 3_600);
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: an overnight repo must mature within 48 hours")]
+fn an_overnight_repo_one_second_over_two_days_is_refused() {
+    let h = setup();
+    propose_kind(
+        &h,
+        &RepoKind::Overnight,
+        500,
+        MAX_OVERNIGHT_TERM_SECONDS + 1,
+    );
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: an open repo must mature within 30 days")]
+fn an_open_repo_one_second_over_thirty_days_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Open, 500, MAX_OPEN_TERM_SECONDS + 1);
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: a term repo must mature within 30 days")]
+fn a_term_repo_one_second_over_thirty_days_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Term, 500, MAX_TERM_REPO_SECONDS + 1);
+}
+
+/// Each kind is held to its own bound, not to a shared one: 36 hours is too long for intraday
+/// only, and 3 days is too long for intraday and overnight.
+#[test]
+fn a_term_one_kind_refuses_is_accepted_under_a_longer_kind() {
+    let h = setup();
+    let thirty_six_hours = 36 * 3_600;
+    let three_days = 3 * 24 * 3_600;
+
+    assert!(is_refused(&h, &RepoKind::Intraday, 500, thirty_six_hours));
+    assert!(!is_refused(&h, &RepoKind::Overnight, 500, thirty_six_hours));
+    assert!(!is_refused(&h, &RepoKind::Open, 500, thirty_six_hours));
+    assert!(!is_refused(&h, &RepoKind::Term, 500, thirty_six_hours));
+
+    assert!(is_refused(&h, &RepoKind::Intraday, 500, three_days));
+    assert!(is_refused(&h, &RepoKind::Overnight, 500, three_days));
+    assert!(!is_refused(&h, &RepoKind::Open, 500, three_days));
+    assert!(!is_refused(&h, &RepoKind::Term, 500, three_days));
+}
+
+#[test]
+fn a_rate_of_zero_and_of_exactly_the_maximum_are_accepted() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    let free = propose_kind(&h, &RepoKind::Intraday, 0, 3_600);
+    assert_eq!(repo.trade(&free).rate_bps, 0);
+
+    let dearest = propose_kind(&h, &RepoKind::Intraday, MAX_RATE_BPS, 3_600);
+    assert_eq!(repo.trade(&dearest).rate_bps, MAX_RATE_BPS);
+}
+
+#[test]
+#[should_panic(expected = "repo-dvp: rate_bps exceeds the maximum rate")]
+fn a_rate_one_bp_over_the_maximum_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, MAX_RATE_BPS + 1, 3_600);
+}
+
+/// The rate from the report: 4,000,000,000 bps, forty million percent.
+#[test]
+#[should_panic(expected = "repo-dvp: rate_bps exceeds the maximum rate")]
+fn a_rate_of_four_billion_bps_is_refused() {
+    let h = setup();
+    propose_kind(&h, &RepoKind::Intraday, 4_000_000_000, 3_600);
+}
+
+/// A proposal refused for its term or its rate leaves the lender's allowance at zero, and a
+/// proposal that fits then goes through as usual.
+#[test]
+fn a_proposal_refused_for_its_term_or_rate_grants_no_leg1_allowance() {
+    let h = setup();
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+
+    assert!(is_refused(&h, &RepoKind::Intraday, 500, 400 * 24 * 3_600));
+    assert!(is_refused(&h, &RepoKind::Intraday, MAX_RATE_BPS + 1, 3_600));
+    assert_eq!(usdc.allowance(&h.cash_lender, &h.repo), 0);
+
+    propose_kind(&h, &RepoKind::Intraday, 500, 3_600);
+    assert!(usdc.allowance(&h.cash_lender, &h.repo) >= 90 * PRICE_SCALE);
 }
 
 #[test]
