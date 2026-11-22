@@ -147,6 +147,11 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
   `propose` replaces the first one's allowance.
+- **Terms.** `propose` holds a trade's term, counted from the proposal to `maturity_at`, to its
+  `kind`: 24h for intraday, 48h for overnight, 30 days for term and for open. It also refuses a
+  `rate_bps` above 10,000 (100% a year). Both are checked before the lender's allowance is granted.
+  An open repo still carries a `maturity_at`, the date it must be unwound by; calling it earlier is
+  not implemented, so on chain an open repo behaves like a term repo of up to 30 days.
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not
@@ -157,6 +162,13 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
   No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
+- **Storage lifetime.** Every entry point extends the contract instance. Every write of a trade
+  extends that trade's entry, and the instance with it, to outlast `maturity_at` plus the unwind
+  grace, and never to less than about 30 days. The borrower's outstanding leg-2 sum is extended to
+  outlast the allowance it describes. Before this only the pause calls extended anything, so a
+  trade lived for the network's minimum persistent TTL from its last write: about 7 days on testnet
+  and about 120 on mainnet (their state-archival settings on 2026-11-22). `extend_ttl` is a
+  permissionless keep-alive for a trade longer than one extension can reach (about 180 days).
 
 ## Known limits
 
