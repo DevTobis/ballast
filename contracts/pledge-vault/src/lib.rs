@@ -446,6 +446,12 @@ impl PledgeVault {
     pub fn position_units(env: Env, line: u64, asset: Address) -> i128 {
         read_position(&env, line, &asset).units
     }
+
+    /// Read-only helper for consoles/tests: lien-mode units pledged but not yet
+    /// gateway-confirmed for `(line, asset)`. Always 0 in escrow mode.
+    pub fn position_pending_lien_units(env: Env, line: u64, asset: Address) -> i128 {
+        read_position(&env, line, &asset).pending_lien_units
+    }
 }
 
 #[cfg(test)]
@@ -926,5 +932,133 @@ mod test {
                 assert_eq!(v0.data, expected_data);
             }
         }
+    }
+
+    // ── B-0184: pledge accumulation & custody-mode flip on empty position ────────────────────────
+
+    /// (1) Two escrow pledges must sum into `position_units`.
+    ///
+    /// A borrower pledges 100 units then 50 units to the same `(line, asset)` position in escrow
+    /// mode. After the second pledge `position_units` must equal 150; the vault must hold the
+    /// combined balance.
+    #[test]
+    fn escrow_pledges_accumulate() {
+        let h = setup(500, 0, PRICE_SCALE);
+        // Mint enough for both pledges.
+        h.token.mint(&h.borrower, &(150 * PRICE_SCALE));
+
+        h.vault.pledge(&h.borrower, &10, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&10, &h.asset),
+            100 * PRICE_SCALE,
+            "after first pledge: 100"
+        );
+
+        h.vault.pledge(&h.borrower, &10, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&10, &h.asset),
+            150 * PRICE_SCALE,
+            "after second pledge: 150"
+        );
+        // Vault balance matches.
+        assert_eq!(h.token.balance(&h.vault.address), 150 * PRICE_SCALE);
+        // Borrower's balance is fully consumed.
+        assert_eq!(h.token.balance(&h.borrower), 0);
+    }
+
+    /// (2) Two `IssuerLien` pledges must accumulate in `pending_lien_units`; `position_units`
+    /// stays zero because no gateway has confirmed either lien yet.
+    ///
+    /// Uses the new `position_pending_lien_units` read-only view rather than `as_contract`.
+    #[test]
+    fn lien_pledges_accumulate_in_pending() {
+        let h = setup(500, 0, PRICE_SCALE);
+
+        // Switch the asset to issuer-lien mode.
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        // No token transfer expected; no mint needed.
+        h.vault.pledge(&h.borrower, &20, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&20, &h.asset),
+            0,
+            "lien pledge should NOT yet count toward LTV"
+        );
+        assert_eq!(
+            h.vault.position_pending_lien_units(&20, &h.asset),
+            100 * PRICE_SCALE,
+            "first lien pledge lands in pending"
+        );
+
+        h.vault.pledge(&h.borrower, &20, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&20, &h.asset),
+            0,
+            "still zero — gateway has not confirmed"
+        );
+        assert_eq!(
+            h.vault.position_pending_lien_units(&20, &h.asset),
+            200 * PRICE_SCALE,
+            "two lien pledges → 200 pending"
+        );
+        // Vault must hold no tokens in lien mode.
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+    }
+
+    /// (3) A position that has been fully released (units == 0, pending_lien_units == 0) must
+    /// allow the asset's custody mode to be changed, and a subsequent pledge in the new mode
+    /// must succeed.
+    ///
+    /// Flow: pledge 100 in Escrow → release 100 → reconfigure to IssuerLien → pledge 100.
+    #[test]
+    fn mode_flip_allowed_on_empty_position() {
+        // Zero debt so the full release passes the LTV health check.
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(100 * PRICE_SCALE));
+
+        // Step 1: pledge in escrow mode.
+        h.vault.pledge(&h.borrower, &30, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&30, &h.asset), 100 * PRICE_SCALE);
+
+        // Step 2: fully release — position is now empty.
+        h.vault.release(&h.borrower, &30, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&30, &h.asset), 0);
+        assert_eq!(
+            h.vault.position_pending_lien_units(&30, &h.asset),
+            0,
+            "pending must also be zero after full escrow release"
+        );
+
+        // Step 3: reconfigure to IssuerLien — allowed because position is empty.
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        // Step 4: pledge in the new mode must succeed; units go into pending, not position.units.
+        h.vault.pledge(&h.borrower, &30, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&30, &h.asset),
+            0,
+            "lien pledge: position_units still zero"
+        );
+        assert_eq!(
+            h.vault.position_pending_lien_units(&30, &h.asset),
+            100 * PRICE_SCALE,
+            "lien pledge after mode flip: 100 pending"
+        );
     }
 }
