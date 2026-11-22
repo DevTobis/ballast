@@ -23,6 +23,26 @@ Jobs run one at a time through a shared queue, because they share one account an
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
 Liquidation and margin steps are written to be safe to repeat after a crash.
 
+## Deployment Constraints
+
+**Strictly only one keeper instance may run per operator account.**
+
+Do not attempt to scale the keeper service (`--scale keeper=N`) for high availability. Every keeper job signs transactions using the same operator key, and Stellar strictly enforces sequential sequence numbers per account.
+
+### Why only one instance
+If multiple keeper instances run concurrently with the same operator account:
+- **`txBadSeq` errors**: Concurrent jobs fetch the same sequence number from the RPC network, causing one or both transactions to be rejected by the Stellar network.
+- **Race conditions & duplicate bookings**: Multiple instances could attempt to process the same unhealthy loan or mature repo trade simultaneously, resulting in duplicate liquidation records or conflicting contract calls.
+- **Wasted fees**: Redundant transactions that race each other burn transaction fees.
+
+### Rolling restarts
+When deploying updates to the keeper:
+- Always use a **stop-before-start** strategy (stop the old keeper container before starting the new one). Never use an overlapping start-before-stop rolling update.
+- Ensure the old instance is given enough time to shut down gracefully (`stop_grace_period: 70s` in Docker Compose allows `KEEPER_SHUTDOWN_GRACE_MS` to finish the in-flight job).
+
+### Advisory locking
+To defend against temporary overlaps during rolling restarts or misconfigured deployments, keeper acquires session-level Postgres advisory locks (`pg_try_advisory_lock`) on each tick before running a job. While this prevents simultaneous execution, running multiple instances remains an operational anti-pattern.
+
 ## Replica Behaviour and Advisory Locking
 
 All keeper jobs sign with a single operator account and need sequential transaction sequence numbers. To prevent duplicate submissions, race conditions, or `tx_bad_seq` errors across multiple replicas (e.g. `--scale keeper=2` or during rolling restarts):

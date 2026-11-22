@@ -33,6 +33,35 @@ it fires an `rpc_lag_high` alert (logged, and posted to `ALERT_WEBHOOK_URL` if s
 computed from the scanned ledger cursor rather than event rows, quiet periods on chain emit no false lag
 alerts. A failed cycle is logged and retried on the next tick. It stops after the current cycle on `SIGTERM`.
 
+## Monitoring
+
+### Metrics
+
+| Metric | Type | Labels / Context | Purpose |
+|---|---|---|---|
+| `indexer.events_ingested` | counter | `{ count }` | Count of decoded contract events written to `chain_event` in each cycle. |
+| `indexer.latest_ledger` | gauge | `latestLedger` | The latest ledger sequence observed from the RPC node during the cycle. |
+
+### Alerts
+
+Alerts are fired via `@ballast/observability` and sent to `ALERT_WEBHOOK_URL` when configured:
+
+- **`rpc_lag_high`**: Fired when the difference between the RPC chain tip and the last scanned ledger exceeds `LAG_ALERT_LEDGERS` (derived from `INDEXER_LAG_ALERT_SECONDS / 5`, default 12 ledgers for 60 seconds).
+  - **Context fields**:
+    - `lagLedgers`: Number of ledgers the indexer is behind the chain tip (`rpcTip - lastScannedLedger`).
+    - `latestLedger`: Current ledger sequence of the RPC tip.
+    - `lastScannedLedger`: Sequence of the last ledger successfully scanned by the indexer.
+    - `lastIngestedFrom`: Alias for `lastScannedLedger`.
+- **`event_gap_skipped`**: Fired when the indexer's resume cursor is older than the RPC node's retention window (`getHealth().oldestLedger`).
+  - **Context fields**:
+    - `skippedFrom`: The first ledger in the unrecoverable skipped range.
+    - `skippedTo`: The last ledger in the skipped range before clamping to `oldestLedger`.
+
+### Lag Semantics and Caveats
+
+- **Scanned cursor vs. event rows**: Lag is computed against the scanned ledger sequence (`state.lastScannedLedger` in memory and persisted in `indexer_cursor`), **not** the ledger of the latest ingested event row. On quiet chains where contracts produce no events for long periods, `lastScannedLedger` continues to advance with each cycle, avoiding false `rpc_lag_high` alerts (resolving Issue #62).
+- **Cold start / gap catch-up caveat**: On an initial cold start with an empty database or after a prolonged downtime, the indexer resumes scanning from `latestLedger - 1000` (or `max(ledger) + 1`). During the initial catch-up window until it reaches the tip, `rpc_lag_high` may fire until the backlog is drained.
+
 ## Run
 
 ```
