@@ -6,6 +6,7 @@ import { decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-ty
 import type { ChainGateway } from "../chain.js";
 import type { ContractClients } from "../contract-clients.js";
 import { recordIntent } from "../intents.js";
+import { exitExecuteRouteSchema, exitQuoteRequestRouteSchema } from "../openapi.js";
 import { exitExecuteSchema, exitQuoteRequestSchema } from "../schemas.js";
 import { requireAsset, requireStellarAccount } from "./helpers.js";
 
@@ -17,7 +18,7 @@ import { requireAsset, requireStellarAccount } from "./helpers.js";
 export const EXIT_MIN_OUT_FLOOR_BPS = 9_900n;
 
 export function registerExitRoutes(app: FastifyInstance, db: Database, contracts: ContractClients, chain: ChainGateway): void {
-  app.post("/v1/exit/quotes", async (request, reply) => {
+  app.post("/v1/exit/quotes", { schema: exitQuoteRequestRouteSchema as any }, async (request, reply) => {
     const body = exitQuoteRequestSchema.parse(request.body);
     const asset = await requireAsset(db, body.assetId);
 
@@ -51,7 +52,10 @@ export function registerExitRoutes(app: FastifyInstance, db: Database, contracts
     });
   });
 
-  app.post<{ Params: { id: string } }>("/v1/exit/quotes/:id/execute", async (request, reply) => {
+  app.post<{ Params: { id: string } }>(
+    "/v1/exit/quotes/:id/execute",
+    { schema: exitExecuteRouteSchema as any },
+    async (request, reply) => {
     const body = exitExecuteSchema.parse(request.body);
     const [quote] = await db.select().from(schema.exitQuote).where(eq(schema.exitQuote.id, request.params.id)).limit(1);
     if (!quote) return reply.code(404).send({ error: "quote not found" });

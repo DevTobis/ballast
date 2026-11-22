@@ -26,6 +26,7 @@ import { registerPositionRoutes } from "./routes/positions.js";
 import { registerReportRoutes } from "./routes/reports.js";
 import { registerPartyRoutes } from "./routes/parties.js";
 import { registerTxRoutes } from "./routes/tx.js";
+import { getOpenApiDocument } from "./openapi.js";
 
 export interface BuildServerOptions {
   config?: ApiConfig;
@@ -78,6 +79,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       done(err as Error, undefined);
     }
   });
+
+  // Preserve route schemas on route options for OpenAPI documentation without overriding
+  // the Zod validation and error formatting handled in the route handlers and error handler.
+  app.setValidatorCompiler(() => () => true);
+  app.setSerializerCompiler(() => (data) => JSON.stringify(data));
 
   void app.register(helmet);
   void app.register(cors, { origin: config.consoleOrigin });
@@ -140,6 +146,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   // GET /v1/assets and /v1/assets/:id/price are public per PRD §9 (no auth required to browse
   // supported assets/prices); everything else needs a resolved partyId.
   app.get("/healthz", { config: { public: true, rateLimit: false } }, async () => ({ ok: true }));
+  app.get("/v1/openapi.json", { config: { public: true, rateLimit: false } }, async () => getOpenApiDocument());
 
   registerAuthRoutes(app, db, config);
 

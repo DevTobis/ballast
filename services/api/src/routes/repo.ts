@@ -5,11 +5,17 @@ import { scaledToDecimalString } from "@ballast/domain-types";
 import type { ChainGateway } from "../chain.js";
 import type { ContractClients } from "../contract-clients.js";
 import { recordIntent, withTransaction } from "../intents.js";
+import {
+  repoProposalRouteSchema,
+  repoTopUpRouteSchema,
+  repoTradeAcceptRouteSchema,
+  repoTradeUnwindRouteSchema,
+} from "../openapi.js";
 import { repoProposalSchema, repoTopUpSchema, repoTradeActionSchema } from "../schemas.js";
 import { requireAsset, requireStellarAccount } from "./helpers.js";
 
 export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts: ContractClients, chain: ChainGateway): void {
-  app.post("/v1/repo/proposals", async (request, reply) => {
+  app.post("/v1/repo/proposals", { schema: repoProposalRouteSchema as any }, async (request, reply) => {
     const body = repoProposalSchema.parse(request.body);
     if (body.cashLenderId !== request.partyId) {
       return reply.code(403).send({ error: "a repo can only be proposed by its own cash lender" });
@@ -60,7 +66,10 @@ export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts
     return reply.code(201).send({ xdr, txHash, tradeId: row.id });
   });
 
-  app.post<{ Params: { id: string } }>("/v1/repo/proposals/:id/accept", async (request, reply) => {
+  app.post<{ Params: { id: string } }>(
+    "/v1/repo/proposals/:id/accept",
+    { schema: repoTradeAcceptRouteSchema as any },
+    async (request, reply) => {
     const body = repoTradeActionSchema.parse(request.body ?? {});
     const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, request.params.id)).limit(1);
     if (!trade) return reply.code(404).send({ error: "repo proposal not found" });
@@ -85,7 +94,10 @@ export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts
     return reply.code(201).send({ xdr, txHash, tradeId: trade.id });
   });
 
-  app.post<{ Params: { id: string } }>("/v1/repo/trades/:id/unwind", async (request, reply) => {
+  app.post<{ Params: { id: string } }>(
+    "/v1/repo/trades/:id/unwind",
+    { schema: repoTradeUnwindRouteSchema as any },
+    async (request, reply) => {
     const body = repoTradeActionSchema.parse(request.body ?? {});
     const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, request.params.id)).limit(1);
     if (!trade) return reply.code(404).send({ error: "repo trade not found" });
@@ -112,7 +124,10 @@ export function registerRepoRoutes(app: FastifyInstance, db: Database, contracts
 
   // The cash borrower's way to cure a margin call: add collateral. If it is enough, the contract
   // clears the call in the same transaction.
-  app.post<{ Params: { id: string } }>("/v1/repo/trades/:id/top-ups", async (request, reply) => {
+  app.post<{ Params: { id: string } }>(
+    "/v1/repo/trades/:id/top-ups",
+    { schema: repoTopUpRouteSchema as any },
+    async (request, reply) => {
     const body = repoTopUpSchema.parse(request.body);
     const [trade] = await db.select().from(schema.repoTrade).where(eq(schema.repoTrade.id, request.params.id)).limit(1);
     if (!trade) return reply.code(404).send({ error: "repo trade not found" });
