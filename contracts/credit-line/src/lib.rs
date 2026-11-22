@@ -614,7 +614,6 @@ impl CreditLine {
         ttl::extend_instance(&env);
         let _ = keeper;
         access::require_keeper(&env);
-        let _ = route;
 
         let mut state = read_line(&env, line);
         let breach_ledger = state
@@ -659,6 +658,11 @@ impl CreditLine {
         state.status = LineStatus::Liquidating;
         state.margin_state = MarginState::Liquidation;
         write_line(&env, line, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "liquidation_started"), line),
+            (route, state.pledged_units, price, view.debt),
+        );
     }
 
     /// Books the outcome of a liquidation and closes the line. Called by the lender once the
@@ -1673,5 +1677,63 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn liquidate_publishes_liquidation_started_event_and_none_on_failure() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &to);
+
+        // No event when liquidate fails before a flagged breach.
+        assert!(h
+            .credit_line
+            .try_liquidate(&h.keeper, &id, &LiquidationRoute::Transfer)
+            .is_err());
+        assert!(h.env.events().all().filter_by_contract(&h.credit_line.address).events().is_empty());
+
+        // Drop price to $0.50 -> breach LTV, flag via poke, advance ledger, liquidate.
+        h.price_guard.set_price(&(PRICE_SCALE / 2), &PriceStatus::Ok);
+        h.credit_line.poke(&id);
+        h.env.ledger().with_mut(|l| l.sequence_number += 1);
+
+        h.credit_line
+            .liquidate(&h.keeper, &id, &LiquidationRoute::Transfer);
+
+        let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+        let items = events.events();
+        assert_eq!(items.len(), 1);
+        let body = match &items[0].body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0, Symbol::new(&h.env, "liquidation_started"));
+        assert_eq!(topic1, id);
+
+        let data: (LiquidationRoute, i128, i128, i128) = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data.0, LiquidationRoute::Transfer);
+        assert_eq!(data.1, 1_000 * PRICE_SCALE);
+        assert_eq!(data.2, PRICE_SCALE / 2);
+        assert_eq!(data.3, 500 * PRICE_SCALE);
     }
 }
