@@ -1674,4 +1674,47 @@ mod test {
             );
         });
     }
+
+    #[test]
+    fn ltv_view_reflects_accrued_interest_zero_collateral_and_degraded_price() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        let view1 = h.credit_line.ltv(&id);
+        assert_eq!(view1.debt, 550 * PRICE_SCALE);
+        assert_eq!(view1.collateral_value, 1_000 * PRICE_SCALE);
+        assert_eq!(view1.ltv_bps, 5_500);
+        assert_eq!(view1.state, MarginState::Healthy);
+        assert_eq!(view1.price_status, PriceStatus::Ok);
+
+        h.price_guard.set_price(&PRICE_SCALE, &PriceStatus::Degraded);
+        let view_deg = h.credit_line.ltv(&id);
+        assert_eq!(view_deg.debt, 550 * PRICE_SCALE);
+        assert_eq!(view_deg.collateral_value, 1_000 * PRICE_SCALE);
+        assert_eq!(view_deg.ltv_bps, 5_500);
+        assert_eq!(view_deg.state, MarginState::Healthy);
+        assert_eq!(view_deg.price_status, PriceStatus::Degraded);
+
+        h.price_guard.set_price(&PRICE_SCALE, &PriceStatus::Ok);
+        h.credit_line.sync_collateral(&h.admin, &id, &0);
+        let view_zero = h.credit_line.ltv(&id);
+        assert_eq!(view_zero.debt, 550 * PRICE_SCALE);
+        assert_eq!(view_zero.collateral_value, 0);
+        assert_eq!(view_zero.ltv_bps, u32::MAX);
+        assert_eq!(view_zero.state, MarginState::Liquidation);
+        assert_eq!(view_zero.price_status, PriceStatus::Ok);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn ltv_panics_for_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.ltv(&999);
+    }
 }
