@@ -1250,4 +1250,81 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn pledge_release_liquidate_and_record_lien_emit_expected_events() {
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let contract_events = || {
+            h.env
+                .events()
+                .all()
+                .events()
+                .into_iter()
+                .filter(|e| e.type_ == ContractEventType::Contract)
+                .cloned()
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        let assert_event = |topic: &str, line: u64, expected_val: soroban_sdk::Val| {
+            let evs = contract_events();
+            assert_eq!(evs.len(), 1, "expected 1 contract event for {topic}");
+            let expected_t0 = ScVal::Symbol(ScSymbol(topic.try_into().unwrap()));
+            let expected_t1 = ScVal::U64(line);
+            let expected_data = ScVal::try_from_val(&h.env, &expected_val).unwrap();
+            match &evs[0].body {
+                ContractEventBody::V0(v0) => {
+                    assert_eq!(v0.topics.get(0), Some(&expected_t0));
+                    assert_eq!(v0.topics.get(1), Some(&expected_t1));
+                    assert_eq!(v0.data, expected_data);
+                }
+            }
+        };
+
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(600 * PRICE_SCALE));
+        assert_event("pledged", 1, (h.asset.clone(), 600 * PRICE_SCALE).into_val(&h.env));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(200 * PRICE_SCALE));
+        assert_event("released", 1, (h.asset.clone(), 200 * PRICE_SCALE).into_val(&h.env));
+
+        let recipient = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &recipient);
+        assert_event(
+            "liquidated",
+            1,
+            (h.asset.clone(), 400 * PRICE_SCALE, recipient).into_val(&h.env),
+        );
+
+        let fail_rel = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.release(&h.borrower, &1, &h.asset, &(1 * PRICE_SCALE));
+        }));
+        assert!(fail_rel.is_err());
+        assert_eq!(contract_events().len(), 0);
+
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+        h.vault.pledge(&h.borrower, &2, &h.asset, &(300 * PRICE_SCALE));
+        assert_event("pledged", 2, (h.asset.clone(), 300 * PRICE_SCALE).into_val(&h.env));
+
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-187");
+        h.vault
+            .record_lien(&gateway, &2, &h.asset, &(300 * PRICE_SCALE), &lien_ref);
+        assert_event(
+            "lien_recorded",
+            2,
+            (h.asset.clone(), 300 * PRICE_SCALE, lien_ref).into_val(&h.env),
+        );
+    }
 }
