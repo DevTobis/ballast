@@ -84,8 +84,18 @@ export class CreditLineClient extends BaseContractClient {
     ]);
   }
 
+  /**
+   * Repay drawn balance and accrued interest. `amount` acts as a cap: on-chain `repay`
+   * applies `min(amount, owed)` (interest first, then principal) and transfers only
+   * what was applied, returning the applied amount.
+   */
   repay(source: string, line: bigint, amount: bigint): Promise<string> {
     return this.invoke(source, "repay", [scAddress(source), scU64(line), scI128(amount)]);
+  }
+
+  /** Read-only: what the borrower owes right now (principal plus interest accrued to this ledger). */
+  debtOf(line: bigint): Promise<bigint> {
+    return this.read<bigint>("debt_of", [scU64(line)]);
   }
 
   /**
