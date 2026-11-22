@@ -9,12 +9,37 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
-| `keeper` | `sync_collateral`, `liquidate`, vault `liquidate`, repo `call_margin`/`default_close`, `poke` | choose a price; liquidate without a confirmed breach on a later ledger |
+| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
 
-The keeper is trusted for **timing and completeness**, not for **value**: every amount a settlement
-uses comes from the contract's own state or from the PriceGuard, never from a keeper-supplied number.
+The keeper is trusted for **timing and completeness**, and for three **values** it supplies (see
+"Keeper-supplied values" below). Every other amount a settlement uses comes from the contract's
+own state or from the PriceGuard. The three supplied values are checked only lightly on-chain;
+that they match reality is enforced by the off-chain keeper job, not by the contracts.
+
+### Keeper-supplied values (enforced off-chain only)
+
+Three values a settlement uses are supplied by the keeper (or admin) rather than read from
+contract state or the PriceGuard. On-chain each is checked only for a range or a bound; that it
+matches the real world is the off-chain keeper job's responsibility, not the contracts'.
+
+| Value | Supplied to | What it decides | On-chain check | Enforcement |
+|---|---|---|---|---|
+| `units` | `CreditLine::sync_collateral` (`contracts/credit-line/src/lib.rs:452`) | the line's booked `pledged_units`, which feeds LTV, draws, and the seized units in a `LiquidationRecord` | `units >= 0` only; no check against the vault's actual balance | Off-chain only: the keeper job reads the balance from the vault (see #162, #815) |
+| `units`, `to` | `PledgeVault::liquidate` (`contracts/pledge-vault/src/lib.rs:447`) | how many units move, and to whom, on liquidation | `units > 0` and `units <= position.units` only; no check that `units` equals the frozen `LiquidationRecord.seized_units` or that `to` is the lender | Off-chain only: the keeper job moves the frozen amount to the lender after `CreditLine::liquidate` confirms the breach |
+| timing of `liquidate` | `CreditLine::liquidate` (`contracts/credit-line/src/lib.rs:613`) | when a confirmed breach becomes a liquidation | the breach must have been flagged by a `poke` on an earlier ledger and still confirm at an `Ok` price; the keeper chooses the moment | Off-chain only: the keeper job decides when to submit it |
+
+`poke` (and the `ltv` read) are permissionless — anyone may call them, not only the keeper — so
+their timing is not a keeper-supplied value either. They only make stored state match a fresh
+price, which is why that is safe (see #211).
+
+The admin is trusted to choose margin thresholds, but not to choose ones that break the state
+machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
+`MarginThresholds::validate`, which refuses anything but
+`0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`. Equal thresholds were accepted
+before #78 and silently removed a state (`Warning` or `MarginCall`). Thresholds stored before that
+change are not re-checked; calling `configure_asset` again is the only way to replace them.
 
 ## PriceGuard
 
@@ -79,16 +104,28 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   left, in the window before the next sync, leaving the lender funding against collateral that was
   gone. `sync_collateral` remains as a keeper/admin reconciliation path and now sets the vault's own
   balance (the keeper job reads it from the vault, never from Postgres).
+- **`sync_collateral` takes its figure from the caller.** The keeper (or admin) supplies `units`
+  and the contract writes it straight into the line's `pledged_units` with only a `units >= 0`
+  check — it does not verify the figure against the vault's actual balance. The vault-driven
+  `sync_from_vault` path does carry the vault's real balance (vault-authenticated), but the keeper
+  path's match to reality is enforced by the off-chain keeper job, not on-chain. See
+  "Keeper-supplied values" above; the auth/validation tests are tracked in #162, and the
+  oversized-figure risk in #815.
 
 ## PledgeVault
 
 - `pledge` requires the line's own borrower and collateral asset, and refuses to take units in a
   different custody mode than the position already holds (`release` moves tokens or not according to
   the mode recorded on the position, so flipping it under live units would strand them).
-- `release` cross-calls `CreditLine::ltv` and `borrower_of`; ownership is checked there.
+- `release` cross-calls `CreditLine::debt_of` and `borrower_of`; it only cross-calls `CreditLine::ltv` (and the price guard) when the line still owes something — with zero debt there is no price or LTV check, so a degraded or halted price cannot trap collateral (#182). Ownership is checked there.
 - `liquidate` has no LTV check by design: it is the liquidation path, keeper-gated. Its safety
   depends on `CreditLine::liquidate` having confirmed the breach first, enforced off-chain by the
   keeper job, not on-chain.
+- **Vault `liquidate` takes its amount and recipient from the keeper.** `units` and `to` are
+  supplied by the caller; on-chain they are checked only against `units > 0` and
+  `units <= position.units`. Nothing on-chain verifies that `units` equals the frozen
+  `LiquidationRecord.seized_units` or that `to` is the lender — that match is enforced by the
+  off-chain keeper job. See "Keeper-supplied values" above.
 
 ## ExitDesk
 
@@ -99,6 +136,11 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   contract between transactions.
 - Quotes are the guarded price less the spread, rounded down (in the desk's favour), and refuse any
   price that is not `Ok`.
+- `exit` compares the desk's own USDC balance with the payout before it takes the holder's RWA, and
+  refuses with `exit-desk: insufficient USDC float` when the balance is smaller. This is for a
+  readable error, not for safety: the swap was already atomic, and a short float used to fail in the
+  USDC token's own transfer. `available_usdc` is the same balance as a free read; like a quote, it
+  can be out of date by the time an exit lands.
 
 ## RepoDvP
 

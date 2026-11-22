@@ -1,0 +1,26 @@
+# CreditLine
+
+The `CreditLine` contract holds lender commitments, draws, repayments, interest accrual, LTV and
+margin state, and the liquidation entry points (PRD §6.2, §8). USDC is held in transit only:
+funded-but-undrawn between `fund` and `draw`, plus repaid interest waiting for
+`withdraw_interest`. See the module doc comment in `src/lib.rs` for what is intentionally
+simplified in this pass.
+
+## Contract Events
+
+Events follow the same convention as `PledgeVault`: one event per state change, with the shape
+`((Symbol, line), payload)`.
+
+| Event | Topics | Data | Emitted by |
+|---|---|---|---|
+| `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
+| `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
+
+`undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
+figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
+publishes nothing.
+
+## Building and testing
+
+`cargo test -p ballast-credit-line` from `contracts/` runs the unit tests on the host target.
+Building the WASM needs `stellar contract build` — see [`../README.md`](../README.md).

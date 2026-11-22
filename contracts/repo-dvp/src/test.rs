@@ -979,18 +979,57 @@ fn configure_asset_accepts_valid_thresholds() {
         },
     );
 
-    // Equal boundaries are valid
+    // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
     repo.configure_asset(
         &h.admin,
         &new_asset,
         &h.price_guard,
         &500u32,
         &MarginThresholds {
-            warning_bps: 8_000,
-            margin_call_bps: 8_000,
-            liquidation_bps: 8_000,
+            warning_bps: 9_998,
+            margin_call_bps: 9_999,
+            liquidation_bps: 10_000,
         },
     );
+}
+
+#[test]
+fn configure_asset_rejects_equal_thresholds() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    // warning == margin_call: Warning could never be reported (#78)
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res1.is_err(), "warning == margin_call must be rejected");
+
+    // margin_call == liquidation: MarginCall could never be reported (#78)
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "margin_call == liquidation must be rejected");
 }
 
 #[test]
@@ -1013,6 +1052,22 @@ fn configure_asset_rejects_zero_thresholds() {
         );
     }));
     assert!(res.is_err(), "zero thresholds must be rejected");
+
+    // A zero margin_call_bps alone: call_margin divides by it, so it must never be stored (#78)
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 0,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "zero margin_call_bps must be rejected");
 }
 
 #[test]
