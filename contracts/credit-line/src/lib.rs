@@ -580,7 +580,8 @@ impl CreditLine {
     pub fn poke(env: Env, line: u64) -> MarginState {
         ttl::extend_instance(&env);
         let mut state = read_line(&env, line);
-        let view = compute_ltv(&env, &state);
+        let from_state = state.margin_state.clone();
+        let (view, price) = read_ltv(&env, &state);
         state.margin_state = view.state.clone();
 
         if matches!(view.state, MarginState::MarginCall | MarginState::Liquidation) {
@@ -604,6 +605,13 @@ impl CreditLine {
         }
 
         write_line(&env, line, &state);
+
+        if view.state != from_state {
+            env.events().publish(
+                (Symbol::new(&env, "margin_state_changed"), line),
+                (from_state, view.state.clone(), view.ltv_bps, price),
+            );
+        }
         view.state
     }
 
@@ -1673,5 +1681,61 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn poke_publishes_margin_state_changed_only_when_state_moves() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(600 * PRICE_SCALE), &to);
+
+        // Repeat poke while still Healthy -> no event.
+        assert_eq!(h.credit_line.poke(&id), MarginState::Healthy);
+        assert!(h.env.events().all().filter_by_contract(&h.credit_line.address).events().is_empty());
+
+        // Move price to $0.85 -> 600 / 807.5 ~ 7430 bps (Warning) -> emits Healthy -> Warning.
+        let warning_price = 8_500_000;
+        h.price_guard.set_price(&warning_price, &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Warning);
+
+        let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+        let items = events.events();
+        assert_eq!(items.len(), 1);
+        let body = match &items[0].body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0, Symbol::new(&h.env, "margin_state_changed"));
+        assert_eq!(topic1, id);
+
+        let data: (MarginState, MarginState, u32, i128) = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data.0, MarginState::Healthy);
+        assert_eq!(data.1, MarginState::Warning);
+        assert!(data.2 >= 7_000 && data.2 < 8_000);
+        assert_eq!(data.3, warning_price);
+
+        // Repeat poke at the same Warning state -> no duplicate event.
+        assert_eq!(h.credit_line.poke(&id), MarginState::Warning);
+        assert!(h.env.events().all().filter_by_contract(&h.credit_line.address).events().is_empty());
     }
 }
