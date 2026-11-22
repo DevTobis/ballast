@@ -1674,4 +1674,62 @@ mod test {
             );
         });
     }
+
+    #[test]
+    #[should_panic(expected = "credit-line: amount must be positive")]
+    fn withdraw_undrawn_zero_amount_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.withdraw_undrawn(&h.lender, &id, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: amount must be positive")]
+    fn withdraw_interest_zero_amount_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.withdraw_interest(&h.lender, &id, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: withdrawal exceeds the interest repaid")]
+    fn withdraw_interest_with_none_repaid_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.withdraw_interest(&h.lender, &id, &(1 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn withdraw_undrawn_exact_remaining_leaves_funded_equal_drawn() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(400 * PRICE_SCALE), &h.borrower.clone());
+
+        h.credit_line
+            .withdraw_undrawn(&h.lender, &id, &(600 * PRICE_SCALE));
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.funded, 400 * PRICE_SCALE);
+        assert_eq!(line.funded, line.drawn);
+        assert_eq!(h.token.balance(&h.credit_line.address), 0);
+        assert_eq!(h.token.balance(&h.lender), 600 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn withdraw_undrawn_succeeds_on_closed_line_after_shortfall_close() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+        assert_eq!(h.credit_line.line(&id).funded, 400 * PRICE_SCALE);
+
+        h.credit_line
+            .withdraw_undrawn(&h.lender, &id, &(400 * PRICE_SCALE));
+        let after = h.credit_line.line(&id);
+        assert_eq!(after.status, LineStatus::Closed);
+        assert_eq!(after.funded, 0);
+        assert_eq!(h.token.balance(&h.lender), 400 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.credit_line.address), 0);
+    }
 }
