@@ -104,7 +104,11 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - **Platform fees & invariant 6 (`fee_bps`)**: `open` takes `fee_bps <= 10_000` (simple
   non-compounding annual rate on `drawn`, included in `debt_of` and LTV). `repay` allocates
   `fee -> interest -> principal`; repaid fees accumulate in `FeeClaimable(line)` and can only be
-  withdrawn by the configured `Treasury` address via `claim_fee` (not pause-gated).
+  withdrawn by the configured `Treasury` address via `claim_fee` (not pause-gated). On
+  liquidation, unpaid platform fees are left out of `LiquidationRecord.debt` and waived in
+  `close_liquidated` so the lender never pockets protocol fees or shrinks the borrower's surplus
+  (any fees already repaid before liquidation remain in `FeeClaimable`). Adding `fee_bps` and
+  `accrued_fee` changes the `Line` storage layout and requires a fresh contract redeploy.
 - `draw` enforces `limit` (it previously only checked `funded`). `fund` is refused on a closed line.
 - Interest is simple, non-compounding, accrued on principal per second.
 - **Collateral is reported by the vault, in the same transaction.** `PledgeVault` calls

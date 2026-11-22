@@ -124,7 +124,8 @@ pub struct LiquidationRecord {
     pub seized_units: i128,
     /// Guarded price (7-decimal) read when the breach was confirmed.
     pub price: i128,
-    /// Principal plus interest owed at that moment.
+    /// Principal plus interest owed to the lender at that moment (excludes unpaid platform fees,
+    /// which are waived on liquidation rather than settled to the lender).
     pub debt: i128,
     pub closed: bool,
     /// `seized_units * price`, no haircut. Zero until the line is closed.
@@ -262,14 +263,14 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
         .expect("credit-line: asset not configured")
 }
 
-/// Interest accrued between `line.last_accrual_ts` and `now`, on top of whatever is already
-/// booked in `line.accrued_interest`. Simple, non-compounding annualized rate, matching PRD §5's
-/// "Fixed annual rate per line, accrued per ledger": `drawn * rate_bps * elapsed_s / year_s /
-/// 10_000`.
 fn rate_delta(drawn: i128, bps: u32, elapsed: i128) -> i128 {
     (drawn * bps as i128 * elapsed) / SECONDS_PER_YEAR / BPS_DENOMINATOR
 }
 
+/// Interest accrued between `line.last_accrual_ts` and `now`, on top of whatever is already
+/// booked in `line.accrued_interest`. Simple, non-compounding annualized rate, matching PRD §5's
+/// "Fixed annual rate per line, accrued per ledger": `drawn * rate_bps * elapsed_s / year_s /
+/// 10_000`.
 fn interest_delta(line: &Line, now: u64) -> i128 {
     let elapsed = now.saturating_sub(line.last_accrual_ts) as i128;
     rate_delta(line.drawn, line.rate_bps, elapsed)
@@ -738,14 +739,18 @@ impl CreditLine {
         );
 
         // Freeze what the outcome will be measured against: the whole position, the confirmed
-        // price and the debt at this moment (see `LiquidationRecord`).
+        // price and the lender's debt (principal + interest) at this moment (see
+        // `LiquidationRecord`). Unpaid platform fees are excluded so the lender never pockets
+        // protocol fees or reduces the borrower's surplus; `close_liquidated` waives them.
+        let now = env.ledger().timestamp();
+        let lender_debt = state.drawn + state.accrued_interest + interest_delta(&state, now);
         write_liquidation(
             &env,
             line,
             &LiquidationRecord {
                 seized_units: state.pledged_units,
                 price,
-                debt: view.debt,
+                debt: lender_debt,
                 closed: false,
                 recovered: 0,
                 surplus: 0,
@@ -3014,5 +3019,89 @@ mod test {
         assert_eq!(final_applied, 525 * PRICE_SCALE);
         assert_eq!(h.credit_line.debt_of(&id), 0);
         assert_eq!(h.credit_line.claimable_interest(&id), 50 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn liquidation_excludes_unpaid_fee_from_record_debt_and_preserves_borrower_surplus() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let treasury = Address::generate(&h.env);
+        h.credit_line.set_treasury(&h.admin, &treasury);
+
+        let agreement = BytesN::from_array(&h.env, &[10u8; 32]);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &200,
+            &86_400,
+            &agreement,
+        );
+        h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &to);
+
+        // Year 1: interest = 50, fee = 10. Borrower repays 10 (fully into FeeClaimable).
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.credit_line.repay(&h.borrower, &id, &(10 * PRICE_SCALE));
+        assert_eq!(h.credit_line.claimable_fee(&id), 10 * PRICE_SCALE);
+
+        // Year 2: +50 interest (100 total) and +10 unpaid fee -> debt_of = 610, lender debt = 600.
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        assert_eq!(h.credit_line.debt_of(&id), 610 * PRICE_SCALE);
+
+        // Price drops to $0.65 -> 1,000 units = 650 (LTV 610/650 = 9,384 bps -> Liquidation).
+        h.price_guard
+            .set_price(&(65 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+        h.env
+            .ledger()
+            .set_sequence_number(h.env.ledger().sequence() + 1);
+        h.credit_line
+            .liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+
+        // Unpaid fee (10) is excluded from LiquidationRecord.debt so the lender cannot pocket it.
+        let frozen = h.credit_line.liquidation_record(&id);
+        assert_eq!(frozen.debt, 600 * PRICE_SCALE);
+
+        let borrower_before = h.token.balance(&h.borrower);
+        // Full surplus = 650 - 600 = 50 (not shrunk to 40 by unpaid platform fee).
+        h.token.mint(&h.lender, &(50 * PRICE_SCALE));
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        let closed = h.credit_line.liquidation_record(&id);
+        assert!(closed.closed);
+        assert_eq!(closed.debt, 600 * PRICE_SCALE);
+        assert_eq!(closed.recovered, 650 * PRICE_SCALE);
+        assert_eq!(closed.surplus, 50 * PRICE_SCALE);
+        assert_eq!(closed.shortfall, 0);
+        assert_eq!(
+            h.token.balance(&h.borrower) - borrower_before,
+            50 * PRICE_SCALE
+        );
+        assert_eq!(h.token.balance(&h.lender), 0);
+
+        let final_line = h.credit_line.line(&id);
+        assert_eq!(final_line.status, LineStatus::Closed);
+        assert_eq!(final_line.accrued_fee, 0);
+
+        // Previously repaid fee (10) remains claimable by treasury; unpaid fee (10) was waived.
+        assert_eq!(h.credit_line.claimable_fee(&id), 10 * PRICE_SCALE);
+        h.credit_line
+            .claim_fee(&treasury, &id, &(10 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&treasury), 10 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_fee(&id), 0);
+
+        // Undrawn principal (500) withdraws cleanly and leaves exact 0 contract balance.
+        h.credit_line
+            .withdraw_undrawn(&h.lender, &id, &(500 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&h.credit_line.address), 0);
     }
 }
