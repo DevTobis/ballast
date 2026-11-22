@@ -48,6 +48,88 @@ invariant 5 ("pausing cannot move funds") requires it.
 
 Read-only entry points (`quote`, `ltv`, `margin_view` and the other getters) are ungated as well.
 
+## Credit-line lifecycle
+
+The credit line has two independent dimensions:
+
+- `LineStatus`: `Open`, `Liquidating`, or `Closed`
+- `MarginState`: `Healthy`, `Warning`, `MarginCall`, or `Liquidation`
+
+Status and margin state are orthogonal: an `Open` line can be `Warning`, `MarginCall`, or `Liquidation`; only `liquidate` changes `Open` to `Liquidating`, and only `close_liquidated` changes `Liquidating` to `Closed`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Open: open / lender auth; limit > 0
+
+    state Open {
+        [*] --> Healthy
+
+        Healthy --> Healthy: draw / post-draw LTV is Healthy
+        Healthy --> Warning: poke / warning range
+        Healthy --> MarginCall: poke / margin-call range
+        Healthy --> Liquidation: poke / ltv >= liquidation_bps
+
+        Warning --> Healthy: poke / ltv < warning_bps
+        Warning --> MarginCall: poke / margin-call range
+        Warning --> Liquidation: poke / ltv >= liquidation_bps
+
+        MarginCall --> Healthy: poke / ltv < warning_bps
+        MarginCall --> Warning: poke / warning range
+        MarginCall --> Liquidation: poke / ltv >= liquidation_bps
+
+        Liquidation --> Healthy: poke / ltv < warning_bps
+        Liquidation --> Warning: poke / warning range
+        Liquidation --> MarginCall: poke / margin-call range
+
+        Healthy --> Healthy: sync_from_vault / sync_collateral
+        Warning --> Warning: sync_from_vault / sync_collateral
+        MarginCall --> MarginCall: sync_from_vault / sync_collateral
+        Liquidation --> Liquidation: sync_from_vault / sync_collateral
+    }
+
+    Open --> Liquidating: liquidate / breach armed and later-ledger Ok liquidation
+    Liquidating --> Closed: close_liquidated / lender auth; Liquidating status
+    Closed --> [*]
+
+    note right of Open
+        poke in Liquidation with an Ok price arms or preserves breach_ledger.
+        poke outside Liquidation or with a non-Ok price clears breach_ledger.
+        draw, poke, liquidate, and close_liquidated refresh margin_state.
+        sync_* changes pledged_units only and does not refresh it.
+    end note
+```
+
+The exact `MarginState` boundaries are computed by `margin::classify`:
+
+| Margin state | LTV condition |
+|---|---|
+| `Healthy` | `ltv_bps < warning_bps` |
+| `Warning` | `ltv_bps >= warning_bps` and `ltv_bps < margin_call_bps` |
+| `MarginCall` | `ltv_bps >= margin_call_bps` and `ltv_bps < liquidation_bps` |
+| `Liquidation` | `ltv_bps >= liquidation_bps` |
+
+Every boundary is inclusive on the higher-LTV side (`>=`). The configured threshold names and limits are: `0 < warning_bps <= margin_call_bps <= liquidation_bps <= 10_000`.
+
+`ltv()` is the source of truth for current margin. It reads debt, collateral, the guarded price, and configured thresholds without persisting state. `Line.margin_state` is only a cache refreshed by `draw`, `poke`, `liquidate`, and `close_liquidated`. `sync_from_vault` and `sync_collateral` change `pledged_units` but deliberately do not refresh the cache; a later `ltv()` or `poke()` can therefore report a state different from stored `Line.margin_state`.
+
+Liquidation is deliberately two-phase. `poke` at `Liquidation` with an `Ok` price stores the current ledger sequence in `breach_ledger`. `liquidate` succeeds only in a later ledger (`current ledger sequence > breach_ledger`), and only if a fresh read remains `Ok` and `Liquidation`. For example, if `poke` runs in ledger 100, it may not liquidate in ledger 100; it may be attempted in ledger 101 or later, but only after the second read confirms the breach.
+
+This is why `Warning` can remain `Open`: status is the lifecycle state, while margin state describes the current LTV band. `Warning` is not a status transition and does not seize collateral or enter liquidation; the line remains `Open` until a separately guarded `liquidate` call succeeds.
+
+| Trigger function | Guard conditions (verbatim panic messages) | Resulting `status` | Resulting `margin_state` | Resulting `breach_ledger` |
+|---|---|---|---|---|
+| `open` | Lender authorization required. `limit > 0`: `credit-line: limit must be positive` | `Open` | `Healthy` | `None` |
+| `draw` | Draws scope not paused: `ballast-common: paused`; borrower authorization; borrower matches line: `credit-line: not this line's borrower`; `amount > 0`: `credit-line: amount must be positive`; status is `Open`: `credit-line: line is not open`; funded-undrawn balance: `credit-line: draw exceeds funded-but-undrawn balance`; line limit: `credit-line: draw exceeds the line's limit`; guarded price status: `credit-line: price status is not Ok`; post-draw margin: `credit-line: draw would push the line past a healthy LTV` | `Open` unchanged | Refreshed to `Healthy` on success (post-draw LTV is guarded to remain healthy) | Unchanged |
+| `poke` — arm | No explicit guard; permissionless. Applies only when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is `None` | `Open` unchanged | Refreshed to `Liquidation` | Set to the current ledger sequence |
+| `poke` — preserve arm | No explicit guard; permissionless. Applies when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is already `Some(...)` | `Open` unchanged | Refreshed to `Liquidation` | Preserved unchanged |
+| `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | `Open` unchanged | Refreshed to the fresh state: `Healthy`, `Warning`, or `MarginCall` | Cleared to `None` |
+| `liquidate` | Keeper authorization; breach exists: `credit-line: no confirmed breach flagged; call poke(line) first`; current ledger sequence is greater than `breach_ledger`: `credit-line: liquidation needs a later ledger than the flagged breach`; status is `Open`: `credit-line: line is not open`; fresh guarded price status: `credit-line: price status is not Ok`; fresh state: `credit-line: breach is no longer confirmed` | `Liquidating` | `Liquidation` | Preserved unchanged |
+| `close_liquidated` | Lender authorization; lender matches line: `credit-line: not this line's lender`; status is `Liquidating`: `credit-line: line is not being liquidated` | `Closed` | `Healthy` | Cleared to `None` |
+| `sync_from_vault` | Configured vault authorization; configured vault check: `credit-line: caller is not the configured vault`; vault not configured: `credit-line: vault not configured`; `units >= 0`: `credit-line: units cannot be negative`; matching line asset: `credit-line: not this line's collateral asset` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
+| `sync_collateral` | Caller authorization and caller is stored admin or keeper: `ballast-common: caller is neither admin nor keeper`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
+
+For details about the surrounding contract and service layout, see [ARCHITECTURE.md](../ARCHITECTURE.md).
+
 ### Known gaps
 
 - `repo-dvp::propose` is not gated, although `require_not_paused`'s doc comment treats a new repo as
