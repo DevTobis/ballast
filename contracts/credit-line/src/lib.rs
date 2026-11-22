@@ -442,6 +442,11 @@ impl CreditLine {
         );
         state.pledged_units = units;
         write_line(&env, line, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "collateral_synced"), line),
+            (asset, units, Symbol::new(&env, "vault")),
+        );
     }
 
     /// Sets the line's locally-tracked collateral figure. See module docs: in the real system
@@ -454,9 +459,21 @@ impl CreditLine {
         access::require_admin_or_keeper(&env, &caller);
         assert!(units >= 0, "credit-line: units cannot be negative");
 
+        let roles = access::read_roles(&env);
+        let source = if caller == roles.keeper {
+            Symbol::new(&env, "keeper")
+        } else {
+            Symbol::new(&env, "admin")
+        };
+
         let mut state = read_line(&env, line);
         state.pledged_units = units;
         write_line(&env, line, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "collateral_synced"), line),
+            (state.asset, units, source),
+        );
     }
 
     /// PRD §8 invariant 1 ("never over-lent") and invariant 2 ("no draws on a bad price"). Both
@@ -1673,5 +1690,63 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn sync_from_vault_and_sync_collateral_publish_collateral_synced_events() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        let vault = Address::generate(&h.env);
+        h.credit_line.set_vault(&h.admin, &vault);
+
+        let decode = |expected_units: i128, expected_source: &str| {
+            let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+            let items = events.events();
+            assert_eq!(items.len(), 1);
+            let body = match &items[0].body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            let topic1 = u64::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, Symbol::new(&h.env, "collateral_synced"));
+            assert_eq!(topic1, id);
+            let data: (Address, i128, Symbol) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                data,
+                (h.asset.clone(), expected_units, Symbol::new(&h.env, expected_source))
+            );
+        };
+
+        h.credit_line
+            .sync_from_vault(&vault, &id, &h.asset, &(250 * PRICE_SCALE));
+        decode(250 * PRICE_SCALE, "vault");
+
+        h.credit_line
+            .sync_collateral(&h.keeper, &id, &(300 * PRICE_SCALE));
+        decode(300 * PRICE_SCALE, "keeper");
+
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(350 * PRICE_SCALE));
+        decode(350 * PRICE_SCALE, "admin");
+
+        // Unauthorized caller fails without emitting an event.
+        let stranger = Address::generate(&h.env);
+        assert!(h.credit_line.try_sync_collateral(&stranger, &id, &10).is_err());
+        assert!(h.env.events().all().filter_by_contract(&h.credit_line.address).events().is_empty());
     }
 }
