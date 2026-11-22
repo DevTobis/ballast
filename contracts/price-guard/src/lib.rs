@@ -395,17 +395,8 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
     }
 }
 
-/// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
-/// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
-///
-/// For an odd source count, the median is the middle value. For an even source count, the median
-/// is the average of the two middle values rounded down (conservative collateral valuation).
-///
-/// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
-/// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
-/// stick and the baseline would never move until some unrelated transaction happened to call it;
-/// the daily-move check would then compare against a baseline days old and halt on ordinary yield
-/// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
+/// Reads the `LastGood` baseline. A value stored by an earlier version as a bare `i128` decodes
+/// with `ts = 0` until the next `Ok` evaluation rewrites it.
 fn read_last_good(env: &Env, asset: &Address) -> Option<LastGood> {
     let raw: Val = env
         .storage()
@@ -423,6 +414,17 @@ fn write_last_good(env: &Env, asset: &Address, value: i128, ts: u64) {
         .set(&DataKey::LastGood(asset.clone()), &LastGood { value, ts });
 }
 
+/// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
+/// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
+///
+/// For an odd source count, the median is the middle value. For an even source count, the median
+/// is the average of the two middle values rounded down (conservative collateral valuation).
+///
+/// Run on **every publish** as well as on every `guarded_price` call. A Soroban read is a
+/// simulation and persists nothing, so if only reads evaluated the guard, the latch would never
+/// stick and the baseline would never move until some unrelated transaction happened to call it;
+/// the daily-move check would then compare against a baseline days old and halt on ordinary yield
+/// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
 fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let config = read_config(env, &asset);
     let all_sources = read_all_sources(env, &asset);
