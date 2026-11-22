@@ -1674,4 +1674,80 @@ mod test {
             );
         });
     }
+
+    #[test]
+    fn configure_asset_and_set_vault_require_stored_admin() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let impostor = Address::generate(&h.env);
+        let alt_pg = Address::generate(&h.env);
+        let alt_usdc = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        };
+
+        h.env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &h.credit_line.address,
+                fn_name: "configure_asset",
+                args: (
+                    impostor.clone(),
+                    h.asset.clone(),
+                    alt_pg.clone(),
+                    alt_usdc.clone(),
+                    2_500u32,
+                    thresholds.clone(),
+                )
+                    .into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res_cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line
+                .configure_asset(&impostor, &h.asset, &alt_pg, &alt_usdc, &2_500, &thresholds);
+        }));
+        assert!(res_cfg.is_err(), "impostor cannot reconfigure asset");
+
+        let impostor_vault = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &h.credit_line.address,
+                fn_name: "set_vault",
+                args: (impostor.clone(), impostor_vault.clone()).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res_vault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.set_vault(&impostor, &impostor_vault);
+        }));
+        assert!(res_vault.is_err(), "impostor cannot set vault");
+
+        h.env.as_contract(&h.credit_line.address, || {
+            let cfg = read_asset_config(&h.env, &h.asset);
+            assert_eq!(cfg.haircut_bps, 500);
+            assert_eq!(cfg.usdc, h.token.address);
+            let v: Option<Address> = h.env.storage().instance().get(&DataKey::Vault);
+            assert_eq!(v, None);
+        });
+
+        h.env.mock_all_auths();
+        let new_vault = Address::generate(&h.env);
+        h.credit_line
+            .configure_asset(&h.admin, &h.asset, &alt_pg, &h.token.address, &2_500, &thresholds);
+        h.credit_line.set_vault(&h.admin, &new_vault);
+
+        h.env.as_contract(&h.credit_line.address, || {
+            let cfg = read_asset_config(&h.env, &h.asset);
+            assert_eq!(cfg.haircut_bps, 2_500);
+            assert_eq!(cfg.price_guard, alt_pg);
+        });
+
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_from_vault(&new_vault, &id, &h.asset, &(500 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 500 * PRICE_SCALE);
+    }
 }
