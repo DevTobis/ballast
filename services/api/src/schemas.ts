@@ -83,7 +83,7 @@ export const openCreditLineSchema = z.object({
   loanCcy: z.string(),
   limit: positiveAmount,
   rateBps: z.number().int().nonnegative(),
-  feeBps: z.number().int().nonnegative().default(0),
+  feeBps: z.number().int().nonnegative().max(10_000).default(0),
   cureWindowS: z.number().int().positive(),
   // Passed through to CreditLineClient.open() per its exact spec'd signature — the on-chain
   // credit_line row itself doesn't persist an asset (a line can be backed by multiple pledged

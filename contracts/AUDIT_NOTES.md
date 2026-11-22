@@ -101,6 +101,10 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
   Both are lender-only and not pause-gated.
+- **Platform fees & invariant 6 (`fee_bps`)**: `open` takes `fee_bps <= 10_000` (simple
+  non-compounding annual rate on `drawn`, included in `debt_of` and LTV). `repay` allocates
+  `fee -> interest -> principal`; repaid fees accumulate in `FeeClaimable(line)` and can only be
+  withdrawn by the configured `Treasury` address via `claim_fee` (not pause-gated).
 - `draw` enforces `limit` (it previously only checked `funded`). `fund` is refused on a closed line.
 - Interest is simple, non-compounding, accrued on principal per second.
 - **Collateral is reported by the vault, in the same transaction.** `PledgeVault` calls

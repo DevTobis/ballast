@@ -39,6 +39,7 @@ export function registerCreditLineRoutes(
       asset: body.asset,
       limit: body.limit,
       rateBps: body.rateBps,
+      feeBps: body.feeBps,
       cureS: body.cureWindowS,
       agreementHash: body.agreementHash,
     });

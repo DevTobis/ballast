@@ -66,6 +66,7 @@ use soroban_sdk::{
 
 const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 const BPS_DENOMINATOR: i128 = 10_000;
+const MAX_FEE_BPS: u32 = 10_000;
 
 /// Cross-contract call to PriceGuard, declared as a local trait so CreditLine never takes a
 /// Cargo dependency on the price-guard crate (being rewritten concurrently by another agent).
@@ -145,11 +146,13 @@ pub struct Line {
     pub drawn: i128,
     pub pledged_units: i128,
     pub rate_bps: u32,
+    pub fee_bps: u32,
     pub cure_s: u64,
     pub agreement: BytesN<32>,
     pub status: LineStatus,
     pub last_accrual_ts: u64,
     pub accrued_interest: i128,
+    pub accrued_fee: i128,
     pub margin_state: MarginState,
     /// PRD §8 invariant 3: the ledger sequence at which a `Liquidation`-state breach was first
     /// observed (via `poke`), and the LTV that was observed then. `liquidate` requires a
@@ -172,8 +175,12 @@ enum DataKey {
     Line(u64),
     /// The `PledgeVault` allowed to report a line's collateral directly (see `sync_from_vault`).
     Vault,
+    /// Protocol treasury allowed to withdraw repaid platform fees (`claim_fee`).
+    Treasury,
     /// Interest repaid on a line that the lender has not withdrawn yet.
     Claimable(u64),
+    /// Platform fees repaid on a line that the treasury has not withdrawn yet.
+    FeeClaimable(u64),
     Liquidation(u64),
 }
 
@@ -188,6 +195,28 @@ fn read_claimable(env: &Env, line: u64) -> i128 {
 
 fn write_claimable(env: &Env, line: u64, amount: i128) {
     let key = DataKey::Claimable(line);
+    env.storage().persistent().set(&key, &amount);
+    ttl::extend_persistent(env, &key);
+}
+
+fn read_treasury(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::Treasury)
+        .expect("credit-line: treasury not configured")
+}
+
+fn read_fee_claimable(env: &Env, line: u64) -> i128 {
+    let key = DataKey::FeeClaimable(line);
+    let amount = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        ttl::extend_persistent(env, &key);
+    }
+    amount
+}
+
+fn write_fee_claimable(env: &Env, line: u64, amount: i128) {
+    let key = DataKey::FeeClaimable(line);
     env.storage().persistent().set(&key, &amount);
     ttl::extend_persistent(env, &key);
 }
@@ -237,9 +266,24 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
 /// booked in `line.accrued_interest`. Simple, non-compounding annualized rate, matching PRD §5's
 /// "Fixed annual rate per line, accrued per ledger": `drawn * rate_bps * elapsed_s / year_s /
 /// 10_000`.
+fn rate_delta(drawn: i128, bps: u32, elapsed: i128) -> i128 {
+    (drawn * bps as i128 * elapsed) / SECONDS_PER_YEAR / BPS_DENOMINATOR
+}
+
 fn interest_delta(line: &Line, now: u64) -> i128 {
     let elapsed = now.saturating_sub(line.last_accrual_ts) as i128;
-    (line.drawn * line.rate_bps as i128 * elapsed) / SECONDS_PER_YEAR / BPS_DENOMINATOR
+    rate_delta(line.drawn, line.rate_bps, elapsed)
+}
+
+fn fee_delta(line: &Line, now: u64) -> i128 {
+    let elapsed = now.saturating_sub(line.last_accrual_ts) as i128;
+    rate_delta(line.drawn, line.fee_bps, elapsed)
+}
+
+fn accrue(line: &mut Line, now: u64) {
+    line.accrued_interest += interest_delta(line, now);
+    line.accrued_fee += fee_delta(line, now);
+    line.last_accrual_ts = now;
 }
 
 /// Recomputes debt, collateral value, and LTV for `line` from a fresh guarded price read. Doesn't
@@ -253,7 +297,12 @@ fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
     let config = read_asset_config(env, &line.asset);
     let guarded = PriceGuardClient::new(env, &config.price_guard).guarded_price(&line.asset);
 
-    let debt = line.drawn + line.accrued_interest + interest_delta(line, env.ledger().timestamp());
+    let now = env.ledger().timestamp();
+    let debt = line.drawn
+        + line.accrued_interest
+        + interest_delta(line, now)
+        + line.accrued_fee
+        + fee_delta(line, now);
     let collateral_value =
         risk::collateral_value(line.pledged_units, guarded.value, config.haircut_bps);
     let ltv_bps = risk::ltv_bps(debt, collateral_value);
@@ -340,12 +389,14 @@ impl CreditLine {
         asset: Address,
         limit: i128,
         rate_bps: u32,
+        fee_bps: u32,
         cure_s: u64,
         agreement: BytesN<32>,
     ) -> u64 {
         ttl::extend_instance(&env);
         lender.require_auth();
         assert!(limit > 0, "credit-line: limit must be positive");
+        assert!(fee_bps <= MAX_FEE_BPS, "credit-line: fee_bps exceeds 10_000");
 
         let id: u64 = env
             .storage()
@@ -368,11 +419,13 @@ impl CreditLine {
                 drawn: 0,
                 pledged_units: 0,
                 rate_bps,
+                fee_bps,
                 cure_s,
                 agreement,
                 status: LineStatus::Open,
                 last_accrual_ts: env.ledger().timestamp(),
                 accrued_interest: 0,
+                accrued_fee: 0,
                 margin_state: MarginState::Healthy,
                 breach_ledger: None,
                 breach_ltv_bps: 0,
@@ -509,8 +562,7 @@ impl CreditLine {
         );
 
         let now = env.ledger().timestamp();
-        state.accrued_interest += interest_delta(&state, now);
-        state.last_accrual_ts = now;
+        accrue(&mut state, now);
 
         assert!(
             amount <= state.funded - state.drawn,
@@ -530,7 +582,7 @@ impl CreditLine {
 
         let collateral_value =
             risk::collateral_value(state.pledged_units, guarded.value, config.haircut_bps);
-        let post_draw_debt = state.drawn + state.accrued_interest + amount;
+        let post_draw_debt = state.drawn + state.accrued_interest + state.accrued_fee + amount;
         let ltv_bps = risk::ltv_bps(post_draw_debt, collateral_value);
         let margin_state = margin::classify(ltv_bps, &config.thresholds);
         assert!(
@@ -564,22 +616,30 @@ impl CreditLine {
         let mut state = read_line(&env, line);
 
         let now = env.ledger().timestamp();
-        state.accrued_interest += interest_delta(&state, now);
-        state.last_accrual_ts = now;
+        accrue(&mut state, now);
 
         // `amount` is a cap, not an exact figure: the borrower signs it some time before the
-        // ledger closes, and interest keeps accruing in between. Applying `min(amount, owed)`
-        // lets "pay everything, up to X" clear a line instead of leaving dust or panicking.
-        let owed = state.accrued_interest + state.drawn;
+        // ledger closes, and interest/fees keep accruing in between. Applying `min(amount, owed)`
+        // (fee -> interest -> principal) lets "pay everything, up to X" clear a line cleanly.
+        let owed = state.accrued_fee + state.accrued_interest + state.drawn;
         assert!(owed > 0, "credit-line: nothing owed");
         let applied = amount.min(owed);
 
         let mut remaining = applied;
+        let pay_fee = remaining.min(state.accrued_fee);
+        state.accrued_fee -= pay_fee;
+        remaining -= pay_fee;
+        if pay_fee > 0 {
+            write_fee_claimable(&env, line, read_fee_claimable(&env, line) + pay_fee);
+        }
+
         let pay_interest = remaining.min(state.accrued_interest);
         state.accrued_interest -= pay_interest;
         remaining -= pay_interest;
-        // Interest belongs to the lender, who takes it out with `withdraw_interest`.
-        write_claimable(&env, line, read_claimable(&env, line) + pay_interest);
+        if pay_interest > 0 {
+            // Interest belongs to the lender, who takes it out with `withdraw_interest`.
+            write_claimable(&env, line, read_claimable(&env, line) + pay_interest);
+        }
 
         let pay_principal = remaining.min(state.drawn);
         state.drawn -= pay_principal;
@@ -742,6 +802,7 @@ impl CreditLine {
         state.funded -= state.drawn;
         state.drawn = 0;
         state.accrued_interest = 0;
+        state.accrued_fee = 0;
         state.pledged_units = 0;
         state.margin_state = MarginState::Healthy;
         state.breach_ledger = None;
@@ -832,6 +893,45 @@ impl CreditLine {
         read_claimable(&env, line)
     }
 
+    /// Sets the protocol treasury address allowed to withdraw repaid platform fees. Admin only.
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
+        ttl::extend_instance(&env);
+        let _ = admin;
+        access::require_admin(&env);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+    }
+
+    /// Withdraws repaid platform fees to the configured treasury address. Treasury auth only.
+    pub fn claim_fee(env: Env, treasury: Address, line: u64, amount: i128) {
+        ttl::extend_instance(&env);
+        treasury.require_auth();
+        assert!(amount > 0, "credit-line: amount must be positive");
+
+        let stored = read_treasury(&env);
+        assert_eq!(treasury, stored, "credit-line: caller is not the treasury");
+        let claimable = read_fee_claimable(&env, line);
+        assert!(
+            amount <= claimable,
+            "credit-line: withdrawal exceeds claimable fees"
+        );
+
+        write_fee_claimable(&env, line, claimable - amount);
+
+        let state = read_line(&env, line);
+        let config = read_asset_config(&env, &state.asset);
+        token::Client::new(&env, &config.usdc).transfer(
+            &env.current_contract_address(),
+            muxed(&treasury),
+            &amount,
+        );
+    }
+
+    /// Platform fees repaid on `line` and not yet withdrawn by treasury.
+    pub fn claimable_fee(env: Env, line: u64) -> i128 {
+        ttl::extend_instance(&env);
+        read_fee_claimable(&env, line)
+    }
+
     /// The recorded liquidation outcome for `line`, if it was liquidated.
     pub fn liquidation_record(env: Env, line: u64) -> LiquidationRecord {
         ttl::extend_instance(&env);
@@ -851,7 +951,12 @@ impl CreditLine {
     pub fn debt_of(env: Env, line: u64) -> i128 {
         ttl::extend_instance(&env);
         let state = read_line(&env, line);
-        state.drawn + state.accrued_interest + interest_delta(&state, env.ledger().timestamp())
+        let now = env.ledger().timestamp();
+        state.drawn
+            + state.accrued_interest
+            + interest_delta(&state, now)
+            + state.accrued_fee
+            + fee_delta(&state, now)
     }
 
     /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
@@ -876,6 +981,10 @@ impl CreditLine {
         let claimable_key = DataKey::Claimable(line);
         if env.storage().persistent().has(&claimable_key) {
             ttl::extend_persistent(&env, &claimable_key);
+        }
+        let fee_claimable_key = DataKey::FeeClaimable(line);
+        if env.storage().persistent().has(&fee_claimable_key) {
+            ttl::extend_persistent(&env, &fee_claimable_key);
         }
         let liq_key = DataKey::Liquidation(line);
         if env.storage().persistent().has(&liq_key) {
@@ -1040,6 +1149,7 @@ mod test {
             &h.asset,
             &limit,
             &1_000,
+            &0,
             &86_400,
             &agreement,
         );
@@ -1859,6 +1969,7 @@ mod test {
             &h.asset,
             &100_000,
             &500,
+            &0,
             &86_400,
             &agreement,
         );
@@ -1935,6 +2046,8 @@ mod test {
             breach_ledger: None,
             breach_ltv_bps: 0,
             unhealthy_since: None,
+            fee_bps: 0,
+            accrued_fee: 0,
         };
 
         let one_day_expected =
@@ -2823,5 +2936,83 @@ mod test {
             .unwrap();
             assert_eq!(data, vault);
         }
+    }
+
+    #[test]
+    fn open_rejects_fee_bps_above_100_percent() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let agreement = BytesN::from_array(&h.env, &[9u8; 32]);
+        assert!(h
+            .credit_line
+            .try_open(
+                &h.lender,
+                &h.borrower,
+                &h.asset,
+                &(1_000 * PRICE_SCALE),
+                &500,
+                &10_001,
+                &86_400,
+                &agreement,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn platform_fee_accrues_repay_waterfall_fee_interest_principal_and_treasury_withdraw_only() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let treasury = Address::generate(&h.env);
+        h.credit_line.set_treasury(&h.admin, &treasury);
+
+        let agreement = BytesN::from_array(&h.env, &[8u8; 32]);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &200,
+            &86_400,
+            &agreement,
+        );
+        h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &to);
+
+        // Advance 1 year -> interest = 10% of 500 = 50; fee = 2% of 500 = 10; total debt = 560.
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        assert_eq!(h.credit_line.debt_of(&id), 560 * PRICE_SCALE);
+
+        // Repay 35: covers all 10 fee + 25 of 50 interest; principal untouched.
+        h.token.mint(&h.borrower, &(35 * PRICE_SCALE));
+        let applied = h.credit_line.repay(&h.borrower, &id, &(35 * PRICE_SCALE));
+        assert_eq!(applied, 35 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_fee(&id), 10 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_interest(&id), 25 * PRICE_SCALE);
+
+        let mid = h.credit_line.line(&id);
+        assert_eq!(mid.accrued_fee, 0);
+        assert_eq!(mid.accrued_interest, 25 * PRICE_SCALE);
+        assert_eq!(mid.drawn, 500 * PRICE_SCALE);
+
+        // Non-treasury (admin / lender) cannot withdraw fees; treasury can.
+        assert!(h
+            .credit_line
+            .try_claim_fee(&h.admin, &id, &(10 * PRICE_SCALE))
+            .is_err());
+        h.credit_line.claim_fee(&treasury, &id, &(10 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&treasury), 10 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_fee(&id), 0);
+
+        // Clear remaining 525 (25 interest + 500 principal).
+        h.token.mint(&h.borrower, &(600 * PRICE_SCALE));
+        let final_applied = h.credit_line.repay(&h.borrower, &id, &(600 * PRICE_SCALE));
+        assert_eq!(final_applied, 525 * PRICE_SCALE);
+        assert_eq!(h.credit_line.debt_of(&id), 0);
+        assert_eq!(h.credit_line.claimable_interest(&id), 50 * PRICE_SCALE);
     }
 }
