@@ -1674,4 +1674,51 @@ mod test {
             );
         });
     }
+
+    #[test]
+    #[should_panic(expected = "credit-line: already initialized")]
+    fn initialize_twice_panics_with_exact_message() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let alt = Address::generate(&h.env);
+        h.credit_line.initialize(&alt, &alt, &alt, &alt, &alt);
+    }
+
+    #[test]
+    fn initialize_stores_all_five_roles_and_preserves_first_admin_after_reinit_failure() {
+        let env = Env::default();
+        let cl_id = env.register(CreditLine, ());
+        let cl = CreditLineClient::new(&env, &cl_id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+
+        cl.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        env.as_contract(&cl_id, || {
+            let stored = access::read_roles(&env);
+            assert_eq!(stored.admin, admin);
+            assert_eq!(stored.pauser, pauser);
+            assert_eq!(stored.keeper, keeper);
+            assert_eq!(stored.price_publisher, price_publisher);
+            assert_eq!(stored.risk, risk);
+        });
+
+        let alt = Address::generate(&env);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cl.initialize(&alt, &alt, &alt, &alt, &alt);
+        }));
+        assert!(res.is_err(), "second initialize must fail");
+
+        env.as_contract(&cl_id, || {
+            let stored = access::read_roles(&env);
+            assert_eq!(stored.admin, admin);
+            assert_eq!(stored.pauser, pauser);
+            assert_eq!(stored.keeper, keeper);
+            assert_eq!(stored.price_publisher, price_publisher);
+            assert_eq!(stored.risk, risk);
+        });
+    }
 }
