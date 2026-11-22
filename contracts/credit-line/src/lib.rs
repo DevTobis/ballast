@@ -312,13 +312,18 @@ impl CreditLine {
         access::require_admin(&env);
         thresholds.validate();
         env.storage().instance().set(
-            &DataKey::AssetConfig(asset),
+            &DataKey::AssetConfig(asset.clone()),
             &AssetConfig {
-                price_guard,
-                usdc,
+                price_guard: price_guard.clone(),
+                usdc: usdc.clone(),
                 haircut_bps,
-                thresholds,
+                thresholds: thresholds.clone(),
             },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "asset_configured"), asset),
+            (price_guard, usdc, haircut_bps, thresholds),
         );
     }
 
@@ -407,6 +412,8 @@ impl CreditLine {
         let _ = admin;
         access::require_admin(&env);
         env.storage().instance().set(&DataKey::Vault, &vault);
+        env.events()
+            .publish((Symbol::new(&env, "vault_set"),), vault);
     }
 
     /// The collateral asset of `line`, so the vault can refuse a pledge of the wrong token.
@@ -1673,5 +1680,96 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn configure_asset_and_set_vault_publish_events_and_none_on_failure() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let new_asset = Address::generate(&h.env);
+        let new_guard = Address::generate(&h.env);
+        let new_usdc = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        };
+
+        h.credit_line.configure_asset(
+            &h.admin,
+            &new_asset,
+            &new_guard,
+            &new_usdc,
+            &600,
+            &thresholds,
+        );
+        {
+            let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+            let items = events.events();
+            assert_eq!(items.len(), 1);
+            let body = match &items[0].body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            let topic1 = Address::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, Symbol::new(&h.env, "asset_configured"));
+            assert_eq!(topic1, new_asset);
+            let data: (Address, Address, u32, MarginThresholds) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, new_guard);
+            assert_eq!(data.1, new_usdc);
+            assert_eq!(data.2, 600);
+            assert_eq!(data.3.warning_bps, thresholds.warning_bps);
+            assert_eq!(data.3.margin_call_bps, thresholds.margin_call_bps);
+            assert_eq!(data.3.liquidation_bps, thresholds.liquidation_bps);
+        }
+
+        // Invalid thresholds fail without emitting an event.
+        let bad = MarginThresholds {
+            warning_bps: 9_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 7_000,
+        };
+        assert!(h
+            .credit_line
+            .try_configure_asset(&h.admin, &new_asset, &new_guard, &new_usdc, &600, &bad)
+            .is_err());
+        assert!(h.env.events().all().filter_by_contract(&h.credit_line.address).events().is_empty());
+
+        let vault = Address::generate(&h.env);
+        h.credit_line.set_vault(&h.admin, &vault);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+            let items = events.events();
+            assert_eq!(items.len(), 1);
+            let body = match &items[0].body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, Symbol::new(&h.env, "vault_set"));
+            let data: Address = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data, vault);
+        }
     }
 }
