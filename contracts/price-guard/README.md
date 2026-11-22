@@ -39,3 +39,17 @@ To support real-time monitoring (PRD §11 alerts for `Degraded` and `Halted` sta
   4. Operator verifies off-chain and calls `confirm_halt_cleared(risk, asset)`.
   5. Emits `halt_cleared(asset)` with `new_last_good`.
   6. `confirm_halt_cleared` only clears the latch; the next publish re-evaluates and emits `status_changed(asset)` with `(from: Halted, to: Ok, ...)`.
+
+## Read-only getters
+
+None of these require auth and none change guard state.
+
+| Function | Returns | Notes |
+|---|---|---|
+| `asset_config(asset)` | `Option<AssetGuardConfig>` | Bands, window and staleness settings for the asset. |
+| `issuer_pubkey(asset)` | `Option<BytesN<32>>` | Ed25519 key `publish_nav` verifies against. |
+| `require_nav_signature()` | `bool` | Defaults to `true` when never configured. |
+| `last_good(asset)` | `Option<i128>` | Last value that reached `Ok`; `None` if it never has. |
+| `halt_info(asset)` | `Option<HaltInfo>` | `None` unless the asset is halted. While halted, `last_good` is the baseline being held and `pending` is the value `confirm_halt_cleared` would promote. |
+
+Operators can read `halt_info` before calling `confirm_halt_cleared` to see both values.

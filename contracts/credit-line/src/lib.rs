@@ -46,6 +46,11 @@
 //! Every read and write to `Line`, `Claimable`, and `Liquidation` extends entry persistent TTL.
 //! In addition, a public `extend_ttl(line)` entry point allows anyone (including keepers or users) to extend
 //! the TTL of a dormant credit line before it archives.
+//!
+//! **Events.** Like `PledgeVault`, state changes publish one event with the shape
+//! `((Symbol, line), payload)`: `line_closed` from `close_liquidated` and `undrawn_withdrawn` from
+//! `withdraw_undrawn` (which moves the lender's funded exposure and so needs an on-chain trace for
+//! the console and indexer). See `README.md`'s events table for the exact topics and payloads.
 
 use ballast_common::{
     access::{self, Roles},
@@ -310,6 +315,7 @@ impl CreditLine {
         ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
+        risk::validate_haircut_bps(haircut_bps);
         thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
@@ -722,6 +728,9 @@ impl CreditLine {
 
     /// Takes undrawn USDC back out of the line (reducing the commitment). Repaid principal returns
     /// to the undrawn balance, so this is also how a lender gets principal back.
+    ///
+    /// Publishes `(Symbol("undrawn_withdrawn"), line)` with `(lender, amount, funded_after)`, so a
+    /// lender's falling funded exposure is explained on chain (see the crate README's events table).
     pub fn withdraw_undrawn(env: Env, lender: Address, line: u64, amount: i128) {
         ttl::extend_instance(&env);
         lender.require_auth();
@@ -742,6 +751,11 @@ impl CreditLine {
             &env.current_contract_address(),
             muxed(&lender),
             &amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "undrawn_withdrawn"), line),
+            (lender, amount, state.funded),
         );
     }
 
@@ -992,6 +1006,26 @@ mod test {
         id
     }
 
+    /// `configure_asset` runs `MarginThresholds::validate` (#78): equal warning and margin-call
+    /// thresholds would make `Warning` unreachable, so they are refused before anything is stored.
+    #[test]
+    #[should_panic(expected = "margin: warning_bps must be below margin_call_bps")]
+    fn configure_asset_rejects_equal_warning_and_margin_call_thresholds() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.configure_asset(
+            &h.admin,
+            &Address::generate(&h.env),
+            &h.price_guard.address,
+            &h.token.address,
+            &500,
+            &MarginThresholds {
+                warning_bps: 8_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }
+
     #[test]
     fn draw_and_repay_happy_path() {
         // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
@@ -1149,6 +1183,61 @@ mod test {
     }
 
     #[test]
+    fn withdraw_undrawn_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+
+        let contract_events = || {
+            h.env
+                .events()
+                .all()
+                .events()
+                .into_iter()
+                .filter(|e| e.type_ == ContractEventType::Contract)
+                .cloned()
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        // Failure: the withdrawal reverts, so nothing is published.
+        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line
+                .withdraw_undrawn(&h.lender, &id, &(1_001 * PRICE_SCALE));
+        }));
+        assert!(over.is_err(), "cannot withdraw more than the undrawn balance");
+        assert_eq!(
+            contract_events().len(),
+            0,
+            "no event may be emitted by a reverted withdraw_undrawn"
+        );
+
+        let amount = 400 * PRICE_SCALE;
+        h.credit_line.withdraw_undrawn(&h.lender, &id, &amount);
+
+        // Read the events before any further invocation, which would reset the recorded log.
+        let events = contract_events();
+        assert_eq!(events.len(), 1, "exactly one event on a successful withdrawal");
+        let last_event = events.last().expect("an event must have been published");
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("undrawn_withdrawn".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(id);
+        let val: soroban_sdk::Val = (h.lender.clone(), amount, 600 * PRICE_SCALE).into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+        assert_eq!(h.credit_line.line(&id).funded, 600 * PRICE_SCALE);
+    }
+
+    #[test]
     #[should_panic(expected = "credit-line: not this line's lender")]
     fn only_the_lender_can_withdraw() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
@@ -1234,6 +1323,27 @@ mod test {
         h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
     }
 
+    /// `configure_asset` refuses a haircut above 100% with `risk::validate_haircut_bps`, the check
+    /// `PledgeVault::configure_asset` runs too (#177). Stored, such a haircut made every draw, poke
+    /// and liquidation for the asset panic as soon as the collateral was valued.
+    #[test]
+    #[should_panic(expected = "haircut_bps")]
+    fn configure_asset_rejects_a_haircut_above_one_hundred_percent() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.token.address,
+            &10_001,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }
+
     // --- liquidation ----------------------------------------------------------------------
 
     /// Draws 600 against 1,000 units at $1, crashes the price to `crash`, and walks the line
@@ -1268,6 +1378,89 @@ mod test {
         h.env.ledger().set_sequence_number(h.env.ledger().sequence() + 2);
         h.credit_line.liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
         assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
+    }
+
+    /// Every field of a `LiquidationRecord`, in one tuple so a test compares all seven at once.
+    fn record_fields(record: &LiquidationRecord) -> (i128, i128, i128, bool, i128, i128, i128) {
+        (
+            record.seized_units,
+            record.price,
+            record.debt,
+            record.closed,
+            record.recovered,
+            record.surplus,
+            record.shortfall,
+        )
+    }
+
+    /// #164: what `liquidate` writes into the record, and that it stays as written. The line has
+    /// a year of interest that was never booked, so `debt` cannot be the principal alone, and the
+    /// crash price differs from the price before and after it, so `price` cannot be a later read.
+    #[test]
+    fn liquidate_freezes_every_field_of_the_liquidation_record() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        // One year at 10% (1_000 bps) on 600 is 60 of interest. Nothing has touched the line
+        // since the draw, so all of it is still pending rather than booked on the line.
+        let year = 365 * 24 * 60 * 60;
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + year);
+        assert_eq!(h.credit_line.line(&id).accrued_interest, 0);
+
+        // $0.70: 1,000 units are worth 700 against 660 owed (LTV 94.28%, past liquidation).
+        let crash = 70 * PRICE_SCALE / 100;
+        h.price_guard.set_price(&crash, &PriceStatus::Ok);
+        h.credit_line.poke(&id);
+        h.env
+            .ledger()
+            .set_sequence_number(h.env.ledger().sequence() + 2);
+        h.credit_line.poke(&id);
+        h.credit_line
+            .liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+
+        let frozen = (
+            1_000 * PRICE_SCALE, // seized_units: the whole pledged position
+            crash,               // price: the one the breach was confirmed at
+            660 * PRICE_SCALE,   // debt: principal plus the pending interest
+            false,               // closed
+            0,                   // recovered
+            0,                   // surplus
+            0,                   // shortfall
+        );
+        assert_eq!(
+            record_fields(&h.credit_line.liquidation_record(&id)),
+            frozen
+        );
+
+        // The price recovers and another year passes. Neither reaches the record.
+        h.price_guard
+            .set_price(&(2 * PRICE_SCALE), &PriceStatus::Ok);
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + year);
+        assert_eq!(
+            record_fields(&h.credit_line.liquidation_record(&id)),
+            frozen
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line was not liquidated")]
+    fn liquidation_record_of_a_line_that_was_never_liquidated_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        h.credit_line.liquidation_record(&id);
     }
 
     #[test]
@@ -1673,5 +1866,51 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn interest_delta_table_driven_cases() {
+        let env = Env::default();
+        let addr = Address::generate(&env);
+        let agreement = BytesN::from_array(&env, &[7u8; 32]);
+
+        let make_line = |drawn: i128, rate_bps: u32, last_accrual_ts: u64| Line {
+            lender: addr.clone(),
+            borrower: addr.clone(),
+            asset: addr.clone(),
+            limit: drawn.max(1),
+            funded: drawn,
+            drawn,
+            pledged_units: 0,
+            rate_bps,
+            cure_s: 86_400,
+            agreement: agreement.clone(),
+            status: LineStatus::Open,
+            last_accrual_ts,
+            accrued_interest: 0,
+            margin_state: MarginState::Healthy,
+            breach_ledger: None,
+            breach_ltv_bps: 0,
+            unhealthy_since: None,
+        };
+
+        let one_day_expected =
+            (500 * PRICE_SCALE * 1_000 * 86_400) / SECONDS_PER_YEAR / BPS_DENOMINATOR;
+        let large_drawn = 10_i128.pow(20);
+
+        let cases: [(&str, i128, u32, u64, u64, i128); 7] = [
+            ("full_year_10pct", 500 * PRICE_SCALE, 1_000, 1_000, 1_000 + 365 * 86_400, 50 * PRICE_SCALE),
+            ("one_day_10pct", 500 * PRICE_SCALE, 1_000, 1_000, 1_000 + 86_400, one_day_expected),
+            ("zero_rate", 500 * PRICE_SCALE, 0, 1_000, 1_000 + 365 * 86_400, 0),
+            ("zero_drawn", 0, 1_000, 1_000, 1_000 + 365 * 86_400, 0),
+            ("tiny_balance_truncates_to_zero", PRICE_SCALE, 1_000, 1_000, 1_005, 0),
+            ("now_before_last_accrual_saturates_to_zero", 500 * PRICE_SCALE, 1_000, 1_000, 500, 0),
+            ("large_drawn_1e20_no_overflow", large_drawn, 10_000, 0, SECONDS_PER_YEAR as u64, large_drawn),
+        ];
+
+        for (label, drawn, rate_bps, last_ts, now, expected) in cases {
+            let line = make_line(drawn, rate_bps, last_ts);
+            assert_eq!(interest_delta(&line, now), expected, "case {label} failed");
+        }
     }
 }
