@@ -30,6 +30,22 @@ export class SpikoNavAdapter implements IssuerNavAdapter {
     const url = `${this.baseUrl}/net-asset-values/${encodeURIComponent(assetCode.toUpperCase())}/latest`;
     const body = await getJson<SpikoLatestNav>(url, this.fetchImpl);
 
+    if (!body || typeof body !== "object") {
+      throw new Error(`spikoNavAdapter: invalid response body for ${assetCode}: expected object`);
+    }
+    if (!body.amount || typeof body.amount !== "object") {
+      throw new Error(`spikoNavAdapter: missing or invalid field "amount" for ${assetCode}`);
+    }
+    if (typeof body.amount.value !== "string" || !body.amount.value.trim()) {
+      throw new Error(`spikoNavAdapter: missing or invalid field "amount.value" for ${assetCode}`);
+    }
+    if (typeof body.amount.currency !== "string" || !body.amount.currency.trim()) {
+      throw new Error(`spikoNavAdapter: missing or invalid field "amount.currency" for ${assetCode}`);
+    }
+    if (typeof body.updatedAt !== "string" || !body.updatedAt.trim()) {
+      throw new Error(`spikoNavAdapter: missing or invalid field "updatedAt" for ${assetCode}`);
+    }
+
     if (body.amount.currency !== "USD") {
       throw new Error(
         `spikoNavAdapter: ${assetCode} NAV is quoted in ${body.amount.currency}; FX conversion to USD is not configured`,

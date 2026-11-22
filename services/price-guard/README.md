@@ -60,6 +60,36 @@ contract or publisher key. `scripts/shadow-run.sh` drives it. `smoke` touches ne
 - `src/navAttestor.ts`, `src/navSignature.ts`: NAV message format and Ed25519 check; keep it identical to the contract's.
 - `src/scaled.ts`: decimal string to and from 1e7 integers. `src/smoke.ts`, `src/seedShadow.ts`: the two scripts.
 
+## Precision and scaling
+
+Ballast represents all prices, asset values, and margin ratios as 7-decimal fixed-point integers (`PRICE_SCALE = 10_000_000n`, `1e7`). This matches Stellar and Soroban native precision (1 stroop = 10⁻⁷ XLM) and is required across the protocol contracts (`PriceGuard`, `CreditLine`, `RepoDvP`).
+
+### Rounding and Truncation Rule
+- All fixed-point conversions truncate **toward zero**:
+  - `decimalStringToScaled`: parses the whole and fractional parts as strings, pads or slices the fractional part to exactly 7 digits (`slice(0, 7)`), discarding excess digits without rounding up.
+  - `rescalePrice`: integer-divides feeds with more than 7 decimals (`price / 10n ** (decimals - 7)`), which in integer arithmetic truncates toward zero.
+- **Worst-case error**:
+  - For typical token prices, the truncation error is strictly bounded by 1 raw unit of the feed's precision.
+  - For an 8-decimal feed (e.g. RedStone CETES at ~$0.0657): 1 raw unit of truncation error (at 7 decimals) is `1e-7` / `0.0657` ≈ 0.015 bps.
+  - For a 6-decimal source (e.g. Etherfuse CETES USD cost with 6 decimals): 1 raw unit at 6 decimals is `1e-6` / `0.0657` ≈ 0.15 bps.
+
+### Worked Examples from Recorded Fixtures
+
+1. **Etherfuse CETES** (`etherfuse-cetes-cost.json`):
+   - Upstream raw JSON: `"token_cost_in_usd": "0.065766"` (6 fractional digits).
+   - `decimalStringToScaled("0.065766")`: pads fractional digits with zero to 7 places (`"0657660"`).
+   - Fixed-point integer: `657_660n` ($0.0657660).
+
+2. **RedStone CETES feed** (`redstone-cetes-feed.json`):
+   - Contract raw reading: `price = 6_575_000n` with `decimals = 8`.
+   - Scaling shift: `8 - 7 = 1`.
+   - `rescalePrice(6_575_000n, 8)`: `6_575_000n / 10n = 657_500n` ($0.0657500).
+
+3. **Spiko USTBL** (`spiko-ustbl-latest.json`):
+   - Upstream raw JSON: `"amount": { "value": "1.098479", "currency": "USD" }`.
+   - `decimalStringToScaled("1.098479")`: pads to 7 decimal places (`"0984790"`).
+   - Fixed-point integer: `10_984_790n` ($1.0984790).
+
 ## Tests
 
 `pnpm --filter @ballast/service-price-guard test` (vitest). `adapters.test.ts` checks each adapter
