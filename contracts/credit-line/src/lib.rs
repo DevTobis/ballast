@@ -1674,4 +1674,70 @@ mod test {
             );
         });
     }
+
+    #[test]
+    #[should_panic(expected = "credit-line: not this line's borrower")]
+    fn draw_rejects_wrong_borrower() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        let impostor = Address::generate(&h.env);
+        h.credit_line.draw(&impostor, &id, &(10 * PRICE_SCALE), &impostor);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: draw exceeds funded-but-undrawn balance")]
+    fn draw_rejects_overdraw_beyond_funded_balance() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 100 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(10_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(101 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line is not open")]
+    fn draw_rejects_non_open_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        h.credit_line
+            .draw(&h.borrower, &id, &(1 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: amount must be positive")]
+    fn draw_rejects_non_positive_amount() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &0, &h.borrower.clone());
+    }
+
+    #[test]
+    fn draw_rejections_leave_line_state_and_balances_unchanged() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 100 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(10_000 * PRICE_SCALE));
+
+        let impostor = Address::generate(&h.env);
+        for res in [
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                h.credit_line.draw(&impostor, &id, &(10 * PRICE_SCALE), &impostor);
+            })),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                h.credit_line.draw(&h.borrower, &id, &(101 * PRICE_SCALE), &h.borrower.clone());
+            })),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                h.credit_line.draw(&h.borrower, &id, &0, &h.borrower.clone());
+            })),
+        ] {
+            assert!(res.is_err());
+        }
+
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.drawn, 0);
+        assert_eq!(line.funded, 100 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.credit_line.address), 100 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+    }
 }
