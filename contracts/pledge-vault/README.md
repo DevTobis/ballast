@@ -6,7 +6,7 @@ or `liquidate` by an authorized keeper.
 
 ## Contract Events
 
-Every state-changing entry point publishes one event with the shape `((Symbol, line), payload)`:
+Every state-changing entry point publishes one event with the shape `(topics, payload)`:
 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|
@@ -14,6 +14,8 @@ Every state-changing entry point publishes one event with the shape `((Symbol, l
 | `released` | `(Symbol("released"), line: u64)` | `(asset: Address, units: i128)` | `release` |
 | `lien_recorded` | `(Symbol("lien_recorded"), line: u64)` | `(asset: Address, units: i128, lien_ref: Bytes)` | `record_lien` |
 | `liquidated` | `(Symbol("liquidated"), line: u64)` | `(asset: Address, units: i128, to: Address)` | `liquidate` |
+| `asset_configured` | `(Symbol("asset_configured"), asset: Address)` | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` |
+| `gateway_set` | `(Symbol("gateway_set"),)` | `gateway: Address` | `set_gateway` |
 
 ## Custody Modes & Pending-Lien Flow
 

@@ -42,11 +42,13 @@
 //! two separate transactions. Flagged here and in the build report as the least clean part of
 //! this skeleton.
 //!
-//! **Events.** Published with shape `((Symbol, line), payload)`:
+//! **Events.** Published with shape `(topics, payload)`:
 //! - `pledged`: `((Symbol("pledged"), line), (asset: Address, units: i128))`
 //! - `released`: `((Symbol("released"), line), (asset: Address, units: i128))`
 //! - `lien_recorded`: `((Symbol("lien_recorded"), line), (asset: Address, units: i128, lien_ref: Bytes))`
 //! - `liquidated`: `((Symbol("liquidated"), line), (asset: Address, units: i128, to: Address))`
+//! - `asset_configured`: `((Symbol("asset_configured"), asset: Address), (price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode))`
+//! - `gateway_set`: `((Symbol("gateway_set"),), gateway: Address)`
 
 use ballast_common::{
     access::{self, Roles},
@@ -243,14 +245,25 @@ impl PledgeVault {
 
         thresholds.validate();
         env.storage().instance().set(
-            &DataKey::AssetConfig(asset),
+            &DataKey::AssetConfig(asset.clone()),
             &AssetConfig {
+                price_guard: price_guard.clone(),
+                credit_line: credit_line.clone(),
+                haircut_bps,
+                thresholds: thresholds.clone(),
+                custody_mode: custody_mode.clone(),
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "asset_configured"), asset),
+            (
                 price_guard,
                 credit_line,
                 haircut_bps,
                 thresholds,
                 custody_mode,
-            },
+            ),
         );
     }
 
@@ -260,6 +273,11 @@ impl PledgeVault {
         access::require_admin(&env);
         ttl::extend_instance(&env);
         env.storage().instance().set(&DataKey::Gateway, &gateway);
+
+        env.events().publish(
+            (Symbol::new(&env, "gateway_set"),),
+            gateway,
+        );
     }
 
     /// Escrow mode (`CustodyMode::Escrow`): pulls `units` of the RWA token from `borrower` into
@@ -1436,5 +1454,208 @@ mod test {
             let gw: Option<Address> = h.env.storage().instance().get(&DataKey::Gateway);
             assert_eq!(gw, Some(gateway));
         });
+    }
+
+    // ── #178: configure_asset and set_gateway events ─────────────────────────
+
+    #[test]
+    fn configure_asset_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let fresh_asset = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 6_000,
+            margin_call_bps: 7_500,
+            liquidation_bps: 8_500,
+        };
+
+        // 1. Success case
+        h.vault.configure_asset(
+            &h.admin,
+            &fresh_asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &300,
+            &thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let contract_events = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .cloned()
+            .collect::<std::vec::Vec<_>>();
+
+        let last_event = contract_events
+            .last()
+            .expect("must emit asset_configured event");
+        let expected_topic0 = ScVal::Symbol(ScSymbol("asset_configured".try_into().unwrap()));
+        let fresh_asset_val: soroban_sdk::Val = fresh_asset.clone().into_val(&h.env);
+        let expected_topic1 =
+            ScVal::try_from_val(&h.env, &fresh_asset_val).unwrap();
+        let expected_payload_val: soroban_sdk::Val = (
+            h.price_guard.address.clone(),
+            h.credit_line.address.clone(),
+            300u32,
+            thresholds.clone(),
+            CustodyMode::IssuerLien,
+        )
+            .into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &expected_payload_val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // 2. Failure case: invalid thresholds
+        let invalid_thresholds = MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 9_000,
+            liquidation_bps: 9_000,
+        };
+        let bad_thresh_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.configure_asset(
+                &h.admin,
+                &Address::generate(&h.env),
+                &h.price_guard.address,
+                &h.credit_line.address,
+                &500,
+                &invalid_thresholds,
+                &CustodyMode::Escrow,
+            );
+        }));
+        assert!(bad_thresh_res.is_err(), "invalid thresholds must fail");
+        let events_after_thresh_fail = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .count();
+        assert_eq!(
+            events_after_thresh_fail, 0,
+            "no contract event on failed configure_asset"
+        );
+
+        // 3. Failure case: non-admin caller
+        let stranger = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "configure_asset",
+                args: (
+                    stranger.clone(),
+                    fresh_asset.clone(),
+                    h.price_guard.address.clone(),
+                    h.credit_line.address.clone(),
+                    500u32,
+                    thresholds.clone(),
+                    CustodyMode::Escrow,
+                )
+                    .into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let bad_auth_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.configure_asset(
+                &stranger,
+                &fresh_asset,
+                &h.price_guard.address,
+                &h.credit_line.address,
+                &500,
+                &thresholds,
+                &CustodyMode::Escrow,
+            );
+        }));
+        assert!(bad_auth_res.is_err(), "non-admin caller must fail");
+        let events_after_auth_fail = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .count();
+        assert_eq!(
+            events_after_auth_fail, 0,
+            "no contract event on unauthorized configure_asset"
+        );
+    }
+
+    #[test]
+    fn set_gateway_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+
+        // 1. Success case
+        h.vault.set_gateway(&h.admin, &gateway);
+
+        let contract_events = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .cloned()
+            .collect::<std::vec::Vec<_>>();
+
+        let last_event = contract_events.last().expect("must emit gateway_set event");
+        let expected_topic0 = ScVal::Symbol(ScSymbol("gateway_set".try_into().unwrap()));
+        let gateway_val: soroban_sdk::Val = gateway.clone().into_val(&h.env);
+        let expected_data =
+            ScVal::try_from_val(&h.env, &gateway_val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.len(), 1);
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // 2. Failure case: non-admin caller
+        let stranger = Address::generate(&h.env);
+        let other_gateway = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "set_gateway",
+                args: (stranger.clone(), other_gateway.clone()).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let bad_auth_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.set_gateway(&stranger, &other_gateway);
+        }));
+        assert!(bad_auth_res.is_err(), "non-admin caller must fail");
+        let events_after_auth_fail = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .count();
+        assert_eq!(
+            events_after_auth_fail, 0,
+            "no contract event on unauthorized set_gateway"
+        );
     }
 }
