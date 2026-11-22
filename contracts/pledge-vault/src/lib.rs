@@ -742,6 +742,27 @@ mod test {
         }
     }
 
+    /// `configure_asset` runs `MarginThresholds::validate` (#78): equal margin-call and
+    /// liquidation thresholds would make `MarginCall` unreachable, so they are refused.
+    #[test]
+    #[should_panic(expected = "margin: margin_call_bps must be below liquidation_bps")]
+    fn configure_asset_rejects_equal_margin_call_and_liquidation_thresholds() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 9_000,
+                liquidation_bps: 9_000,
+            },
+            &CustodyMode::Escrow,
+        );
+    }
+
     #[test]
     fn pledge_then_release_happy_path() {
         // 5% haircut, $500 debt, $1.00 price.
@@ -968,6 +989,80 @@ mod test {
         h.credit_line.set_asset(&Address::generate(&h.env));
         h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
         h.vault.pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+    }
+
+    // ── #185: pledge's error paths ──────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn pledge_of_zero_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn pledge_of_negative_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &-1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: asset not configured")]
+    fn pledge_of_an_unconfigured_asset_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        // A second token that the admin never passed to `configure_asset`. The borrower holds
+        // enough of it, so the missing config is the only thing wrong with the pledge.
+        let other_id = h.env.register(mock_token::MockToken, ());
+        let other = mock_token::MockTokenClient::new(&h.env, &other_id);
+        other.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &other_id, &(10 * PRICE_SCALE));
+    }
+
+    /// The borrower holds fewer units than they pledge, so the token's own `transfer` refuses.
+    #[test]
+    #[should_panic(expected = "mock-token: insufficient balance")]
+    fn pledge_beyond_the_borrowers_balance_panics_in_the_token() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(40 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE + 1));
+    }
+
+    /// The same failed transfer, looked at from outside: the whole pledge fails with it. No units
+    /// are credited, nothing is reported to the credit line, and no tokens move. Pledging what the
+    /// borrower does hold then works, so the amount was the only thing wrong with the first call.
+    #[test]
+    fn pledge_beyond_the_borrowers_balance_changes_nothing() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(40 * PRICE_SCALE));
+
+        let refused = h
+            .vault
+            .try_pledge(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE + 1));
+
+        assert!(
+            refused.is_err(),
+            "a pledge the borrower cannot fund must fail"
+        );
+        assert_eq!(h.vault.position_units(&1, &h.asset), 0);
+        assert_eq!(
+            h.credit_line.synced_units(),
+            -1,
+            "nothing reported to the credit line"
+        );
+        assert_eq!(h.token.balance(&h.borrower), 40 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 40 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 40 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 40 * PRICE_SCALE);
     }
 
     #[test]
@@ -1249,5 +1344,97 @@ mod test {
                 assert_eq!(v0.data, expected_data);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: already initialized")]
+    fn initialize_twice_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let alt = Address::generate(&h.env);
+        h.vault.initialize(&alt, &alt, &alt, &alt, &alt);
+    }
+
+    #[test]
+    fn configure_asset_and_set_gateway_require_stored_admin() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let impostor = Address::generate(&h.env);
+        let alt_pg = Address::generate(&h.env);
+        let alt_cl = Address::generate(&h.env);
+
+        h.env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "configure_asset",
+                args: (
+                    impostor.clone(),
+                    h.asset.clone(),
+                    alt_pg.clone(),
+                    alt_cl.clone(),
+                    2_500u32,
+                    h.thresholds.clone(),
+                    CustodyMode::IssuerLien,
+                )
+                    .into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res_cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.configure_asset(
+                &impostor,
+                &h.asset,
+                &alt_pg,
+                &alt_cl,
+                &2_500,
+                &h.thresholds,
+                &CustodyMode::IssuerLien,
+            );
+        }));
+        assert!(res_cfg.is_err(), "impostor cannot reconfigure asset");
+
+        h.env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "set_gateway",
+                args: (impostor.clone(), impostor.clone()).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let res_gw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.set_gateway(&impostor, &impostor);
+        }));
+        assert!(res_gw.is_err(), "impostor cannot set gateway");
+
+        h.env.as_contract(&h.vault.address, || {
+            let cfg = read_asset_config(&h.env, &h.asset);
+            assert_eq!(cfg.haircut_bps, 500);
+            assert_eq!(cfg.custody_mode, CustodyMode::Escrow);
+            let gw: Option<Address> = h.env.storage().instance().get(&DataKey::Gateway);
+            assert_eq!(gw, None);
+        });
+
+        h.env.mock_all_auths();
+        let gateway = Address::generate(&h.env);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &alt_pg,
+            &alt_cl,
+            &2_500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+        h.vault.set_gateway(&h.admin, &gateway);
+
+        h.env.as_contract(&h.vault.address, || {
+            let cfg = read_asset_config(&h.env, &h.asset);
+            assert_eq!(cfg.haircut_bps, 2_500);
+            assert_eq!(cfg.custody_mode, CustodyMode::IssuerLien);
+            let gw: Option<Address> = h.env.storage().instance().get(&DataKey::Gateway);
+            assert_eq!(gw, Some(gateway));
+        });
     }
 }
