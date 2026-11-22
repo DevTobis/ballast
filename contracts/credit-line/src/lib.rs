@@ -760,13 +760,19 @@ impl CreditLine {
             "credit-line: withdrawal exceeds the interest repaid"
         );
 
-        write_claimable(&env, line, claimable - amount);
+        let claimable_after = claimable - amount;
+        write_claimable(&env, line, claimable_after);
 
         let config = read_asset_config(&env, &state.asset);
         token::Client::new(&env, &config.usdc).transfer(
             &env.current_contract_address(),
             muxed(&lender),
             &amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "interest_withdrawn"), line),
+            (lender, amount, claimable_after),
         );
     }
 
@@ -1673,5 +1679,61 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    fn withdraw_interest_publishes_event_and_none_on_failure() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &to);
+
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        let repay_amount = 50 * PRICE_SCALE;
+        h.token.mint(&h.borrower, &repay_amount);
+        h.credit_line.repay(&h.borrower, &id, &repay_amount);
+
+        // Over-withdrawal fails without emitting an event.
+        assert!(h
+            .credit_line
+            .try_withdraw_interest(&h.lender, &id, &(51 * PRICE_SCALE))
+            .is_err());
+        assert!(h.env.events().all().filter_by_contract(&h.credit_line.address).events().is_empty());
+
+        let withdraw_amount = 30 * PRICE_SCALE;
+        h.credit_line
+            .withdraw_interest(&h.lender, &id, &withdraw_amount);
+
+        let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+        let items = events.events();
+        assert_eq!(items.len(), 1);
+        let body = match &items[0].body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0, Symbol::new(&h.env, "interest_withdrawn"));
+        assert_eq!(topic1, id);
+
+        let data: (Address, i128, i128) = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data, (h.lender.clone(), withdraw_amount, 20 * PRICE_SCALE));
     }
 }
