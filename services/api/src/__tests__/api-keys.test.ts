@@ -59,6 +59,8 @@ function keyDb(keyOverrides: Record<string, unknown> | null = {}) {
     }),
     update: () => ({ set: (patch: Record<string, unknown>) => ({ where: async () => { if (key) Object.assign(key, patch); } }) }),
     delete: () => ({ where: async () => undefined }),
+    transaction: async (fn: (tx: any) => any) => fn(db),
+    execute: async () => [{ "?column?": 1 }],
   } as unknown as Database;
   return { db, created, audit, key };
 }
@@ -223,6 +225,31 @@ describe("API-key requests through the server", () => {
     const app = buildServer({ config: { ...config, apiKeySecretKey: "" }, db, contracts: {} as ContractClients });
     const res = await app.inject({ method: "POST", url: "/v1/api-keys", headers: session, payload: {} });
     expect(res.statusCode).toBe(503);
+  });
+
+  it("leaves exactly 10 active keys when 15 creates are sent concurrently", async () => {
+    const { db, created } = keyDb(null);
+    const app = buildServer({ config, db, contracts: {} as ContractClients });
+
+    const requests = Array.from({ length: 15 }, (_, i) =>
+      app.inject({
+        method: "POST",
+        url: "/v1/api-keys",
+        headers: session,
+        payload: { label: `key-${i}` },
+      }),
+    );
+
+    const responses = await Promise.all(requests);
+    const successes = responses.filter((r) => r.statusCode === 201);
+    const conflicts = responses.filter((r) => r.statusCode === 409);
+
+    expect(successes).toHaveLength(10);
+    expect(conflicts).toHaveLength(5);
+    expect(created).toHaveLength(10);
+    for (const c of conflicts) {
+      expect(c.json()).toEqual({ error: "at most 10 active API keys per party" });
+    }
   });
 
   it("revokes a key and audits it", async () => {

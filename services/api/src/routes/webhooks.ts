@@ -12,6 +12,7 @@ import { DELIVERABLE_WEBHOOK_EVENTS } from "@ballast/domain-types";
 import type { ApiConfig } from "../config.js";
 import { encryptSecret, isValidSecretKey } from "../webhooks/secretBox.js";
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "../webhooks/ssrf.js";
+import { withPartyAdvisoryLock } from "../party-lock.js";
 
 const MAX_SUBSCRIPTIONS_PER_PARTY = 10;
 
@@ -39,26 +40,33 @@ export function registerWebhookRoutes(app: FastifyInstance, db: Database, config
       throw err;
     }
 
-    const mine = await db
-      .select()
-      .from(schema.webhookSubscription)
-      .where(eq(schema.webhookSubscription.partyId, request.partyId));
-    if (mine.filter((s) => s.active).length >= MAX_SUBSCRIPTIONS_PER_PARTY) {
-      return reply.code(409).send({ error: `at most ${MAX_SUBSCRIPTIONS_PER_PARTY} active subscriptions per party` });
-    }
+    const result = await withPartyAdvisoryLock(db, request.partyId, async (tx) => {
+      const mine = await tx
+        .select()
+        .from(schema.webhookSubscription)
+        .where(eq(schema.webhookSubscription.partyId, request.partyId));
+      if (mine.filter((s) => s.active).length >= MAX_SUBSCRIPTIONS_PER_PARTY) {
+        return {
+          status: 409,
+          body: { error: `at most ${MAX_SUBSCRIPTIONS_PER_PARTY} active subscriptions per party` },
+        };
+      }
 
-    const secret = randomBytes(32).toString("hex");
-    const [row] = await db
-      .insert(schema.webhookSubscription)
-      .values({
-        partyId: request.partyId,
-        url: parsed.data.url,
-        events: [...new Set(parsed.data.events)],
-        secretCiphertext: encryptSecret(secret, config.webhookSecretKey),
-      })
-      .returning();
+      const secret = randomBytes(32).toString("hex");
+      const [row] = await tx
+        .insert(schema.webhookSubscription)
+        .values({
+          partyId: request.partyId,
+          url: parsed.data.url,
+          events: [...new Set(parsed.data.events)],
+          secretCiphertext: encryptSecret(secret, config.webhookSecretKey),
+        })
+        .returning();
 
-    return reply.code(201).send({ id: row.id, url: row.url, events: row.events, secret });
+      return { status: 201, body: { id: row.id, url: row.url, events: row.events, secret } };
+    });
+
+    return reply.code(result.status).send(result.body);
   });
 
   app.get("/v1/webhooks/subscriptions", async (request) => {

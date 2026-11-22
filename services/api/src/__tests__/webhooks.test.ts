@@ -335,6 +335,64 @@ describe("webhook routes", () => {
     expect(JSON.stringify(listed.json())).not.toMatch(/secret/i);
   });
 
+  it("leaves exactly 10 active subscriptions when 15 creates are sent concurrently", async () => {
+    const subs: Array<Record<string, unknown>> = [];
+    const chain = (rows: unknown[]) => {
+      const p = Promise.resolve(rows) as Promise<unknown[]> & Record<string, unknown>;
+      p.where = () => chain(rows);
+      p.limit = () => chain(rows);
+      return p;
+    };
+    const db = {
+      select: () => ({
+        from: (t: unknown) =>
+          t === schema.partyAccount
+            ? chain([{ partyId: PARTY, stellarAccount: ACCOUNT, role: "borrower" }])
+            : t === schema.webhookSubscription
+              ? chain(subs)
+              : chain([]),
+      }),
+      insert: (table: unknown) => ({
+        values: (v: Record<string, unknown>) => {
+          const row = { id: `sub-${subs.length + 1}`, active: true, createdAt: new Date(), ...v };
+          if (table === schema.webhookSubscription) {
+            subs.push(row);
+          }
+          return {
+            returning: async () => [row],
+          };
+        },
+      }),
+      transaction: async (fn: (tx: any) => any) => fn(db),
+      execute: async () => [{ "?column?": 1 }],
+    } as unknown as Database;
+
+    const app = buildServer({ config, contracts: {} as ContractClients, db });
+
+    const requests = Array.from({ length: 15 }, (_, i) =>
+      app.inject({
+        method: "POST",
+        url: "/v1/webhooks/subscriptions",
+        headers: authed,
+        payload: {
+          url: `https://93.184.216.34/hook-${i}`,
+          events: ["margin.call_issued"],
+        },
+      }),
+    );
+
+    const responses = await Promise.all(requests);
+    const successes = responses.filter((r) => r.statusCode === 201);
+    const conflicts = responses.filter((r) => r.statusCode === 409);
+
+    expect(successes).toHaveLength(10);
+    expect(conflicts).toHaveLength(5);
+    expect(subs).toHaveLength(10);
+    for (const c of conflicts) {
+      expect(c.json()).toEqual({ error: "at most 10 active subscriptions per party" });
+    }
+  });
+
   it("answers 404 when redelivering another party's delivery", async () => {
     const theirs = { id: "sub-x", partyId: "someone-else", url: "https://93.184.216.34/h", events: [], secretCiphertext: "x", active: true, createdAt: new Date() };
     // The fake db ignores WHERE, so only the handler's own ownership check can produce the 404.

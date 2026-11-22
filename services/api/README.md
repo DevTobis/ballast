@@ -202,7 +202,7 @@ Decimal strings appear only where routes return raw database rows without going 
 | Endpoint | Request Amount(s) | Internal Handling | Response Amount(s) & Format |
 | --- | --- | --- | --- |
 | `GET /v1/assets` | — | Selects all assets and price snapshots; picks latest snapshot per asset; `haircutBps = haircutBaseBps + haircutFxBps`; no conversion | `price.value` (raw DB column `guardedValue`, a decimal string); `price.status` (enum); `price.asOf` (ISO date); `haircutBps` (bps) |
-| `GET /v1/assets/:id/price` | — | Returns latest snapshot and 50 most recent history rows directly from DB; no conversion | `value`, `history[*].guardedValue` (raw DB column `guardedValue`, decimal strings); `status` (enum); `ts` (ISO date) |
+| `GET /v1/assets/:id/price` | Optional query params: `limit` (1-500, default 50), `from` and `to` (ISO timestamps) | Returns latest snapshot and up to `limit` history rows (optionally filtered between `from` and `to`) ordered by `createdAt desc` | `value`, `history[*].guardedValue` (raw DB column `guardedValue`, decimal strings); `status` (enum); `ts` (ISO date) |
 
 > **Note:** `guardedValue` is a decimal string, not a scaled integer: the price-guard service writes it with `scaledToDecimalString` (`services/price-guard/src/pipeline.ts`), e.g. `"0.0657660"`.
 
