@@ -85,7 +85,7 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
 - `pledge` requires the line's own borrower and collateral asset, and refuses to take units in a
   different custody mode than the position already holds (`release` moves tokens or not according to
   the mode recorded on the position, so flipping it under live units would strand them).
-- `release` cross-calls `CreditLine::ltv` and `borrower_of`; ownership is checked there.
+- `release` cross-calls `CreditLine::ltv_after` (simulating remaining units with `CreditLine`'s own config) and `borrower_of`; ownership and healthy margin standing are checked there.
 - `liquidate` has no LTV check by design: it is the liquidation path, keeper-gated. Its safety
   depends on `CreditLine::liquidate` having confirmed the breach first, enforced off-chain by the
   keeper job, not on-chain.
