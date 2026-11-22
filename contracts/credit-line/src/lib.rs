@@ -1674,4 +1674,50 @@ mod test {
             );
         });
     }
+
+    #[test]
+    fn interest_delta_table_driven_cases() {
+        let env = Env::default();
+        let addr = Address::generate(&env);
+        let agreement = BytesN::from_array(&env, &[7u8; 32]);
+
+        let make_line = |drawn: i128, rate_bps: u32, last_accrual_ts: u64| Line {
+            lender: addr.clone(),
+            borrower: addr.clone(),
+            asset: addr.clone(),
+            limit: drawn.max(1),
+            funded: drawn,
+            drawn,
+            pledged_units: 0,
+            rate_bps,
+            cure_s: 86_400,
+            agreement: agreement.clone(),
+            status: LineStatus::Open,
+            last_accrual_ts,
+            accrued_interest: 0,
+            margin_state: MarginState::Healthy,
+            breach_ledger: None,
+            breach_ltv_bps: 0,
+            unhealthy_since: None,
+        };
+
+        let one_day_expected =
+            (500 * PRICE_SCALE * 1_000 * 86_400) / SECONDS_PER_YEAR / BPS_DENOMINATOR;
+        let large_drawn = 10_i128.pow(20);
+
+        let cases: [(&str, i128, u32, u64, u64, i128); 7] = [
+            ("full_year_10pct", 500 * PRICE_SCALE, 1_000, 1_000, 1_000 + 365 * 86_400, 50 * PRICE_SCALE),
+            ("one_day_10pct", 500 * PRICE_SCALE, 1_000, 1_000, 1_000 + 86_400, one_day_expected),
+            ("zero_rate", 500 * PRICE_SCALE, 0, 1_000, 1_000 + 365 * 86_400, 0),
+            ("zero_drawn", 0, 1_000, 1_000, 1_000 + 365 * 86_400, 0),
+            ("tiny_balance_truncates_to_zero", PRICE_SCALE, 1_000, 1_000, 1_005, 0),
+            ("now_before_last_accrual_saturates_to_zero", 500 * PRICE_SCALE, 1_000, 1_000, 500, 0),
+            ("large_drawn_1e20_no_overflow", large_drawn, 10_000, 0, SECONDS_PER_YEAR as u64, large_drawn),
+        ];
+
+        for (label, drawn, rate_bps, last_ts, now, expected) in cases {
+            let line = make_line(drawn, rate_bps, last_ts);
+            assert_eq!(interest_delta(&line, now), expected, "case {label} failed");
+        }
+    }
 }
