@@ -1674,4 +1674,80 @@ mod test {
             );
         });
     }
+
+    #[test]
+    fn close_liquidated_at_break_even_leaves_surplus_and_shortfall_zero() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 60 * PRICE_SCALE / 100);
+        let lender_before = h.token.balance(&h.lender);
+        let borrower_before = h.token.balance(&h.borrower);
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
+        assert_eq!(record.debt, 600 * PRICE_SCALE);
+        assert_eq!(record.recovered, 600 * PRICE_SCALE);
+        assert_eq!(record.surplus, 0);
+        assert_eq!(record.shortfall, 0);
+        assert_eq!(h.token.balance(&h.lender), lender_before);
+        assert_eq!(h.token.balance(&h.borrower), borrower_before);
+    }
+
+    #[test]
+    fn close_liquidated_clears_accrued_interest_and_writes_down_drawn_from_funded() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        h.price_guard.set_price(&(50 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        h.credit_line.poke(&id);
+        h.env.ledger().set_sequence_number(h.env.ledger().sequence() + 2);
+        h.credit_line.liquidate(&h.keeper, &id, &LiquidationRoute::Transfer);
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        let record = h.credit_line.liquidation_record(&id);
+        assert_eq!(record.debt, 550 * PRICE_SCALE);
+        assert_eq!(record.recovered, 500 * PRICE_SCALE);
+        assert_eq!(record.shortfall, 50 * PRICE_SCALE);
+        assert_eq!(record.surplus, 0);
+
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.status, LineStatus::Closed);
+        assert_eq!(line.drawn, 0);
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.funded, 500 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn pre_liquidation_repaid_interest_remains_withdrawable_after_close() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        let interest = 60 * PRICE_SCALE;
+        h.token.mint(&h.borrower, &interest);
+        let applied = h.credit_line.repay(&h.borrower, &id, &interest);
+        assert_eq!(applied, interest);
+        assert_eq!(h.credit_line.claimable_interest(&id), interest);
+
+        h.price_guard.set_price(&(50 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        h.credit_line.poke(&id);
+        h.env.ledger().set_sequence_number(h.env.ledger().sequence() + 2);
+        h.credit_line.liquidate(&h.keeper, &id, &LiquidationRoute::Transfer);
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        assert_eq!(h.credit_line.claimable_interest(&id), interest);
+        assert_eq!(h.credit_line.line(&id).funded, 400 * PRICE_SCALE);
+
+        h.credit_line.withdraw_interest(&h.lender, &id, &interest);
+        h.credit_line.withdraw_undrawn(&h.lender, &id, &(400 * PRICE_SCALE));
+        assert_eq!(h.credit_line.claimable_interest(&id), 0);
+        assert_eq!(h.token.balance(&h.lender), 460 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.credit_line.address), 0);
+    }
 }
