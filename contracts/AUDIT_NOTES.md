@@ -115,6 +115,13 @@ uses comes from the contract's own state or from the PriceGuard, never from a ke
   collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
   No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
+- **Storage lifetime.** Every entry point extends the contract instance. Every write of a trade
+  extends that trade's entry, and the instance with it, to outlast `maturity_at` plus the unwind
+  grace, and never to less than about 30 days. The borrower's outstanding leg-2 sum is extended to
+  outlast the allowance it describes. Before this only the pause calls extended anything, so a
+  trade lived for the network's minimum persistent TTL from its last write: about 7 days on testnet
+  and about 120 on mainnet (their state-archival settings on 2026-11-22). `extend_ttl` is a
+  permissionless keep-alive for a trade longer than one extension can reach (about 180 days).
 
 ## Known limits
 
