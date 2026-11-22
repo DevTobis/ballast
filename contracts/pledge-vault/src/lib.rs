@@ -1250,4 +1250,79 @@ mod test {
             }
         }
     }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: gateway not configured")]
+    fn record_lien_fails_before_gateway_configured() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let caller = Address::generate(&h.env);
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-unset");
+        h.vault
+            .record_lien(&caller, &1, &h.asset, &(10 * PRICE_SCALE), &lien_ref);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: caller is not the configured gateway")]
+    fn record_lien_fails_for_non_gateway() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        let impostor = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-impostor");
+        h.vault
+            .record_lien(&impostor, &1, &h.asset, &(10 * PRICE_SCALE), &lien_ref);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn record_lien_fails_when_units_zero() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-zero");
+        h.vault.record_lien(&gateway, &1, &h.asset, &0, &lien_ref);
+    }
+
+    #[test]
+    fn record_lien_partial_tranches_sum_and_last_lien_ref_wins() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 0);
+        assert_eq!(
+            h.vault.position(&1, &h.asset).pending_lien_units,
+            100 * PRICE_SCALE
+        );
+
+        let lien_ref_1 = Bytes::from_slice(&h.env, b"lien-tranche-1");
+        h.vault
+            .record_lien(&gateway, &1, &h.asset, &(40 * PRICE_SCALE), &lien_ref_1);
+        let mid = h.vault.position(&1, &h.asset);
+        assert_eq!(mid.units, 40 * PRICE_SCALE);
+        assert_eq!(mid.pending_lien_units, 60 * PRICE_SCALE);
+        assert_eq!(mid.lien_ref, Some(lien_ref_1));
+        assert_eq!(h.credit_line.synced_units(), 40 * PRICE_SCALE);
+
+        let lien_ref_2 = Bytes::from_slice(&h.env, b"lien-tranche-2");
+        h.vault
+            .record_lien(&gateway, &1, &h.asset, &(60 * PRICE_SCALE), &lien_ref_2);
+        let done = h.vault.position(&1, &h.asset);
+        assert_eq!(done.units, 100 * PRICE_SCALE);
+        assert_eq!(done.pending_lien_units, 0);
+        assert_eq!(done.lien_ref, Some(lien_ref_2));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 100 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 100 * PRICE_SCALE);
+    }
 }
