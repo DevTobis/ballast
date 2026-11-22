@@ -12,6 +12,8 @@
  *
  * A line already in step costs two reads and no transaction, which is what lets this run every
  * minute without paying a fee per line per run.
+ *
+ * Counts as: processed = syncCollateral transaction submitted; skipped = missing on-chain id or pledged units already match vault balance; error = exception during sync.
  */
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";

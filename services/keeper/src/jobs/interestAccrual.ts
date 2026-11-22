@@ -4,6 +4,8 @@
  * `CreditLine.poke` is permissionless on-chain (no role check — "anyone" per PRD §8), but the
  * resulting transaction still needs *a* signer to submit; this job uses the keeper operator key
  * for convenience, as the task brief calls for, even though the call itself isn't role-gated.
+ *
+ * Counts as: processed = poke transaction submitted; skipped = missing on-chain id; error = exception during poke submission.
  */
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";

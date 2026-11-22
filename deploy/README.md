@@ -65,3 +65,15 @@ compose stack, TLS issuance and the console image have not been run end to end.
 - Single host, no failover. The services are safe to restart (every job is idempotent) but there is no
   second copy running.
 - `docker-compose.yml` at the repo root is the local development stack, not this one.
+
+## Replica Safety and Service Scaling
+
+| Service | Replicas Allowed | What Breaks If Doubled | Restart Behaviour | Code Trace |
+|---|---|---|---|---|
+| `keeper` | **1 only** | Stellar account sequence collision (`txBadSeq`); race conditions on liquidations and repo margin calls; redundant gas fees. (Advisory locking mitigates temporary restarts, but multiple active replicas are unsupported). | Scheduled via `node-cron`. Missed ticks during downtime are not queued or backfilled; execution resumes at the next scheduled tick. | `services/keeper/src/index.ts:35`, `services/keeper/src/lock.ts` |
+| `margin-monitor` | **1 only** | Concurrent instances poll the same lines, generating duplicate `margin_event` rows in Postgres, duplicate alert dispatches, and unnecessary contract simulation load. | Polling loop with delay. Resumes immediately on container startup; missed checks during downtime are evaluated on the first pass. | `services/margin-monitor/src/index.ts:22`, `services/margin-monitor/src/poll.ts` |
+| `ledger` | **1 only** | Simultaneous reconciliation runs generate duplicate `reconciliation_run` and break audit records and duplicate alert notifications. | Scheduled task. Missed scheduled reconciliation runs are not backfilled; next run executes on schedule. | `services/ledger/src/index.ts`, `services/ledger/src/reconcile.ts` |
+| `indexer` | **1 (idempotent)** | Safely deduplicates via unique constraint `chain_event_event_id_uq` (`onConflictDoNothing`), but concurrent replicas waste Stellar RPC credits, CPU, and DB connections scanning redundant ledger pages. | Poller loop. Reads the cursor or latest ledger from Postgres on startup and continues forward; missed ledgers during downtime are naturally caught up. | `services/indexer/src/poller.ts:235`, `services/indexer/src/index.ts` |
+
+### Missed-Tick Policy
+None of the operational services (keeper, margin-monitor, ledger) queue or replay missed cron ticks during container downtime. When restarted, cron jobs wait for the next scheduled tick without catch-up.

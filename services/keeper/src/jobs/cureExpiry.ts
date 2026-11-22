@@ -25,6 +25,8 @@
  *
  * Every step is safe to repeat: a run that dies after `CreditLine.liquidate` finds the line
  * already `Liquidating` on-chain next time and carries on from the vault.
+ *
+ * Counts as: processed = poke or liquidation tx submitted; skipped = missing on-chain id, recovered/healthy, armed breach awaiting later ledger, or margin call within cure window; error = exception during line processing.
  */
 import { and, desc, eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
