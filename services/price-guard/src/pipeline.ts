@@ -83,12 +83,25 @@ export async function runPriceUpdateCycle(
         continue;
       }
 
+      let navSig: Buffer | undefined;
+      let navAttestError: { source: string; reason: string } | undefined;
+      if (!shadow && signer && nav) {
+        try {
+          navSig = await attestNav(signer, asset.code, nav.ts, nav.value);
+        } catch (err) {
+          const reason = `issuer NAV attest failed: ${err instanceof Error ? err.message : String(err)}`;
+          navAttestError = { source: "issuer NAV", reason };
+          logger.error({ err, assetId: asset.id, code: asset.code }, `price-guard: ${asset.code}: ${reason}`);
+        }
+      }
+
       if (nav) {
         await db.insert(schema.priceObservation).values({
           assetId: asset.id,
           source: "issuer_nav",
           value: scaledToDecimalString(nav.value),
           observedAt: new Date(nav.ts * 1000),
+          signature: navSig ? navSig.toString("base64") : null,
           stale: false,
         }).onConflictDoNothing();
       }
@@ -124,17 +137,19 @@ export async function runPriceUpdateCycle(
       // Publish each source independently: a failed NAV tx must not stop the feed publish (and
       // vice versa). Collect per-source errors and alert after the read-back.
       const publishErrors: { source: string; reason: string }[] = [];
+      if (navAttestError) {
+        publishErrors.push(navAttestError);
+      }
 
-      if (nav) {
+      if (nav && navSig) {
         try {
-          const sig = await attestNav(publisher, asset.code, nav.ts, nav.value);
           const navUnsignedXdr = await client.publishNav(
             publisherPublicKey,
             asset.contractC,
             asset.code,
             nav.value,
             nav.ts,
-            sig,
+            navSig,
           );
           await submit(await publisher.sign(navUnsignedXdr));
         } catch (err) {

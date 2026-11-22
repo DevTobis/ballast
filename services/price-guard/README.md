@@ -42,6 +42,7 @@ contract or publisher key. `scripts/shadow-run.sh` drives it. `smoke` touches ne
 - `PRICE_GUARD_CONTRACT_ID`: required unless shadow.
 - `PRICE_GUARD_PUBLISH`: `false` for a shadow run; anything else publishes.
 - `PRICE_GUARD_CRON`: cycle schedule, default `*/1 * * * *`.
+- `PRICE_GUARD_RUN_ON_START`: whether to execute one cycle immediately at startup (default `true`; `false` disables).
 - `PRICE_PUBLISHER_SIGNER_MODE` (`local`, `vault`, `kms-envelope`) and `PRICE_PUBLISHER_SECRET_KEY` (local
   mode); Vault and KMS variables are listed in `.env.example`.
 - `REDSTONE_FEED_CONTRACT_IDS`: JSON `{assetCode: feedContractId}`. Required; the cycle throws without it.
