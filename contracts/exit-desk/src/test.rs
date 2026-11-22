@@ -294,6 +294,161 @@ fn exit_panics_on_slippage() {
     ExitDeskClient::new(&h.env, &h.desk).exit(&holder, &h.rwa, &units, &(units + 1), &holder);
 }
 
+// --- #213: the USDC float -----------------------------------------------------------------
+
+/// What 100 units pay at $1.00 with a 1% spread.
+const PAYOUT_FOR_100_UNITS: i128 = 99 * PRICE_SCALE;
+
+/// A desk that quotes `PAYOUT_FOR_100_UNITS` for 100 units and holds `float` USDC, and a holder
+/// with those 100 units. Both caps are exactly 100 units, so one exit of the lot uses them up.
+fn desk_with_float(float: i128) -> (Harness, Address, i128) {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    configure(&h, 100, units, units);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    if float > 0 {
+        fund_desk(&h, float);
+    }
+    let holder = Address::generate(&h.env);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);
+    (h, holder, units)
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: insufficient USDC float")]
+fn exit_panics_when_the_float_is_one_stroop_short_of_the_payout() {
+    let (h, holder, units) = desk_with_float(PAYOUT_FOR_100_UNITS - 1);
+    ExitDeskClient::new(&h.env, &h.desk).exit(&holder, &h.rwa, &units, &0, &holder);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: insufficient USDC float")]
+fn exit_panics_with_the_float_message_on_a_desk_that_was_never_funded() {
+    let (h, holder, units) = desk_with_float(0);
+    ExitDeskClient::new(&h.env, &h.desk).exit(&holder, &h.rwa, &units, &0, &holder);
+}
+
+#[test]
+fn exit_pays_out_a_float_that_exactly_covers_the_payout() {
+    let (h, holder, units) = desk_with_float(PAYOUT_FOR_100_UNITS);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    let usdc_out = desk.exit(&holder, &h.rwa, &units, &0, &holder);
+
+    assert_eq!(usdc_out, PAYOUT_FOR_100_UNITS);
+    assert_eq!(
+        MockTokenClient::new(&h.env, &h.usdc).balance(&holder),
+        PAYOUT_FOR_100_UNITS
+    );
+    assert_eq!(desk.available_usdc(), 0);
+}
+
+/// A refused exit takes nothing and uses up nothing. The caps here are exactly 100 units, so if
+/// the refused call had counted against the holder's daily cap or the desk's inventory, the same
+/// exit could not go through once the float is topped up.
+#[test]
+fn an_exit_refused_for_a_short_float_changes_nothing() {
+    let (h, holder, units) = desk_with_float(PAYOUT_FOR_100_UNITS - 1);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let rwa = MockTokenClient::new(&h.env, &h.rwa);
+    let usdc = MockTokenClient::new(&h.env, &h.usdc);
+    let payout_to = Address::generate(&h.env);
+
+    let refused = desk.try_exit(&holder, &h.rwa, &units, &0, &payout_to);
+
+    assert!(refused.is_err(), "a payout the desk cannot make must fail");
+    assert_eq!(rwa.balance(&holder), units, "the holder keeps their RWA");
+    assert_eq!(rwa.balance(&h.desk), 0, "the desk took no RWA");
+    assert_eq!(usdc.balance(&payout_to), 0, "nothing was paid out");
+    assert_eq!(desk.available_usdc(), PAYOUT_FOR_100_UNITS - 1);
+
+    fund_desk(&h, 1);
+    let usdc_out = desk.exit(&holder, &h.rwa, &units, &0, &payout_to);
+    assert_eq!(usdc_out, PAYOUT_FOR_100_UNITS);
+    assert_eq!(rwa.balance(&h.desk), units);
+    assert_eq!(usdc.balance(&payout_to), PAYOUT_FOR_100_UNITS);
+}
+
+#[test]
+fn available_usdc_follows_the_float_through_fund_exit_and_withdraw() {
+    let (h, holder, units) = desk_with_float(0);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let quote = desk.quote(&h.rwa, &units);
+
+    // A USDC token is set but nothing has been funded: the quote cannot be paid.
+    assert_eq!(desk.available_usdc(), 0);
+    assert!(quote.usdc_out > desk.available_usdc());
+
+    fund_desk(&h, 1_000 * PRICE_SCALE);
+    assert_eq!(desk.available_usdc(), 1_000 * PRICE_SCALE);
+    assert!(quote.usdc_out <= desk.available_usdc());
+
+    desk.exit(&holder, &h.rwa, &units, &0, &holder);
+    assert_eq!(
+        desk.available_usdc(),
+        1_000 * PRICE_SCALE - PAYOUT_FOR_100_UNITS
+    );
+
+    desk.withdraw(
+        &h.admin,
+        &h.usdc,
+        &(400 * PRICE_SCALE),
+        &Address::generate(&h.env),
+    );
+    assert_eq!(
+        desk.available_usdc(),
+        600 * PRICE_SCALE - PAYOUT_FOR_100_UNITS
+    );
+}
+
+/// A desk with roles and an asset configured, but no USDC token set yet.
+fn desk_without_a_usdc_token() -> (Env, ExitDeskClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = ExitDeskClient::new(&env, &env.register(ExitDesk, ()));
+    desk.initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let price_guard = env.register(MockPriceGuard, ());
+    let rwa = env.register(MockToken, ());
+    desk.configure_asset(
+        &admin,
+        &rwa,
+        &price_guard,
+        &100,
+        &(1_000 * PRICE_SCALE),
+        &(1_000 * PRICE_SCALE),
+    );
+    MockPriceGuardClient::new(&env, &price_guard).set_price(
+        &rwa,
+        &PRICE_SCALE,
+        &PriceStatus::Ok,
+        &env.ledger().timestamp(),
+    );
+    (env, desk, rwa)
+}
+
+#[test]
+fn available_usdc_is_zero_before_a_usdc_token_is_set() {
+    let (_env, desk, _rwa) = desk_without_a_usdc_token();
+    assert_eq!(desk.available_usdc(), 0);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: usdc not configured")]
+fn exit_before_a_usdc_token_is_set_still_says_usdc_is_not_configured() {
+    let (env, desk, rwa) = desk_without_a_usdc_token();
+    let holder = Address::generate(&env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&env, &rwa).mint(&holder, &units);
+    desk.exit(&holder, &rwa, &units, &0, &holder);
+}
+
 #[test]
 #[should_panic(expected = "exit-desk: usdc_out is zero")]
 fn exit_rejects_a_dust_amount_that_would_pay_zero() {
