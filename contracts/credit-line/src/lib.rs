@@ -1069,10 +1069,11 @@ mod test {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             h.credit_line.draw(&h.borrower, &id, &PRICE_SCALE, &to);
         }));
-        assert!(
-            result.is_err(),
-            "credit-line: draw should have panicked while Draws is paused"
-        );
+        let msg = *result
+            .expect_err("credit-line: draw should have panicked while Draws is paused")
+            .downcast::<String>()
+            .expect("panic carries its message");
+        assert!(msg.contains("ballast-common: paused"), "unexpected message: {msg}");
     }
 
     #[test]
@@ -1673,5 +1674,74 @@ mod test {
                 ballast_common::ttl::INSTANCE_EXTEND_TO_LEDGERS
             );
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn draw_panics_when_draws_scope_paused() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        // TODO: switch from `as_contract(set_paused)` once on-chain pause forwarding (#30/#32) lands.
+        h.env.as_contract(&h.credit_line.address, || {
+            pause::set_paused(&h.env, &PauseScope::Draws, true);
+        });
+        h.credit_line
+            .draw(&h.borrower, &id, &(10 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn draw_panics_when_all_scope_paused() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.credit_line.address, || {
+            pause::set_paused(&h.env, &PauseScope::All, true);
+        });
+        h.credit_line
+            .draw(&h.borrower, &id, &(10 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    #[test]
+    fn ungated_exit_and_liquidation_paths_succeed_under_all_pause() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+
+        let id_repay = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id_repay, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id_repay, &(500 * PRICE_SCALE), &h.borrower.clone());
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(50 * PRICE_SCALE));
+
+        let id_liq = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id_liq, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id_liq, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        h.price_guard.set_price(&(50 * PRICE_SCALE / 100), &PriceStatus::Ok);
+
+        h.env.as_contract(&h.credit_line.address, || {
+            pause::set_paused(&h.env, &PauseScope::All, true);
+        });
+
+        let applied = h.credit_line.repay(&h.borrower, &id_repay, &(550 * PRICE_SCALE));
+        assert_eq!(applied, 550 * PRICE_SCALE);
+        h.credit_line.withdraw_interest(&h.lender, &id_repay, &(50 * PRICE_SCALE));
+        h.credit_line.withdraw_undrawn(&h.lender, &id_repay, &(1_000 * PRICE_SCALE));
+
+        let state = h.credit_line.poke(&id_liq);
+        assert_eq!(state, MarginState::Liquidation);
+        h.env
+            .ledger()
+            .set_sequence_number(h.env.ledger().sequence() + 2);
+        h.credit_line
+            .liquidate(&h.keeper, &id_liq, &LiquidationRoute::Transfer);
+        h.credit_line.close_liquidated(&h.lender, &id_liq);
+        assert_eq!(h.credit_line.line(&id_liq).status, LineStatus::Closed);
     }
 }
