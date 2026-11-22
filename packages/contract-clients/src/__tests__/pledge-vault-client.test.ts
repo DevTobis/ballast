@@ -32,4 +32,14 @@ describe("PledgeVaultClient", () => {
     const xdr = await client.recordLien(source, 1n, asset, 500n, Buffer.from("lien-ref"));
     expect(xdr.length).toBeGreaterThan(0);
   });
+
+  it("cancelPending() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.cancelPending(source, 1n, asset, 500n);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("rejectLien() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.rejectLien(source, 1n, asset, 500n, Buffer.from("declined"));
+    expect(xdr.length).toBeGreaterThan(0);
+  });
 });
