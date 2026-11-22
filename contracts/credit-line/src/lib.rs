@@ -1674,4 +1674,118 @@ mod test {
             );
         });
     }
+
+    #[test]
+    fn property_contract_usdc_always_equals_funded_minus_drawn_plus_claimable() {
+        const SEED: u64 = 0xB411_A570_0000_0148;
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0
+            }
+            fn range_i128(&mut self, lo: i128, hi: i128) -> i128 {
+                let span = (hi - lo + 1) as u64;
+                lo + (self.next_u64() % span) as i128
+            }
+        }
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let limit = 10_000 * PRICE_SCALE;
+        let collateral_units = 20_000 * PRICE_SCALE;
+        let ids = [
+            open_and_fund(&h, limit, 1_000 * PRICE_SCALE),
+            open_and_fund(&h, limit, 1_000 * PRICE_SCALE),
+            open_and_fund(&h, limit, 1_000 * PRICE_SCALE),
+        ];
+        for id in ids {
+            h.credit_line.sync_collateral(&h.admin, &id, &collateral_units);
+        }
+
+        let check_invariant = |step: usize, op: &str| {
+            let mut expected = 0i128;
+            for id in ids {
+                let line = h.credit_line.line(&id);
+                let claimable = h.credit_line.claimable_interest(&id);
+                expected += line.funded - line.drawn + claimable;
+            }
+            let actual = h.token.balance(&h.credit_line.address);
+            assert_eq!(
+                actual, expected,
+                "USDC conservation invariant violated (seed={SEED:#x}, step={step}, op={op})"
+            );
+        };
+
+        check_invariant(0, "init");
+
+        let mut rng = Lcg(SEED);
+        for step in 1..=240usize {
+            let dt = (rng.next_u64() % 20) * 86_400;
+            if dt > 0 {
+                h.env.ledger().set_timestamp(h.env.ledger().timestamp() + dt);
+            }
+
+            let id = ids[(rng.next_u64() % ids.len() as u64) as usize];
+            let op_idx = rng.next_u64() % 5;
+            let op_name = match op_idx {
+                0 => {
+                    let amt = rng.range_i128(1, 500) * PRICE_SCALE;
+                    h.token.mint(&h.lender, &amt);
+                    h.credit_line.fund(&h.lender, &id, &amt);
+                    "fund"
+                }
+                1 => {
+                    let line = h.credit_line.line(&id);
+                    let owed = h.credit_line.debt_of(&id);
+                    let healthy_debt_cap = (collateral_units * 6_900) / 10_000;
+                    let max_draw = (line.funded - line.drawn)
+                        .min(line.limit - line.drawn)
+                        .min(healthy_debt_cap - owed);
+                    if max_draw >= PRICE_SCALE {
+                        let max_whole = (max_draw / PRICE_SCALE).min(500);
+                        let amt = rng.range_i128(1, max_whole) * PRICE_SCALE;
+                        h.credit_line.draw(&h.borrower, &id, &amt, &h.borrower.clone());
+                    }
+                    "draw"
+                }
+                2 => {
+                    let owed = h.credit_line.debt_of(&id);
+                    if owed > 0 {
+                        let amt = if rng.next_u64() % 4 == 0 {
+                            owed + 25 * PRICE_SCALE
+                        } else {
+                            let half = (owed / 2).max(1);
+                            rng.range_i128(1, half).min(owed)
+                        };
+                        h.token.mint(&h.borrower, &amt);
+                        h.credit_line.repay(&h.borrower, &id, &amt);
+                    }
+                    "repay"
+                }
+                3 => {
+                    let line = h.credit_line.line(&id);
+                    let avail = line.funded - line.drawn;
+                    if avail >= PRICE_SCALE {
+                        let max_whole = (avail / PRICE_SCALE).min(400);
+                        let amt = rng.range_i128(1, max_whole) * PRICE_SCALE;
+                        h.credit_line.withdraw_undrawn(&h.lender, &id, &amt);
+                    }
+                    "withdraw_undrawn"
+                }
+                _ => {
+                    let claimable = h.credit_line.claimable_interest(&id);
+                    if claimable > 0 {
+                        let amt = rng.range_i128(1, claimable);
+                        h.credit_line.withdraw_interest(&h.lender, &id, &amt);
+                    }
+                    "withdraw_interest"
+                }
+            };
+
+            check_invariant(step, op_name);
+        }
+    }
 }
