@@ -944,6 +944,127 @@ mod test {
     }
 
     #[test]
+    fn release_in_lien_mode_moves_no_tokens_but_still_syncs() {
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+
+        // Re-point this asset's config at issuer-lien mode for this test.
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 2u64;
+        let pledge_amount = 100 * PRICE_SCALE;
+        h.vault
+            .pledge(&h.borrower, &line_id, &h.asset, &pledge_amount);
+
+        // In lien mode, tokens never enter vault and position_units is 0 pending confirmation
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+        assert_eq!(h.vault.position_units(&line_id, &h.asset), 0);
+
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-release-test");
+        h.vault
+            .record_lien(&gateway, &line_id, &h.asset, &pledge_amount, &lien_ref);
+        assert_eq!(h.vault.position_units(&line_id, &h.asset), 100 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 100 * PRICE_SCALE);
+
+        // Release 40 units in lien mode
+        let release_amount = 40 * PRICE_SCALE;
+        h.vault
+            .release(&h.borrower, &line_id, &h.asset, &release_amount);
+
+        // Assert released event emitted (read immediately before subsequent calls reset event log)
+        let events = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .cloned()
+            .collect::<std::vec::Vec<_>>();
+        let last_event = events.last().expect("expected released event");
+        let expected_t0 = ScVal::Symbol(ScSymbol("released".try_into().unwrap()));
+        let expected_t1 = ScVal::U64(line_id);
+        let val: soroban_sdk::Val = (h.asset.clone(), release_amount).into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_t0));
+                assert_eq!(v0.topics.get(1), Some(&expected_t1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // Assert borrower token balance still 0, vault token balance 0
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+        // position_units == 60
+        assert_eq!(h.vault.position_units(&line_id, &h.asset), 60 * PRICE_SCALE);
+        // synced_units() == 60
+        assert_eq!(h.credit_line.synced_units(), 60 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release exceeds pledged units")]
+    fn release_in_lien_mode_cannot_exceed_confirmed_units_when_pending() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 2u64;
+        h.vault
+            .pledge(&h.borrower, &line_id, &h.asset, &(100 * PRICE_SCALE));
+        // Confirmed units is 0, 100 pending. Release cannot exceed confirmed (0)
+        h.vault
+            .release(&h.borrower, &line_id, &h.asset, &(1 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release exceeds pledged units")]
+    fn release_in_lien_mode_cannot_exceed_confirmed_units_after_partial_record() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 2u64;
+        h.vault
+            .pledge(&h.borrower, &line_id, &h.asset, &(100 * PRICE_SCALE));
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-partial");
+        h.vault
+            .record_lien(&gateway, &line_id, &h.asset, &(50 * PRICE_SCALE), &lien_ref);
+        // Confirmed is 50, trying to release 51 must panic
+        h.vault
+            .release(&h.borrower, &line_id, &h.asset, &(51 * PRICE_SCALE));
+    }
+
+    #[test]
     #[should_panic(expected = "pledge-vault: units exceed pending (unconfirmed) lien units")]
     fn record_lien_cannot_confirm_more_than_pending() {
         let h = setup(500, 0, PRICE_SCALE);
