@@ -15,9 +15,9 @@ use ballast_common::{
     access::{self, Roles},
     asset::{AssetConfig, ParamChange},
     pause::{self, PauseScope},
-    timelock, ttl, upgrade,
+    timelock, ttl, upgrade, Error,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, Address, BytesN, Env, Symbol};
 
 #[contracttype]
 struct PendingParamChange {
@@ -69,7 +69,7 @@ impl Registry {
     ) {
         ttl::extend_instance(&env);
         if access::has_roles(&env) {
-            panic!("registry: already initialized");
+            panic_with_error!(&env, Error::AlreadyInitialized);
         }
         access::write_roles(
             &env,
@@ -449,6 +449,18 @@ mod test {
         );
 
         (env, client, admin, risk, asset)
+    }
+
+    #[test]
+    fn reinitialize_fails_with_already_initialized_error() {
+        let (_env, client, admin, risk, _asset) = setup();
+        let res = client.try_initialize(&admin, &admin, &admin, &admin, &risk);
+        assert_eq!(
+            res,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::AlreadyInitialized as u32
+            )))
+        );
     }
 
     #[test]

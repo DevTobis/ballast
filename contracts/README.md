@@ -218,3 +218,18 @@ However, once Ballast undergoes external security audit and reaches production m
 - After completing the formal security audit and deployment verification on mainnet, upgrade authority will be permanently renounced or burned (e.g. by setting the contract admin to an unspendable burn address or locking the upgrade mechanism).
 - Freezing post-audit guarantees immutability, ensuring neither compromised admin keys nor rogue governance actions can replace contract code or drain user collateral, fulfilling Ballast's core security commitments.
 
+## Shared contract error codes (`ballast-common::Error`)
+
+Rust string panic messages are stripped in release Wasm builds, rendering trapped invocations as `VM call trapped: UnreachableCodeReached`. Ballast contracts define typed, ABI-stable error codes via `#[contracterror]` in `ballast_common::Error` so that operators, client SDKs, and APIs can determine the exact failure cause.
+
+| Code | Name | Description |
+|---|---|---|
+| `1` | `NotInitialized` | Contract, module, or required state (e.g. roles) has not been initialized. |
+| `2` | `AlreadyInitialized` | Contract or module has already been initialized and cannot be re-initialized. |
+| `3` | `Paused` | The requested entry point or operation is gated by an active pause scope. |
+| `4` | `TimelockNotElapsed` | The 48-hour timelock delay required before execution has not yet elapsed. |
+| `5` | `NotFound` | The requested proposal, pending role change, asset configuration, or record does not exist. |
+| `6` | `InvalidInput` | Provided parameters or arguments are malformed or out of allowed bounds. |
+| `7` | `Unauthorized` | Caller does not possess the requisite role authority for the operation. |
+
+
