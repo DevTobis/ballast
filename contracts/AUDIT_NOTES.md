@@ -41,6 +41,84 @@ machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
 before #78 and silently removed a state (`Warning` or `MarginCall`). Thresholds stored before that
 change are not re-checked; calling `configure_asset` again is the only way to replace them.
 
+## Registry
+
+- **Holds no funds.** Registry stores role addresses, per-asset `AssetConfig`s and timelocked pending
+  changes; settlements read their own local config copy or the PriceGuard, never a Registry balance
+  (`contracts/registry/src/lib.rs:9`).
+- **`register_asset` is admin-only and not timelocked** (`contracts/registry/src/lib.rs:132`):
+  onboarding a *new* asset carries no existing positions to protect. It is not unvalidated — the
+  config goes through `AssetConfig::validate` before it is stored
+  (`contracts/registry/src/lib.rs:140`) — and a duplicate asset is refused
+  (`contracts/registry/src/lib.rs:136`).
+- **Pending changes live in persistent storage, not temporary.** `queue_param`
+  (`contracts/registry/src/lib.rs:160`) and `queue_unpause` (`contracts/registry/src/lib.rs:301`)
+  write `DataKey::PendingParam` / `PendingUnpause` entries and extend their TTL to cover the 48h delay
+  plus a 7-day grace window (`TIMELOCK_EXTEND_TTL_LEDGERS`, `contracts/common/src/timelock.rs:23`). An
+  entry left unexecuted past that window expires under Soroban state archival unless refreshed or
+  cancelled; `cancel_param` / `cancel_unpause` (admin-only) remove it early
+  (`contracts/registry/src/lib.rs:203`, `contracts/registry/src/lib.rs:323`).
+- **Execution is permissionless, queueing is not.** `execute_param`
+  (`contracts/registry/src/lib.rs:220`) and `execute_unpause` (`contracts/registry/src/lib.rs:338`)
+  may be called by anyone once `executes_at` has passed; only the admin may queue or cancel.
+  Executing deletes the entry, so an id cannot be replayed.
+- **`raise_haircut_now` is the risk role's immediate, increase-only brake**
+  (`contracts/registry/src/lib.rs:265`). It overflow-checks the base increase and caps the *combined*
+  base + FX haircut at 10,000 bps (`contracts/registry/src/lib.rs:275`); loosening risk must go
+  through the timelocked `queue_param` path instead.
+- **Pause is immediate, unpause is timelocked.** `pause` (pauser-only,
+  `contracts/registry/src/lib.rs:288`) sets a scope flag with no delay; lifting it goes through
+  `queue_unpause` / `execute_unpause` (48h). `All` is a virtual override read by `is_paused`, not a
+  stored per-scope flag (`contracts/common/src/pause.rs:69`).
+- **Registry's pause flags and asset parameters are not read at runtime by the other contracts.**
+  Each contract keeps an admin-configured local copy of its asset config (`configure_asset`) and
+  reads pause flags from its *own* instance storage; `Registry::pause` writes only Registry's
+  (`contracts/registry/src/lib.rs:292`). `exit-desk` and `repo-dvp` expose their own pause/unpause
+  (`contracts/exit-desk/src/lib.rs:433`, `contracts/repo-dvp/src/lib.rs:612`), but `credit-line` and
+  `pledge-vault` only read their flag (`contracts/credit-line/src/lib.rs:497`,
+  `contracts/pledge-vault/src/lib.rs:291`) and have no on-chain writer, so those two scopes cannot
+  currently be paused on chain. Cross-contract pause reach is tracked in #210, and `repo-dvp::propose`
+  is additionally not pause-gated (#846). Because configs are local copies, `credit-line` and
+  `pledge-vault` can hold separate haircut/threshold values (#180).
+- **Roles and pending changes are readable.** `roles()` (`contracts/registry/src/lib.rs:87`),
+  `pending_admin()` (`contracts/registry/src/lib.rs:105`), `pending_role_change(id)`
+  (`contracts/registry/src/lib.rs:124`) and `pending_upgrade(id)`
+  (`contracts/registry/src/lib.rs:386`) expose the stored roles and outstanding timelock entries.
+  Non-admin roles rotate through `queue_role_change` / `execute_role_change` (48h); the admin moves
+  with the two-step `propose_admin` / `accept_admin` pair.
+
+## ballast-common
+
+- **Shared math and guards, no funds.** `risk`, `margin`, `pause`, `access`, `asset`, `price`,
+  `timelock`, `ttl` and `upgrade` are helpers the contracts call so they cannot disagree on
+  valuation, margin bands, pause semantics or role checks.
+- **It trusts the caller for non-negative amounts.** `risk::collateral_value`
+  (`contracts/common/src/risk.rs:13`) checks only that the haircut is <= 100%
+  (`contracts/common/src/risk.rs:14`) and that the fixed-point products do not overflow
+  (`contracts/common/src/risk.rs:18`); it does not reject negative `units` or `guarded_price`, so a
+  negative input yields a negative collateral value (#808). `risk::ltv_bps`
+  (`contracts/common/src/risk.rs:30`) floors the ratio, reading up to 1 bp healthier than reality
+  (#809), and returns `u32::MAX` for zero/negative collateral against debt
+  (`contracts/common/src/risk.rs:34`).
+- **Thresholds are validated where they are configured, not where they are used.**
+  `MarginThresholds::validate` (`contracts/common/src/margin.rs:57`) panics unless
+  `0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`; `classify` trusts that the stored
+  thresholds already passed it (each contract calls `validate` in `configure_asset`).
+- **Pause helpers read the calling contract's own storage.** `pause::is_paused`
+  (`contracts/common/src/pause.rs:69`) and `require_not_paused` (`contracts/common/src/pause.rs:90`)
+  operate on the instance storage of whichever contract invokes them; `require_not_paused` panics
+  with `ballast-common: paused` and is meant only for risk-adding entry points, never
+  repay/cure/liquidate (invariant 5).
+- **Role checks panic on mismatch.** `access::require_admin` / `require_pauser` / `require_risk`
+  (`contracts/common/src/access.rs:73`, `contracts/common/src/access.rs:81`,
+  `contracts/common/src/access.rs:99`) return the stored address or panic; roles live in instance
+  storage (`access::write_roles`, `contracts/common/src/access.rs:57`).
+- **Every guard is a panic, and a panic traps.** The `assert!` / `expect!` / `panic!` paths above
+  abort the whole Soroban transaction — no partial state is committed — rather than returning a
+  recoverable error. The 48h delay and 7-day grace constants live in `timelock`
+  (`contracts/common/src/timelock.rs:8`, `contracts/common/src/timelock.rs:17`); callers assert
+  `is_ready` and panic on a missing pending entry.
+
 ## PriceGuard
 
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
