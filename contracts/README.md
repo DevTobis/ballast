@@ -13,7 +13,7 @@ in this skeleton pass.
 | `pledge-vault` | [Escrow/lien collateral positions](pledge-vault/README.md) |
 | `credit-line` | [Credit lines, draws, repayments, storage layout, and the margin state machine](credit-line/README.md) |
 | `exit-desk` | [RWA → USDC instant exit](exit-desk/README.md) |
-| `repo-dvp` | Bilateral repo, atomic DvP |
+| `repo-dvp` | [Bilateral repo, atomic DvP, trade lifecycle, entry points and failure modes](repo-dvp/README.md) |
 
 ## Differences from PRD section 8
 
