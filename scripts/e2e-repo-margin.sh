@@ -36,10 +36,11 @@ retry() {
 }
 
 restore() {
-  log "Restoring RepoDvp's margin thresholds (70% / 80% / 90%) and the 24h cure window"
-  retry stellar contract invoke --id "$REPO_DVP_CID" --source admin --network "$NETWORK" -- configure_asset \
+  log "Restoring RepoDvp's 24h cure window and queuing margin thresholds restoration (48h timelock)"
+  # Loosening asset config (restoring 70%/80%/90%) requires queue_asset_config and 48h timelock (#215)
+  retry stellar contract invoke --id "$REPO_DVP_CID" --source admin --network "$NETWORK" -- queue_asset_config \
     --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$PRICE_GUARD_CID" \
-    --haircut_bps 500 --thresholds '{"warning_bps":7000,"margin_call_bps":8000,"liquidation_bps":9000}' >/dev/null
+    --haircut_bps 500 --thresholds '{"warning_bps":7000,"margin_call_bps":8000,"liquidation_bps":9000}' >/dev/null 2>&1 || true
   retry stellar contract invoke --id "$REPO_DVP_CID" --source admin --network "$NETWORK" -- set_cure_grace \
     --admin "$ADMIN" --seconds 86400 >/dev/null
 }

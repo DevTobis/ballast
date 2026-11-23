@@ -260,6 +260,16 @@ struct PendingUnpause {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingAssetConfig {
+    pub asset: Address,
+    pub price_guard: Address,
+    pub haircut_bps: u32,
+    pub thresholds: MarginThresholds,
+    pub executes_at: u64,
+}
+
+#[contracttype]
 enum DataKey {
     Usdc,
     AssetConfig(Address),
@@ -280,6 +290,8 @@ enum DataKey {
     MaturityGrace,
 
     PendingUnpause(u64),
+
+    PendingAssetConfig(u64),
 
     LatestProposal(Address),
 }
@@ -305,6 +317,25 @@ fn read_asset_config(env: &Env, asset: &Address) -> RepoAssetConfig {
         .instance()
         .get(&DataKey::AssetConfig(asset.clone()))
         .expect("repo-dvp: asset not configured")
+}
+
+fn read_asset_config_opt(env: &Env, asset: &Address) -> Option<RepoAssetConfig> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetConfig(asset.clone()))
+}
+
+fn is_tightening(
+    current: &RepoAssetConfig,
+    new_price_guard: &Address,
+    new_haircut_bps: u32,
+    new_thresholds: &MarginThresholds,
+) -> bool {
+    new_price_guard == &current.price_guard
+        && new_haircut_bps >= current.haircut_bps
+        && new_thresholds.warning_bps <= current.thresholds.warning_bps
+        && new_thresholds.margin_call_bps <= current.thresholds.margin_call_bps
+        && new_thresholds.liquidation_bps <= current.thresholds.liquidation_bps
 }
 
 fn is_asset_disabled(env: &Env, asset: &Address) -> bool {
@@ -673,29 +704,199 @@ impl RepoDvp {
         pause::is_paused(&env, &scope)
     }
 
+    /// Configures an asset.
+    /// - When no config exists yet, the initial configuration is applied immediately by the admin.
+    /// - Once configured, loosening risk (lower haircut, higher thresholds, or a new price guard)
+    ///   is refused immediately and must be queued via `queue_asset_config` and wait a 48h timelock.
+    /// - Tightening risk (raising haircut or lowering thresholds with the same price guard) by the
+    ///   `risk` or `admin` role is allowed immediately.
     pub fn configure_asset(
         env: Env,
-        admin: Address,
+        caller: Address,
         asset: Address,
         price_guard: Address,
         haircut_bps: u32,
         thresholds: MarginThresholds,
     ) {
-        require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
         assert!(
             haircut_bps as i128 <= BPS_DENOMINATOR,
             "repo-dvp: haircut exceeds 100%"
         );
         thresholds.validate();
+
+        if let Some(current) = read_asset_config_opt(&env, &asset) {
+            if is_tightening(&current, &price_guard, haircut_bps, &thresholds) {
+                let roles = access::read_roles(&env);
+                if caller == roles.risk {
+                    access::require_risk(&env);
+                } else {
+                    require_admin_is(&env, &caller);
+                }
+                env.storage().instance().set(
+                    &DataKey::AssetConfig(asset.clone()),
+                    &RepoAssetConfig {
+                        price_guard,
+                        haircut_bps,
+                        thresholds,
+                    },
+                );
+            } else {
+                panic!("repo-dvp: loosening asset config requires queue_asset_config and 48h timelock");
+            }
+        } else {
+            require_admin_is(&env, &caller);
+            env.storage().instance().set(
+                &DataKey::AssetConfig(asset.clone()),
+                &RepoAssetConfig {
+                    price_guard,
+                    haircut_bps,
+                    thresholds,
+                },
+            );
+        }
+    }
+
+    /// Fast emergency path: immediately tightens an existing asset's risk parameters (higher haircut
+    /// or lower margin thresholds with the same price guard) without the 48h timelock.
+    /// Gated to the `risk` role.
+    pub fn tighten_asset_config(
+        env: Env,
+        risk: Address,
+        asset: Address,
+        haircut_bps: u32,
+        thresholds: MarginThresholds,
+    ) {
+        risk.require_auth();
+        let stored_risk = access::require_risk(&env);
+        assert_eq!(&stored_risk, &risk, "repo-dvp: caller is not risk role");
+        ttl::extend_instance(&env);
+        assert!(
+            haircut_bps as i128 <= BPS_DENOMINATOR,
+            "repo-dvp: haircut exceeds 100%"
+        );
+        thresholds.validate();
+
+        let current = read_asset_config(&env, &asset);
+        assert!(
+            is_tightening(&current, &current.price_guard, haircut_bps, &thresholds),
+            "repo-dvp: cannot loosen risk on tightening path"
+        );
+
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
             &RepoAssetConfig {
-                price_guard,
+                price_guard: current.price_guard,
                 haircut_bps,
                 thresholds,
             },
         );
+        env.events().publish(
+            (Symbol::new(&env, "asset_config_tightened"), asset),
+            (haircut_bps,),
+        );
+    }
+
+    /// Queues a risk-loosening change to an existing asset config, executable after the 48h
+    /// timelock (PRD §8, Invariant 6). Admin only.
+    pub fn queue_asset_config(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        price_guard: Address,
+        haircut_bps: u32,
+        thresholds: MarginThresholds,
+    ) -> u64 {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let _ = read_asset_config(&env, &asset);
+        assert!(
+            haircut_bps as i128 <= BPS_DENOMINATOR,
+            "repo-dvp: haircut exceeds 100%"
+        );
+        thresholds.validate();
+
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingAssetConfig {
+                asset: asset.clone(),
+                price_guard: price_guard.clone(),
+                haircut_bps,
+                thresholds,
+                executes_at,
+            },
+        );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events().publish(
+            (Symbol::new(&env, "asset_config_queued"), id),
+            (asset, price_guard, haircut_bps, executes_at),
+        );
+        id
+    }
+
+    /// Cancels a pending asset config change and removes its persistent storage entry. Admin only.
+    pub fn cancel_asset_config(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending asset config");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "asset_config_cancelled"), id), pending.asset);
+    }
+
+    /// Executes a queued asset config change once the 48h timelock has elapsed. Permissionless.
+    pub fn execute_asset_config(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending asset config");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "repo-dvp: timelock has not elapsed"
+        );
+        assert!(
+            pending.haircut_bps as i128 <= BPS_DENOMINATOR,
+            "repo-dvp: haircut exceeds 100%"
+        );
+        pending.thresholds.validate();
+
+        env.storage().instance().set(
+            &DataKey::AssetConfig(pending.asset.clone()),
+            &RepoAssetConfig {
+                price_guard: pending.price_guard.clone(),
+                haircut_bps: pending.haircut_bps,
+                thresholds: pending.thresholds,
+            },
+        );
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "asset_config_executed"), id),
+            (pending.asset, pending.price_guard, pending.haircut_bps),
+        );
+    }
+
+    /// Reads a pending asset config change if present.
+    pub fn pending_asset_config(env: Env, id: u64) -> Option<PendingAssetConfig> {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Reads the active configuration for an asset.
+    pub fn asset_config(env: Env, asset: Address) -> RepoAssetConfig {
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset)
     }
 
     /// Disables an asset so that new proposals and settlements are refused. Admin only.

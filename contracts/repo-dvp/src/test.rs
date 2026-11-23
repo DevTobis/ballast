@@ -153,6 +153,7 @@ struct Harness {
     admin: Address,
     pauser: Address,
     keeper: Address,
+    risk: Address,
     price_guard: Address,
     rwa: Address,
     usdc: Address,
@@ -209,6 +210,7 @@ fn setup() -> Harness {
         admin,
         pauser,
         keeper,
+        risk,
         price_guard,
         rwa,
         usdc,
@@ -1149,9 +1151,10 @@ fn configure_asset_accepts_valid_thresholds() {
     );
 
     // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
+    let new_asset_2 = Address::generate(&h.env);
     repo.configure_asset(
         &h.admin,
-        &new_asset,
+        &new_asset_2,
         &h.price_guard,
         &500u32,
         &MarginThresholds {
@@ -1298,8 +1301,216 @@ fn configure_asset_rejects_liquidation_exceeding_10000() {
         );
     }));
     assert!(res.is_err(), "liquidation > 10000 must be rejected");
-    }
+}
 
+#[test]
+fn first_time_configure_asset_is_immediate() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+
+    repo.configure_asset(
+        &h.admin,
+        &new_asset,
+        &h.price_guard,
+        &600u32,
+        &MarginThresholds {
+            warning_bps: 6_000,
+            margin_call_bps: 7_000,
+            liquidation_bps: 8_000,
+        },
+    );
+
+    let config = repo.asset_config(&new_asset);
+    assert_eq!(config.haircut_bps, 600);
+    assert_eq!(config.price_guard, h.price_guard);
+    assert_eq!(config.thresholds.warning_bps, 6_000);
+    assert_eq!(config.thresholds.margin_call_bps, 7_000);
+    assert_eq!(config.thresholds.liquidation_bps, 8_000);
+}
+
+#[test]
+fn loosening_asset_config_requires_timelock() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    // Initial setup has haircut 500, warning 7000, margin_call 8000, liquidation 9000
+
+    // 1. Lowering haircut is loosening -> panics
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &h.rwa,
+            &h.price_guard,
+            &400u32, // lower haircut
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res1.is_err(), "lowering haircut directly must panic");
+
+    // 2. Raising threshold is loosening -> panics
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &h.rwa,
+            &h.price_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_500, // raised warning threshold
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res2.is_err(), "raising threshold directly must panic");
+
+    // 3. Changing price guard is loosening -> panics
+    let new_guard = Address::generate(&h.env);
+    let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &h.rwa,
+            &new_guard,
+            &500u32,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+    }));
+    assert!(res3.is_err(), "changing price guard directly must panic");
+}
+
+#[test]
+fn queue_and_execute_asset_config_with_timelock() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    let looser_thresholds = MarginThresholds {
+        warning_bps: 7_500,
+        margin_call_bps: 8_500,
+        liquidation_bps: 9_500,
+    };
+
+    let id = repo.queue_asset_config(
+        &h.admin,
+        &h.rwa,
+        &h.price_guard,
+        &400u32,
+        &looser_thresholds,
+    );
+
+    // Pending config readable
+    let pending = repo.pending_asset_config(&id).expect("pending config must exist");
+    assert_eq!(pending.asset, h.rwa);
+    assert_eq!(pending.haircut_bps, 400);
+
+    // Cannot execute before 48h
+    let early_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.execute_asset_config(&id);
+    }));
+    assert!(early_res.is_err(), "executing before timelock must fail");
+
+    // Advance ledger timestamp by 48h
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
+
+    // Execute succeeds
+    repo.execute_asset_config(&id);
+
+    let config = repo.asset_config(&h.rwa);
+    assert_eq!(config.haircut_bps, 400);
+    assert_eq!(config.thresholds.warning_bps, 7_500);
+    assert_eq!(config.thresholds.margin_call_bps, 8_500);
+    assert_eq!(config.thresholds.liquidation_bps, 9_500);
+
+    // Second execution panics
+    let duplicate_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.execute_asset_config(&id);
+    }));
+    assert!(duplicate_res.is_err(), "second execute must fail");
+}
+
+#[test]
+fn cancel_asset_config() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    let id = repo.queue_asset_config(
+        &h.admin,
+        &h.rwa,
+        &h.price_guard,
+        &400u32,
+        &MarginThresholds {
+            warning_bps: 7_500,
+            margin_call_bps: 8_500,
+            liquidation_bps: 9_500,
+        },
+    );
+
+    // Stranger cannot cancel
+    let stranger = Address::generate(&h.env);
+    let stranger_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.cancel_asset_config(&stranger, &id);
+    }));
+    assert!(stranger_res.is_err(), "stranger cannot cancel");
+
+    // Admin cancels
+    repo.cancel_asset_config(&h.admin, &id);
+    assert!(repo.pending_asset_config(&id).is_none());
+
+    // Execute panics after timelock
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
+    let exec_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.execute_asset_config(&id);
+    }));
+    assert!(exec_res.is_err(), "executing cancelled config must fail");
+}
+
+#[test]
+fn tighten_asset_config_immediate_risk_path() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    let tighter_thresholds = MarginThresholds {
+        warning_bps: 6_000,
+        margin_call_bps: 7_000,
+        liquidation_bps: 8_000,
+    };
+
+    // Risk role tightens immediately (higher haircut: 600 vs 500, tighter thresholds)
+    repo.tighten_asset_config(&h.risk, &h.rwa, &600u32, &tighter_thresholds);
+
+    let config = repo.asset_config(&h.rwa);
+    assert_eq!(config.haircut_bps, 600);
+    assert_eq!(config.thresholds.warning_bps, 6_000);
+    assert_eq!(config.thresholds.margin_call_bps, 7_000);
+    assert_eq!(config.thresholds.liquidation_bps, 8_000);
+
+    // Risk role cannot loosen on tightening path
+    let loosen_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.tighten_asset_config(
+            &h.risk,
+            &h.rwa,
+            &500u32, // lowering haircut
+            &tighter_thresholds,
+        );
+    }));
+    assert!(loosen_res.is_err(), "tighten path rejects loosening haircut");
+
+    // Non-risk caller is rejected
+    let stranger = Address::generate(&h.env);
+    let stranger_res = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.tighten_asset_config(&stranger, &h.rwa, &700u32, &tighter_thresholds);
+    }));
+    assert!(stranger_res.is_err(), "stranger cannot call tighten_asset_config");
+}
+
+#[test]
 fn disabled_asset_blocks_propose_and_accept_and_settle() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
@@ -1455,6 +1666,7 @@ mod sac {
             admin,
             pauser,
             keeper,
+            risk,
             price_guard,
             rwa,
             usdc,
@@ -2207,8 +2419,9 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.set_usdc(&h.admin, &h.usdc));
         extends_the_instance(&h, |repo| repo.set_cure_grace(&h.admin, &3_600));
         extends_the_instance(&h, |repo| repo.set_maturity_grace(&h.admin, &3_600));
+        let new_asset = Address::generate(&h.env);
         extends_the_instance(&h, |repo| {
-            repo.configure_asset(&h.admin, &h.rwa, &h.price_guard, &500, &thresholds)
+            repo.configure_asset(&h.admin, &new_asset, &h.price_guard, &500, &thresholds)
         });
         extends_the_instance(&h, |repo| repo.disable_asset(&h.admin, &h.rwa));
         extends_the_instance(&h, |repo| repo.enable_asset(&h.admin, &h.rwa));

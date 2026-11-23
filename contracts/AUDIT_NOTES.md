@@ -11,7 +11,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
-| `risk` | `confirm_halt_cleared` | publish prices |
+| `risk` | `confirm_halt_cleared`, `tighten_asset_config` (RepoDvp) | publish prices |
 
 The keeper is trusted for **timing and completeness**, and for three **values** it supplies (see
 "Keeper-supplied values" below). Every other amount a settlement uses comes from the contract's
@@ -173,6 +173,12 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
   No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
+- **Asset configuration & timelock.** Initial configuration on an unconfigured asset is applied
+  immediately by the admin. Once configured, risk-loosening changes (lower haircut, higher thresholds,
+  or re-pointing `price_guard`) require `queue_asset_config` and a 48-hour timelock (`execute_asset_config`),
+  preventing an admin from manipulating margin parameters to force artificial liquidations or mask breaches.
+  Tightening risk (higher haircut or lower thresholds with the same price guard) can be executed immediately
+  by the `risk` role via `tighten_asset_config` or by `admin`/`risk` via `configure_asset`.
 - **Storage lifetime.** Every entry point extends the contract instance. Every write of a trade
   extends that trade's entry, and the instance with it, to outlast `maturity_at` plus the unwind
   grace, and never to less than about 30 days. The borrower's outstanding leg-2 sum is extended to
