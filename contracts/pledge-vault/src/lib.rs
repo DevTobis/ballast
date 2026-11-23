@@ -624,7 +624,9 @@ mod test {
             Debt,
             Borrower,
             Asset,
+            LineAsset(u64),
             Synced,
+            SyncedLine,
         }
 
         #[contractimpl]
@@ -663,22 +665,35 @@ mod test {
                 env.storage().instance().set(&DataKey::Asset, &asset);
             }
 
-            pub fn asset_of(env: Env, _line: u64) -> Address {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::Asset)
-                    .expect("mock-credit-line: asset not set")
+            pub fn set_line_asset(env: Env, line: u64, asset: Address) {
+                env.storage().instance().set(&DataKey::LineAsset(line), &asset);
+            }
+
+            pub fn asset_of(env: Env, line: u64) -> Address {
+                if let Some(asset) = env.storage().instance().get(&DataKey::LineAsset(line)) {
+                    asset
+                } else {
+                    env.storage()
+                        .instance()
+                        .get(&DataKey::Asset)
+                        .expect("mock-credit-line: asset not set")
+                }
             }
 
             /// Records the last figure the vault reported, so tests can see that every change to a
             /// position reached the credit line in the same transaction.
-            pub fn sync_from_vault(env: Env, vault: Address, _line: u64, _asset: Address, units: i128) {
+            pub fn sync_from_vault(env: Env, vault: Address, line: u64, _asset: Address, units: i128) {
                 vault.require_auth();
                 env.storage().instance().set(&DataKey::Synced, &units);
+                env.storage().instance().set(&DataKey::SyncedLine, &line);
             }
 
             pub fn synced_units(env: Env) -> i128 {
                 env.storage().instance().get(&DataKey::Synced).unwrap_or(-1)
+            }
+
+            pub fn synced_line(env: Env) -> u64 {
+                env.storage().instance().get(&DataKey::SyncedLine).unwrap_or(0)
             }
         }
     }
@@ -1747,5 +1762,91 @@ mod test {
         assert_eq!(confirmed.pending_lien_units, 150 * PRICE_SCALE);
         assert_eq!(confirmed.mode, CustodyMode::IssuerLien);
         assert_eq!(confirmed.lien_ref, Some(lien_ref));
+    }
+
+    #[test]
+    fn position_isolation_per_line_and_asset_and_defaults_for_unknown_keys() {
+        let h = setup(0, 0, PRICE_SCALE);
+
+        // Unknown key returns 0 units
+        assert_eq!(h.vault.position_units(&99, &h.asset), 0);
+        let unknown_asset = Address::generate(&h.env);
+        assert_eq!(h.vault.position_units(&1, &unknown_asset), 0);
+
+        // Register and configure a second asset
+        let token2_id = h.env.register(mock_token::MockToken, ());
+        let token2 = mock_token::MockTokenClient::new(&h.env, &token2_id);
+        h.vault.configure_asset(
+            &h.admin,
+            &token2_id,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &0,
+            &h.thresholds,
+            &CustodyMode::Escrow,
+        );
+
+        // Configure line assets on mock credit line
+        h.credit_line.set_line_asset(&1, &h.asset);
+        h.credit_line.set_line_asset(&2, &token2_id);
+        h.credit_line.set_line_asset(&3, &h.asset);
+        h.credit_line.set_line_asset(&4, &token2_id);
+
+        // Mint balances to borrower
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        token2.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+
+        // Pledge on 4 distinct (line, asset) pairs:
+        // (Line 1, Asset 1): 100
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 1);
+        assert_eq!(h.credit_line.synced_units(), 100 * PRICE_SCALE);
+
+        // (Line 2, Asset 2): 200
+        h.vault.pledge(&h.borrower, &2, &token2_id, &(200 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 2);
+        assert_eq!(h.credit_line.synced_units(), 200 * PRICE_SCALE);
+
+        // (Line 3, Asset 1): 300
+        h.vault.pledge(&h.borrower, &3, &h.asset, &(300 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 3);
+        assert_eq!(h.credit_line.synced_units(), 300 * PRICE_SCALE);
+
+        // (Line 4, Asset 2): 400
+        h.vault.pledge(&h.borrower, &4, &token2_id, &(400 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 4);
+        assert_eq!(h.credit_line.synced_units(), 400 * PRICE_SCALE);
+
+        // Verify initial state across all positions
+        assert_eq!(h.vault.position_units(&1, &h.asset), 100 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 400 * PRICE_SCALE);
+
+        // Release 40 from (Line 1, Asset 1)
+        h.vault.release(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 1);
+        assert_eq!(h.credit_line.synced_units(), 60 * PRICE_SCALE);
+
+        // Verify (Line 1, Asset 1) is reduced to 60 while all other positions are unchanged
+        assert_eq!(h.vault.position_units(&1, &h.asset), 60 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 400 * PRICE_SCALE);
+
+        // Release 50 from (Line 4, Asset 2)
+        h.vault.release(&h.borrower, &4, &token2_id, &(50 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 4);
+        assert_eq!(h.credit_line.synced_units(), 350 * PRICE_SCALE);
+
+        // Verify (Line 4, Asset 2) is reduced to 350 while all other positions remain unchanged
+        assert_eq!(h.vault.position_units(&1, &h.asset), 60 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 350 * PRICE_SCALE);
+
+        // Never-used (line, asset) key remains 0
+        assert_eq!(h.vault.position_units(&99, &h.asset), 0);
+        assert_eq!(h.vault.position_units(&1, &Address::generate(&h.env)), 0);
     }
 }
