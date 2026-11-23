@@ -98,11 +98,38 @@ all six contracts against the public Stellar testnet.
 
 ## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
 
-`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
+`PriceGuard.publish_nav` takes an additional `asset_code: Bytes` argument (the asset's ticker,
 e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
 `require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
 issuer key (`configure_issuer_key`, admin-only) over the canonical message
 `"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+
+> [!IMPORTANT]
+> NAV is signed by the **price publisher's** key (`configure_issuer_key` registers it), because
+> issuers publish unsigned data. As documented in [contracts/AUDIT_NOTES.md](AUDIT_NOTES.md), the
+> attestor key is the same key that is authorised to publish. On-chain the signature adds no protection
+> against a compromised publisher: it records who relayed the value. **Do not describe it as issuer attestation.**
+>
+> Full specification, key encoding command, test vectors, and operational guidance are documented in
+> [docs/nav-signing.md](../docs/nav-signing.md).
+
+### Operational summary & key conversion
+To configure an attestor key and enforce signatures on a deployment:
+
+1. Convert the publisher's Stellar address (`G...`) to raw 32-byte hex:
+   ```bash
+   PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PRICE_PUBLISHER")
+   ```
+2. Register the attestor key:
+   ```bash
+   stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
+     --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX"
+   ```
+3. Enable signature verification:
+   ```bash
+   stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
+     --admin "$ADMIN" --required true
+   ```
 
 This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
