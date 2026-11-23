@@ -49,6 +49,29 @@ export class PriceGuardClient extends BaseContractClient {
     return this.invoke(source, "configure_signature_requirement", [scAddress(source), scBool(required)]);
   }
 
+  /** Admin-only. Configures per-source staleness window in seconds (PRD §6.4, issue #86). */
+  configureSource(
+    source: string,
+    assetAddress: string,
+    sourceName: string,
+    maxStalenessS: number,
+  ): Promise<string> {
+    return this.invoke(source, "configure_source", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+      scU64(maxStalenessS),
+    ]);
+  }
+
+  /** Read-only; returns the configured per-source max staleness in seconds, or undefined if unset. */
+  sourceStaleness(assetAddress: string, sourceName: string): Promise<number | undefined> {
+    return this.read<number | undefined>("source_staleness", [
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+    ]);
+  }
+
   /**
    * Pushes an independent-feed or last-redemption-price reading. The on-chain function is named
    * `publish_source` (contracts/price-guard/src/lib.rs) — kept as `publishFeed` here for the

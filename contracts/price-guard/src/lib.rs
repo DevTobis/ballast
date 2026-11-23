@@ -155,6 +155,8 @@ enum DataKey {
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
+    /// Per-source max staleness in seconds override for (asset, source-name) (issue #86).
+    SourceMaxStaleness(Address, Symbol),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -227,6 +229,12 @@ fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
         .instance()
         .get(&DataKey::Config(asset.clone()))
         .expect("price-guard: asset not configured")
+}
+
+fn read_source_staleness(env: &Env, asset: &Address, name: &Symbol) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SourceMaxStaleness(asset.clone(), name.clone()))
 }
 
 fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed_at: u64) {
@@ -443,7 +451,9 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let mut fresh_values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
     let mut fresh_sources: soroban_sdk::Vec<PriceSource> = soroban_sdk::Vec::new(env);
     for source in all_sources.iter() {
-        if is_fresh(env, &source, config.max_staleness_s) {
+        let max_staleness_s = read_source_staleness(env, &asset, &source.name)
+            .unwrap_or(config.max_staleness_s);
+        if is_fresh(env, &source, max_staleness_s) {
             fresh_values.push_back(source.value);
             fresh_sources.push_back(source.clone());
         }
@@ -831,6 +841,40 @@ impl PriceGuard {
         );
     }
 
+    /// Admin-only. Configures a per-source staleness window in seconds for an asset's price source.
+    /// When unset or 0, `evaluate` falls back to the asset's configured `max_staleness_s` (issue #86).
+    pub fn configure_source(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        name: Symbol,
+        max_staleness_s: u64,
+    ) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+
+        let key = DataKey::SourceMaxStaleness(asset.clone(), name.clone());
+        if max_staleness_s > 0 {
+            env.storage().instance().set(&key, &max_staleness_s);
+        } else {
+            env.storage().instance().remove(&key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "configure_source"), asset.clone()),
+            (name, max_staleness_s),
+        );
+
+        evaluate(&env, asset);
+    }
+
+    /// Returns the per-source max staleness in seconds if configured, or None if falling back to the asset default.
+    pub fn source_staleness(env: Env, asset: Address, name: Symbol) -> Option<u64> {
+        read_source_staleness(&env, &asset, &name)
+    }
+
     /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
     /// for `asset`. Unknown name removal is a safe no-op.
     pub fn remove_source(env: Env, admin: Address, asset: Address, name: Symbol) {
@@ -839,6 +883,9 @@ impl PriceGuard {
         ttl::extend_instance(&env);
         read_config(&env, &asset);
 
+        env.storage()
+            .instance()
+            .remove(&DataKey::SourceMaxStaleness(asset.clone(), name.clone()));
         remove_source_internal(&env, &asset, &name);
 
         env.events().publish(
@@ -3026,6 +3073,126 @@ mod test {
         assert_eq!(degraded_upgraded.status, PriceStatus::Degraded);
         assert_eq!(degraded_upgraded.value, SCALE);
         assert_eq!(degraded_upgraded.ts, 3_000);
+    }
+
+    // --- per-source staleness window tests (issue #86) ----------------------------------------
+
+    #[test]
+    fn per_source_staleness_window_long_window_nav_and_short_window_feed() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let base_ts = 100_000u64;
+        env.ledger().set_timestamp(base_ts);
+
+        let issuer_name = Symbol::new(&env, ISSUER_SOURCE);
+        let feed_name = feed(&env);
+
+        // Daily NAV gets a 24h (86_400s) window; short-window feed gets 30m (1_800s).
+        client.configure_source(&admin, &asset, &issuer_name, &86_400);
+        client.configure_source(&admin, &asset, &feed_name, &1_800);
+
+        assert_eq!(client.source_staleness(&asset, &issuer_name), Some(86_400));
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(1_800));
+
+        // Publish both at base_ts
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &base_ts, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &base_ts);
+
+        // At age 1,000s: NAV (1,000s <= 86,400s) is fresh; feed (1,000s <= 1,800s) is fresh -> Ok
+        env.ledger().set_timestamp(base_ts + 1_000);
+        let price_1000 = client.guarded_price(&asset);
+        assert_eq!(price_1000.status, PriceStatus::Ok);
+        assert_eq!(price_1000.sources.len(), 2);
+
+        // At age 2,500s: NAV (2,500s <= 86,400s) is fresh; feed (2,500s > 1,800s) is STALE -> Degraded
+        env.ledger().set_timestamp(base_ts + 2_500);
+        let price_2500 = client.guarded_price(&asset);
+        assert_eq!(price_2500.status, PriceStatus::Degraded);
+        assert_eq!(price_2500.sources.len(), 1);
+        assert_eq!(price_2500.sources.get(0).unwrap().name, issuer_name);
+
+        // At age 90,000s: both NAV (90,000s > 86,400s) and feed are stale -> Degraded with 0 fresh sources
+        env.ledger().set_timestamp(base_ts + 90_000);
+        let price_90000 = client.guarded_price(&asset);
+        assert_eq!(price_90000.status, PriceStatus::Degraded);
+        assert_eq!(price_90000.sources.len(), 0);
+    }
+
+    #[test]
+    fn per_source_staleness_fallback_to_asset_default_when_unset_or_cleared() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let base_ts = 100_000u64;
+        env.ledger().set_timestamp(base_ts);
+
+        let issuer_name = Symbol::new(&env, ISSUER_SOURCE);
+        let feed_name = feed(&env);
+        // Unset initially: returns None
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
+        assert_eq!(client.source_staleness(&asset, &issuer_name), None);
+
+        // Publish NAV and feed
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &base_ts, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &base_ts);
+
+        // At age 4,000s: both fallback to asset default (3,600s) -> both are stale (>3,600s)
+        env.ledger().set_timestamp(base_ts + 4_000);
+        let price_default = client.guarded_price(&asset);
+        assert_eq!(price_default.status, PriceStatus::Degraded);
+
+        // Configure a 7,200s window for both -> now both are fresh (4,000s <= 7,200s) -> Ok!
+        client.configure_source(&admin, &asset, &issuer_name, &7_200);
+        client.configure_source(&admin, &asset, &feed_name, &7_200);
+        assert_eq!(client.source_staleness(&asset, &issuer_name), Some(7_200));
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(7_200));
+
+        let price_configured = client.guarded_price(&asset);
+        assert_eq!(price_configured.status, PriceStatus::Ok);
+
+        // Setting feed window to 0 clears the per-source override back to asset default (3,600s)
+        // Feed becomes stale at 4,000s (>3,600s) -> drops to 1 fresh source -> Degraded
+        client.configure_source(&admin, &asset, &feed_name, &0);
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
+
+        let price_cleared = client.guarded_price(&asset);
+        assert_eq!(price_cleared.status, PriceStatus::Degraded);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_source() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let feed_name = feed(&env);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "configure_source",
+                    args: (&stranger, &asset, &feed_name, 7_200u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_configure_source(&stranger, &asset, &feed_name, &7_200);
+
+        assert!(res.is_err(), "non-admin must not configure source staleness");
+    }
+
+    #[test]
+    fn remove_source_cleans_up_per_source_staleness() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let feed_name = feed(&env);
+        client.configure_source(&admin, &asset, &feed_name, &7_200);
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(7_200));
+
+        client.remove_source(&admin, &asset, &feed_name);
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
     }
 
     mod invariants;
