@@ -95,8 +95,9 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   haircut, pays any surplus from the lender's USDC to the borrower in the same call, records any
   shortfall, writes unrecovered principal off `funded` and closes the line. The lender cannot
   choose the price or understate the collateral, but **can choose when to close**; until they do
-  the line stays `Liquidating` and the borrower's surplus is not paid. There is no borrower-side
-  or keeper-side close.
+  the line stays `Liquidating` and the borrower's surplus is not paid. After `CLOSE_GRACE_S` (7 days),
+  the borrower or keeper can call `close_expired` to close the line and book the frozen outcome
+  without waiting on the lender; any surplus owed is recorded as an on-chain claim for the borrower (#133).
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.

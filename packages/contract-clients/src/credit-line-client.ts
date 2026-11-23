@@ -56,6 +56,7 @@ export interface OnChainLiquidationRecord {
   recovered: bigint;
   surplus: bigint;
   shortfall: bigint;
+  liquidatedAt?: number | bigint;
 }
 
 export class CreditLineClient extends BaseContractClient {
@@ -148,9 +149,21 @@ export class CreditLineClient extends BaseContractClient {
     return this.invoke(source, "close_liquidated", [scAddress(source), scU64(line)]);
   }
 
+  /**
+   * Borrower or keeper books a liquidation's outcome and closes the line after CLOSE_GRACE_S.
+   */
+  closeExpired(source: string, line: bigint): Promise<string> {
+    return this.invoke(source, "close_expired", [scAddress(source), scU64(line)]);
+  }
+
   /** Read-only: interest repaid on the line and not yet withdrawn. */
   claimableInterest(line: bigint): Promise<bigint> {
     return this.read<bigint>("claimable_interest", [scU64(line)]);
+  }
+
+  /** Read-only: surplus owed to the borrower on a line closed via close_expired. */
+  surplusClaim(line: bigint): Promise<bigint> {
+    return this.read<bigint>("surplus_claim", [scU64(line)]);
   }
 
   /** Read-only: the recorded outcome of a liquidated line (throws if it was never liquidated). */
