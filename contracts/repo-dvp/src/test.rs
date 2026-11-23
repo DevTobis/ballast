@@ -2291,3 +2291,177 @@ mod storage_lifetime {
         assert!(!trade.pending_margin_call);
     }
 }
+
+/// Contract event assertions serving as the formal contract between RepoDvp and off-chain
+/// consumers (services/indexer and services/ledger) as specified in AUDIT_NOTES.md.
+///
+/// Event schemas emitted by `RepoDvp`:
+/// - `unwind`: `topics: [Symbol("unwind"), u64(trade_id)]`, `data: i128(total_due)`
+///   Emitted when a repo is successfully unwound by repaying cash leg 2.
+/// - `mcall`: `topics: [Symbol("mcall"), u64(trade_id)]`, `data: i128(margin_call_amount)`
+///   Emitted when a margin call is opened or updated on an undercollateralized repo.
+/// - `cured`: `topics: [Symbol("cured"), u64(trade_id)]`, `data: i128(0)`
+///   Emitted when a previously pending margin call is cleared due to collateral price recovery.
+/// - `topup`: `topics: [Symbol("topup"), u64(trade_id)]`, `data: (i128(extra_units), bool(cured))`
+///   Emitted when a borrower deposits additional collateral units into escrow, indicating whether
+///   the position was cured in the same transaction.
+/// - `default`: `topics: [Symbol("default"), u64(trade_id)]`, `data: (i128(lender_units), i128(borrower_units))`
+///   Emitted when an expired margin call is defaulted via `default_close`, transferring collateral
+///   to the lender up to exposure and returning surplus to the borrower.
+/// - `mat_def`: `topics: [Symbol("mat_def"), u64(trade_id)]`, `data: (i128(lender_units), i128(borrower_units))`
+///   Emitted when an un-repaid trade is defaulted past maturity grace via `default_at_maturity`.
+mod indexer_events {
+    use super::*;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal, TryFromVal, Val, Vec};
+
+    fn settled_trade(h: &Harness, term_seconds: u64) -> u64 {
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 50 * PRICE_SCALE;
+        let maturity = h.env.ledger().timestamp() + term_seconds;
+        let id = propose(h, units, cash_amount, 500, maturity);
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+        id
+    }
+
+    fn assert_event<D: IntoVal<Env, Val>>(
+        h: &Harness,
+        events: &soroban_sdk::testutils::ContractEvents,
+        expected_topic0: Symbol,
+        expected_id: u64,
+        expected_data: D,
+    ) {
+        let filtered = events.filter_by_contract(&h.repo);
+        let last = filtered
+            .events()
+            .last()
+            .expect("expected an event emitted by repo-dvp");
+        let expected_topics: Vec<Val> = (expected_topic0, expected_id).into_val(&h.env);
+        let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+        let data_val: Val = expected_data.into_val(&h.env);
+        let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+            .expect("failed to convert expected data to ScVal");
+        match &last.body {
+            soroban_sdk::xdr::ContractEventBody::V0(body) => {
+                assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+                assert_eq!(body.data, expected_data_xdr, "data mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn unwind_emits_unwind_event_with_total_due() {
+        let h = setup();
+        let id = settled_trade(&h, 3_600);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let settled_at = trade.settled_at.unwrap();
+        h.env.ledger().set_timestamp(settled_at + 3_600);
+
+        let expected_total_due = total_due(&trade, settled_at);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &expected_total_due);
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_borrower, &id);
+        let events = h.env.events().all();
+
+        assert_event(&h, &events, symbol_short!("unwind"), id, expected_total_due);
+    }
+
+    #[test]
+    fn call_margin_emits_mcall_event_with_margin_call_amount() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let trade = repo.trade(&id);
+        assert!(trade.pending_margin_call);
+        assert!(trade.margin_call_amount > 0);
+
+        assert_event(&h, &events, symbol_short!("mcall"), id, trade.margin_call_amount);
+    }
+
+    #[test]
+    fn call_margin_emits_cured_event_when_price_recovers() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Price doubles, restoring healthy LTV
+        set_price(&h, 2 * PRICE_SCALE);
+        repo.call_margin(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let trade = repo.trade(&id);
+        assert!(!trade.pending_margin_call);
+
+        assert_event(&h, &events, symbol_short!("cured"), id, 0i128);
+    }
+
+    #[test]
+    fn top_up_emits_topup_event_with_units_and_cured_flag() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Top up insufficient to cure (1 unit: still under margin call)
+        let small_extra = 1 * PRICE_SCALE;
+        repo.top_up(&h.cash_borrower, &id, &small_extra);
+        let events1 = h.env.events().all();
+        assert_event(&h, &events1, symbol_short!("topup"), id, (small_extra, false));
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Top up sufficient to cure (100 units: doubles collateral, cures call)
+        let cure_extra = 100 * PRICE_SCALE;
+        repo.top_up(&h.cash_borrower, &id, &cure_extra);
+        let events2 = h.env.events().all();
+        assert_event(&h, &events2, symbol_short!("topup"), id, (cure_extra, true));
+        assert!(!repo.trade(&id).pending_margin_call);
+    }
+
+    #[test]
+    fn default_close_emits_default_event_with_unit_distribution() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let borrower_before = rwa_balance(&h, &h.cash_borrower);
+
+        repo.call_margin(&h.keeper, &id);
+        let deadline = repo.trade(&id).cure_deadline.expect("cure deadline set");
+        h.env.ledger().set_timestamp(deadline);
+
+        repo.default_close(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let lender_units = rwa_balance(&h, &h.cash_lender);
+        let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
+        assert!(lender_units > 0);
+        assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
+
+        assert_event(&h, &events, symbol_short!("default"), id, (lender_units, borrower_units));
+    }
+
+    #[test]
+    fn default_at_maturity_emits_mat_def_event_with_unit_distribution() {
+        let h = setup();
+        let id = settled_trade(&h, 3_600);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let maturity = trade.maturity_at;
+        let grace = RepoDvpClient::new(&h.env, &h.repo).maturity_grace_seconds();
+        h.env.ledger().set_timestamp(maturity + grace);
+
+        let borrower_before = rwa_balance(&h, &h.cash_borrower);
+        RepoDvpClient::new(&h.env, &h.repo).default_at_maturity(&h.cash_lender, &id);
+        let events = h.env.events().all();
+
+        let lender_units = rwa_balance(&h, &h.cash_lender);
+        let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
+
+        assert_event(&h, &events, symbol_short!("mat_def"), id, (lender_units, borrower_units));
+    }
+}
