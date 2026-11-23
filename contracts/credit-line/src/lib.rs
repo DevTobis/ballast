@@ -92,6 +92,18 @@ pub struct LtvView {
     pub price_status: PriceStatus,
 }
 
+/// Exact payoff breakdown and pending accrual for a credit line without a PriceGuard call
+/// (PRD §9, Backlog B-0131).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Owed {
+    pub principal: i128,
+    pub accrued_interest: i128,
+    pub pending_interest: i128,
+    pub total: i128,
+    pub as_of: u64,
+}
+
 /// Per-asset config for lines drawn against `asset` (see module docs on the Registry
 /// simplification). Mirrors `pledge-vault`'s `AssetConfig` shape since both crates are owned
 /// together in this pass, though the two are never cross-called against each other for config.
@@ -604,6 +616,27 @@ impl CreditLine {
         compute_ltv(&env, &state)
     }
 
+    /// Returns the exact payoff breakdown and pending accrual for `line` (PRD §9, Backlog B-0131):
+    /// principal, interest already booked, interest pending since `last_accrual_ts`, total payoff,
+    /// and the ledger timestamp it is valid for.
+    ///
+    /// Unlike `ltv`, it reads no price and makes no PriceGuard call, so it continues to work when
+    /// the price is Degraded or the guard is down.
+    pub fn owed(env: Env, line: u64) -> Owed {
+        ttl::extend_instance(&env);
+        let state = read_line(&env, line);
+        let now = env.ledger().timestamp();
+        let pending_interest = interest_delta(&state, now);
+        let total = state.drawn + state.accrued_interest + pending_interest;
+        Owed {
+            principal: state.drawn,
+            accrued_interest: state.accrued_interest,
+            pending_interest,
+            total,
+            as_of: now,
+        }
+    }
+
     /// Permissionless: recomputes the margin state via a fresh price read and persists it, also
     /// arming (or clearing) the breach flag `liquidate` needs. Anyone may call this — it can only
     /// ever make on-chain state match a fresh price read, never move funds.
@@ -849,9 +882,7 @@ impl CreditLine {
     /// vault, deciding whether a release puts anything at risk) cannot be blocked by a degraded or
     /// halted price feed.
     pub fn debt_of(env: Env, line: u64) -> i128 {
-        ttl::extend_instance(&env);
-        let state = read_line(&env, line);
-        state.drawn + state.accrued_interest + interest_delta(&state, env.ledger().timestamp())
+        Self::owed(env, line).total
     }
 
     /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
@@ -2332,6 +2363,134 @@ mod test {
     fn ltv_panics_for_unknown_line() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         h.credit_line.ltv(&999);
+    }
+
+    #[test]
+    fn owed_view_returns_components_and_matches_ltv_debt() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        // Immediately after draw (no time elapsed)
+        let initial_ts = h.env.ledger().timestamp();
+        let owed0 = h.credit_line.owed(&id);
+        assert_eq!(
+            owed0,
+            Owed {
+                principal: 500 * PRICE_SCALE,
+                accrued_interest: 0,
+                pending_interest: 0,
+                total: 500 * PRICE_SCALE,
+                as_of: initial_ts,
+            }
+        );
+        assert_eq!(owed0.total, h.credit_line.ltv(&id).debt);
+        assert_eq!(owed0.total, h.credit_line.debt_of(&id));
+
+        // Advance 1 year: 10% on 500 is 50 interest
+        let year_s = 365 * 24 * 60 * 60;
+        h.env.ledger().set_timestamp(initial_ts + year_s);
+        let ts1 = h.env.ledger().timestamp();
+        let owed1 = h.credit_line.owed(&id);
+        assert_eq!(
+            owed1,
+            Owed {
+                principal: 500 * PRICE_SCALE,
+                accrued_interest: 0,
+                pending_interest: 50 * PRICE_SCALE,
+                total: 550 * PRICE_SCALE,
+                as_of: ts1,
+            }
+        );
+        assert_eq!(owed1.total, h.credit_line.ltv(&id).debt);
+        assert_eq!(owed1.total, h.credit_line.debt_of(&id));
+
+        // Repay partial: 50 pays all pending interest
+        h.token.mint(&h.borrower, &(50 * PRICE_SCALE));
+        h.credit_line
+            .repay(&h.borrower, &id, &(50 * PRICE_SCALE));
+
+        let ts2 = h.env.ledger().timestamp();
+        let owed2 = h.credit_line.owed(&id);
+        assert_eq!(
+            owed2,
+            Owed {
+                principal: 500 * PRICE_SCALE,
+                accrued_interest: 0,
+                pending_interest: 0,
+                total: 500 * PRICE_SCALE,
+                as_of: ts2,
+            }
+        );
+        assert_eq!(owed2.total, h.credit_line.ltv(&id).debt);
+
+        // Advance 6 months: 10% annualized on 500 is 25 interest
+        h.env.ledger().set_timestamp(ts2 + year_s / 2);
+        let ts3 = h.env.ledger().timestamp();
+        let owed3 = h.credit_line.owed(&id);
+        assert_eq!(
+            owed3,
+            Owed {
+                principal: 500 * PRICE_SCALE,
+                accrued_interest: 0,
+                pending_interest: 25 * PRICE_SCALE,
+                total: 525 * PRICE_SCALE,
+                as_of: ts3,
+            }
+        );
+        assert_eq!(owed3.total, h.credit_line.ltv(&id).debt);
+        assert_eq!(owed3.total, h.credit_line.debt_of(&id));
+    }
+
+    #[test]
+    fn owed_view_works_when_price_is_degraded_or_guard_is_down() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+
+        // 1. Works with Degraded price and matches ltv().debt
+        h.price_guard.set_price(&PRICE_SCALE, &PriceStatus::Degraded);
+        let owed_deg = h.credit_line.owed(&id);
+        assert_eq!(owed_deg.total, 550 * PRICE_SCALE);
+        assert_eq!(owed_deg.total, h.credit_line.ltv(&id).debt);
+
+        // 2. Works when the price guard is down/failing
+        // Point asset config to a non-contract address so any call to price guard panics
+        let dead_guard = Address::generate(&h.env);
+        h.credit_line.configure_asset(
+            &h.admin,
+            &h.asset,
+            &dead_guard,
+            &h.token.address,
+            &0,
+            &MarginThresholds {
+                warning_bps: 7000,
+                margin_call_bps: 8000,
+                liquidation_bps: 9000,
+            },
+        );
+
+        // owed succeeds without calling the dead price guard
+        let owed_dead = h.credit_line.owed(&id);
+        assert_eq!(owed_dead.principal, 500 * PRICE_SCALE);
+        assert_eq!(owed_dead.pending_interest, 50 * PRICE_SCALE);
+        assert_eq!(owed_dead.total, 550 * PRICE_SCALE);
+        assert_eq!(owed_dead.as_of, h.env.ledger().timestamp());
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn owed_panics_for_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.owed(&999);
     }
 
     #[test]

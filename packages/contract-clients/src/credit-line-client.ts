@@ -32,6 +32,18 @@ export interface LtvView {
   priceStatus: PriceStatus;
 }
 
+/**
+ * Exact payoff breakdown and pending accrual returned by `CreditLineClient.owed` without calling
+ * PriceGuard (PRD §9, Backlog B-0131).
+ */
+export interface Owed {
+  principal: bigint;
+  accruedInterest: bigint;
+  pendingInterest: bigint;
+  total: bigint;
+  asOf: bigint;
+}
+
 /** The subset of the contract's `Line` struct (contracts/credit-line/src/lib.rs) callers read. */
 export interface OnChainLine {
   lender: string;
@@ -104,6 +116,11 @@ export class CreditLineClient extends BaseContractClient {
   /** Read-only; simulated rather than returned as unsigned XDR since it changes no state. */
   ltv(line: bigint): Promise<LtvView> {
     return this.read<LtvView>("ltv", [scU64(line)]);
+  }
+
+  /** Read-only: exact payoff components and timestamp without calling PriceGuard (PRD §9, Backlog B-0131). */
+  owed(line: bigint): Promise<Owed> {
+    return this.read<Owed>("owed", [scU64(line)]);
   }
 
   /** Read-only: the line's raw on-chain state (principal `drawn`, `funded`, `pledgedUnits`...). */
