@@ -32,6 +32,29 @@ struct PendingUnpause {
     executes_at: u64,
 }
 
+/// Read-only view of a queued parameter change (`queue_param`), for consoles and ops scripts that
+/// need to show what is waiting in the timelock without guessing ids.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingParamView {
+    /// The asset the queued change targets.
+    pub asset: Address,
+    /// The parameter change that will be applied on execution.
+    pub change: ParamChange,
+    /// Ledger timestamp at which the change becomes executable.
+    pub executes_at: u64,
+}
+
+/// Read-only view of a queued unpause (`queue_unpause`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUnpauseView {
+    /// The pause scope the queued unpause will lift.
+    pub scope: PauseScope,
+    /// Ledger timestamp at which the unpause becomes executable.
+    pub executes_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     Asset(Address),
@@ -259,6 +282,19 @@ impl Registry {
         );
     }
 
+    /// The queued parameter change for `id`, if one is still pending. Returns `None` for unknown,
+    /// already-executed or cancelled ids. Read-only: it neither mutates state nor extends TTLs.
+    pub fn pending_param(env: Env, id: u64) -> Option<PendingParamView> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingParam(id))
+            .map(|pending: PendingParamChange| PendingParamView {
+                asset: pending.asset,
+                change: pending.change,
+                executes_at: pending.executes_at,
+            })
+    }
+
     /// The emergency brake (PRD §6.4/§8): raises `haircut_base_bps` immediately, with no
     /// timelock. Increase-only — a decrease (loosening risk) must go through the timelocked path,
     /// only tightening risk gets to skip it.
@@ -351,6 +387,18 @@ impl Registry {
         env.storage().persistent().remove(&key);
         env.events()
             .publish((Symbol::new(&env, "unpause_executed"), id), pending.scope);
+    }
+
+    /// The queued unpause for `id`, if one is still pending. Returns `None` for unknown,
+    /// already-executed or cancelled ids. Read-only: it neither mutates state nor extends TTLs.
+    pub fn pending_unpause(env: Env, id: u64) -> Option<PendingUnpauseView> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingUnpause(id))
+            .map(|pending: PendingUnpause| PendingUnpauseView {
+                scope: pending.scope,
+                executes_at: pending.executes_at,
+            })
     }
 
     pub fn is_paused(env: Env, scope: PauseScope) -> bool {
@@ -768,16 +816,11 @@ mod test {
 
     #[test]
     fn pause_is_immediate_unpause_is_timelocked() {
-        let (env, client, admin, _risk, asset) = setup();
-        let _ = asset;
+        let (env, client, admin, _risk, _asset) = setup();
 
-        let pauser = Address::generate(&env);
-        // Re-initialize isn't possible; instead call pause with the actual configured pauser by
-        // reading it back out is not exposed, so this test exercises the read-your-writes path
-        // via `is_paused` using the pauser captured at setup time instead.
-        let _ = pauser;
-
-        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        // The configured pauser is read back through the public `roles()` getter rather than
+        // poking storage, so this also pins the read-your-writes path for role addresses.
+        client.pause(&client.roles().pauser, &PauseScope::Draws);
         assert!(client.is_paused(&PauseScope::Draws));
 
         let id = client.queue_unpause(&admin, &PauseScope::Draws);
@@ -1662,5 +1705,73 @@ mod test {
 
         // Raising base by even 1 bps when base (300) + fx (9_700) == 10_000 must panic.
         client.raise_haircut_now(&risk, &asset, &1);
+    }
+
+    #[test]
+    fn roles_returns_the_addresses_configured_at_initialize() {
+        let (_env, client, admin, risk, _asset) = setup();
+        let roles = client.roles();
+        assert_eq!(roles.admin, admin);
+        assert_eq!(roles.risk, risk);
+        // A second read is stable and does not mutate state.
+        assert_eq!(client.roles(), roles);
+    }
+
+    #[test]
+    fn pending_param_reports_queued_changes_and_none_once_gone() {
+        let (env, client, admin, _risk, asset) = setup();
+        assert_eq!(client.pending_param(&999), None);
+
+        let change = ParamChange::HaircutBaseBps(700);
+        let id = client.queue_param(&admin, &asset, &change);
+        let view = client
+            .pending_param(&id)
+            .expect("queued change must be visible");
+        assert_eq!(view.asset, asset);
+        assert_eq!(view.change, change);
+        assert_eq!(
+            view.executes_at,
+            env.ledger().timestamp() + ballast_common::timelock::TIMELOCK_DELAY_SECONDS
+        );
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        assert_eq!(client.pending_param(&id), None);
+    }
+
+    #[test]
+    fn pending_unpause_reports_queued_unpauses_and_none_once_gone() {
+        let (env, client, admin, _risk, _asset) = setup();
+        assert_eq!(client.pending_unpause(&999), None);
+
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        let view = client
+            .pending_unpause(&id)
+            .expect("queued unpause must be visible");
+        assert_eq!(view.scope, PauseScope::Draws);
+        assert_eq!(
+            view.executes_at,
+            env.ledger().timestamp() + ballast_common::timelock::TIMELOCK_DELAY_SECONDS
+        );
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        assert_eq!(client.pending_unpause(&id), None);
+    }
+
+    #[test]
+    fn cancelled_pending_entries_report_none() {
+        let (_env, client, admin, _risk, asset) = setup();
+        let param_id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(700));
+        client.cancel_param(&admin, &param_id);
+        assert_eq!(client.pending_param(&param_id), None);
+
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        client.cancel_unpause(&admin, &unpause_id);
+        assert_eq!(client.pending_unpause(&unpause_id), None);
     }
 }
