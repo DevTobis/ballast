@@ -2,6 +2,10 @@
 // Contract entry points take their inputs as flat arguments (that's the on-chain interface), and
 // `#[contractimpl]` generates client functions with the same arity.
 #![allow(clippy::too_many_arguments)]
+// Events are published with `Events::publish`, which soroban-sdk now deprecates in favour of
+// `#[contractevent]`. Moving over changes how events are encoded on-chain, so it has to be done
+// together with the off-chain readers (services/indexer, services/ledger) and a redeploy.
+#![allow(deprecated)]
 
 //! `CreditLine` (PRD §6.2, §8): lender commitments, draws, repayments, interest accrual, LTV
 //! computation, the margin state machine, and the liquidation entry point. Holds USDC "in transit
@@ -48,9 +52,10 @@
 //! the TTL of a dormant credit line before it archives.
 //!
 //! **Events.** Like `PledgeVault`, state changes publish one event with the shape
-//! `((Symbol, line), payload)`: `line_closed` from `close_liquidated` and `undrawn_withdrawn` from
+//! `((Symbol, line), payload)`: `drawn` from `draw`, `line_closed` from `close_liquidated` and `undrawn_withdrawn` from
 //! `withdraw_undrawn` (which moves the lender's funded exposure and so needs an on-chain trace for
-//! the console and indexer). See `README.md`'s events table for the exact topics and payloads.
+//! the console and indexer). See `README.md`'s events table for the exact topics and payloads:
+//! - `drawn`: `((Symbol("drawn"), line: u64), (amount: i128, to: Address, drawn_total: i128, ltv_bps: u32))`
 
 use ballast_common::{
     access::{self, Roles},
@@ -600,6 +605,11 @@ impl CreditLine {
         state.drawn += amount;
         state.margin_state = margin_state;
         write_line(&env, line, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "drawn"), line),
+            (amount, to, state.drawn, ltv_bps),
+        );
     }
 
     /// PRD §8 invariant 5 ("pausing cannot move funds"): deliberately *not* gated by
@@ -3232,5 +3242,144 @@ mod test {
         h.credit_line
             .withdraw_undrawn(&h.lender, &id, &(500 * PRICE_SCALE));
         assert_eq!(h.token.balance(&h.credit_line.address), 0);
+    }
+
+    #[test]
+    fn draw_publishes_drawn_event_with_expected_topics_and_data() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to1 = Address::generate(&h.env);
+        let amount1 = 300 * PRICE_SCALE;
+        // First draw: $300 debt against $950 collateral -> 3157 bps (<7000 Healthy).
+        h.credit_line.draw(&h.borrower, &id, &amount1, &to1);
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("drawn".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(id);
+
+        let all_events1 = h.env.events().all();
+        let contract_events1 = all_events1.filter_by_contract(&h.credit_line.address);
+        let drawn_events: std::vec::Vec<_> = contract_events1
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&expected_topic0),
+            })
+            .collect();
+        assert_eq!(
+            drawn_events.len(),
+            1,
+            "exactly 1 drawn event after first draw"
+        );
+
+        let val1: soroban_sdk::Val = (amount1, to1.clone(), amount1, 3157u32).into_val(&h.env);
+        let expected_data1 = ScVal::try_from_val(&h.env, &val1).unwrap();
+        match &drawn_events[0].body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.first(), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data1);
+
+                // Decode and verify topics and payload with TryFromVal and Symbol::new
+                let top0_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.first().unwrap()).unwrap();
+                let top0_sym = Symbol::try_from_val(&h.env, &top0_val).unwrap();
+                assert_eq!(top0_sym, Symbol::new(&h.env, "drawn"));
+
+                let top1_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.get(1).unwrap()).unwrap();
+                let top1_line = u64::try_from_val(&h.env, &top1_val).unwrap();
+                assert_eq!(top1_line, id);
+
+                let data_val = soroban_sdk::Val::try_from_val(&h.env, &v0.data).unwrap();
+                let decoded: (i128, Address, i128, u32) =
+                    TryFromVal::try_from_val(&h.env, &data_val).unwrap();
+                assert_eq!(decoded, (amount1, to1.clone(), amount1, 3157u32));
+            }
+        }
+
+        // Second cumulative draw to a distinct recipient address.
+        let to2 = Address::generate(&h.env);
+        let amount2 = 200 * PRICE_SCALE;
+        // Cumulative debt is $500 against $950 collateral -> 5263 bps (<7000 Healthy).
+        h.credit_line.draw(&h.borrower, &id, &amount2, &to2);
+
+        let all_events2 = h.env.events().all();
+        let contract_events2 = all_events2.filter_by_contract(&h.credit_line.address);
+        let drawn_events2: std::vec::Vec<_> = contract_events2
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&expected_topic0),
+            })
+            .collect();
+        assert_eq!(
+            drawn_events2.len(),
+            1,
+            "exactly 1 drawn event in second draw invocation"
+        );
+
+        let val2: soroban_sdk::Val =
+            (amount2, to2.clone(), amount1 + amount2, 5263u32).into_val(&h.env);
+        let expected_data2 = ScVal::try_from_val(&h.env, &val2).unwrap();
+        match &drawn_events2[0].body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.first(), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data2);
+
+                let top0_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.first().unwrap()).unwrap();
+                let top0_sym = Symbol::try_from_val(&h.env, &top0_val).unwrap();
+                assert_eq!(top0_sym, Symbol::new(&h.env, "drawn"));
+
+                let top1_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.get(1).unwrap()).unwrap();
+                let top1_line = u64::try_from_val(&h.env, &top1_val).unwrap();
+                assert_eq!(top1_line, id);
+
+                let data_val = soroban_sdk::Val::try_from_val(&h.env, &v0.data).unwrap();
+                let decoded: (i128, Address, i128, u32) =
+                    TryFromVal::try_from_val(&h.env, &data_val).unwrap();
+                assert_eq!(decoded, (amount2, to2.clone(), amount1 + amount2, 5263u32));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_draw_emits_no_drawn_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        // Exceeding the line's limit (limit is 1000, drawing 1001)
+        let res = h
+            .credit_line
+            .try_draw(&h.borrower, &id, &(1_001 * PRICE_SCALE), &to);
+        assert!(res.is_err(), "draw exceeding limit must fail");
+
+        let drawn_symbol = ScVal::Symbol(ScSymbol("drawn".try_into().unwrap()));
+        let all_events = h.env.events().all();
+        let contract_events = all_events.filter_by_contract(&h.credit_line.address);
+        let count = contract_events
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&drawn_symbol),
+            })
+            .count();
+        assert_eq!(count, 0, "no drawn event should be emitted on failed draw");
     }
 }
