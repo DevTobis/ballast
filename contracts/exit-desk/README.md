@@ -67,7 +67,19 @@ Matches `quote_with_ok_price_applies_spread` in `contracts/exit-desk/src/test.rs
     `"exit-desk: exceeds per-holder daily cap"`.
   - Resets automatically upon rolling into the next UTC day.
 
-### 2. Desk Inventory Cap (`desk_inventory_cap`)
+### 2. Desk Daily Volume Cap (`desk_daily_cap`)
+
+* **Storage Key**: `DataKey::DeskDailyUsed(asset, day_bucket)`
+* **Bucket Calculation**:
+  $$\text{day\_bucket} = \left\lfloor \frac{\text{ledger\_timestamp}}{86{,}400} \right\rfloor$$
+* **Mechanism**:
+  - Partitions aggregate desk volume across all holders into 86,400-second UTC calendar day buckets.
+  - Each exit increments `desk_daily_used` by `units`.
+  - If `new_desk_daily_used > desk_daily_cap`, the transaction panics with:
+    `"exit-desk: exceeds desk daily cap"`.
+  - Resets automatically upon rolling into the next UTC day. Withdrawing RWA inventory does not restore daily volume capacity.
+
+### 3. Desk Inventory Cap (`desk_inventory_cap`)
 
 * **Storage Key**: `DataKey::Inventory(asset)`
 * **Mechanism**:
@@ -100,11 +112,13 @@ stellar contract invoke \
   --price_guard "$PRICE_GUARD_CID" \
   --spread_bps 25 \
   --per_holder_daily_cap $((10000 * UNIT)) \
+  --desk_daily_cap $((50000 * UNIT)) \
   --desk_inventory_cap $((1000000 * UNIT))
 ```
 
 * `--spread_bps 25`: 0.25% exit fee.
 * `--per_holder_daily_cap`: Maximum 10,000 RWA units per holder per UTC day.
+* `--desk_daily_cap`: Maximum 50,000 RWA units aggregated across all holders per UTC day.
 * `--desk_inventory_cap`: Maximum 1,000,000 RWA units accumulated before operator rebalance is required.
 
 ### 2. Fund the USDC Float

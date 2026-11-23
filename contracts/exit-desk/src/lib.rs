@@ -59,6 +59,7 @@ pub struct AssetConfig {
     pub price_guard: Address,
     pub spread_bps: u32,
     pub per_holder_daily_cap: i128,
+    pub desk_daily_cap: i128,
     pub desk_inventory_cap: i128,
 }
 
@@ -93,6 +94,9 @@ enum DataKey {
     /// Units a `holder` has exited for `asset` within a given UTC day bucket
     /// (`timestamp / 86_400`), for the per-holder daily cap.
     DailyUsed(Address, Address, u64),
+    /// Units exited for `asset` across all holders within a given UTC day bucket
+    /// (`timestamp / 86_400`), for the total desk daily volume cap.
+    DeskDailyUsed(Address, u64),
     PendingUnpause(u64),
 }
 
@@ -202,6 +206,7 @@ impl ExitDesk {
         price_guard: Address,
         spread_bps: u32,
         per_holder_daily_cap: i128,
+        desk_daily_cap: i128,
         desk_inventory_cap: i128,
     ) {
         require_admin_is(&env, &admin);
@@ -215,6 +220,10 @@ impl ExitDesk {
             "exit-desk: per_holder_daily_cap must be positive"
         );
         assert!(
+            desk_daily_cap > 0,
+            "exit-desk: desk_daily_cap must be positive"
+        );
+        assert!(
             desk_inventory_cap > 0,
             "exit-desk: desk_inventory_cap must be positive"
         );
@@ -225,6 +234,7 @@ impl ExitDesk {
                 price_guard,
                 spread_bps,
                 per_holder_daily_cap,
+                desk_daily_cap,
                 desk_inventory_cap,
             },
         );
@@ -388,6 +398,15 @@ impl ExitDesk {
             panic!("exit-desk: exceeds per-holder daily cap");
         }
 
+        let desk_daily_key = DataKey::DeskDailyUsed(asset.clone(), day_bucket);
+        let desk_daily_used: i128 = env.storage().persistent().get(&desk_daily_key).unwrap_or(0);
+        let new_desk_daily_used = desk_daily_used
+            .checked_add(units)
+            .expect("exit-desk: overflow in desk daily-used counter");
+        if new_desk_daily_used > config.desk_daily_cap {
+            panic!("exit-desk: exceeds desk daily cap");
+        }
+
         let inventory_key = DataKey::Inventory(asset.clone());
         let inventory: i128 = env.storage().persistent().get(&inventory_key).unwrap_or(0);
         let new_inventory = inventory
@@ -419,6 +438,9 @@ impl ExitDesk {
         );
 
         env.storage().persistent().set(&daily_key, &new_daily_used);
+        env.storage()
+            .persistent()
+            .set(&desk_daily_key, &new_desk_daily_used);
         env.storage()
             .persistent()
             .set(&inventory_key, &new_inventory);
