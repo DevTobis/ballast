@@ -127,11 +127,10 @@ export async function runPriceUpdateCycle(
 
       if (nav) {
         try {
-          const sig = await attestNav(publisher, asset.code, nav.ts, nav.value);
+          const sig = await attestNav(publisher, client.contractAddress, asset.code, nav.ts, nav.value);
           const navUnsignedXdr = await client.publishNav(
             publisherPublicKey,
             asset.contractC,
-            asset.code,
             nav.value,
             nav.ts,
             sig,

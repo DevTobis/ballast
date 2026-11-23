@@ -31,7 +31,7 @@ PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.ar
 
 echo ">>> Registering $PRICE_PUBLISHER as the NAV attestor for $RWA_SAC"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
-  --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
+  --admin "$ADMIN" --asset "$RWA_SAC" --asset_code "${RWA_ASSET_CODE:-RWA1}" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
 
 echo ">>> Requiring NAV signatures"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \

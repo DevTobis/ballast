@@ -178,7 +178,6 @@ fn execute_and_assert_invariants(
     env.ledger().with_mut(|l| l.timestamp = start_time);
 
     let mut model = PriceGuardModel::new(band_bps, daily_move_band_bps, max_staleness_s, start_time);
-    let code = asset_code(&env);
     let sig = BytesN::from_array(&env, &[0u8; 64]);
 
     let mut prev_status: Option<PriceStatus> = None;
@@ -191,7 +190,7 @@ fn execute_and_assert_invariants(
             Operation::PublishNav { value, time_skew } => {
                 let now = env.ledger().timestamp();
                 let ts = ((now as i64) + time_skew).clamp(1, (now + MAX_FUTURE_SKEW_S) as i64) as u64;
-                client.publish_nav(&publisher, &asset, &code, value, &ts, &sig);
+                client.publish_nav(&publisher, &asset, value, &ts, &sig);
                 model.publish_nav(*value, ts);
             }
             Operation::PublishSource { source_idx, value, time_skew } => {
@@ -334,11 +333,10 @@ proptest! {
 #[test]
 fn regression_invariant_1_single_source_cannot_be_ok() {
     let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
-    let code = asset_code(&env);
     let sig = BytesN::from_array(&env, &[0u8; 64]);
     let now = env.ledger().timestamp();
 
-    client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     let price = client.guarded_price(&asset);
     assert_ne!(price.status, PriceStatus::Ok);
     assert_eq!(price.status, PriceStatus::Degraded);
@@ -347,11 +345,10 @@ fn regression_invariant_1_single_source_cannot_be_ok() {
 #[test]
 fn regression_invariant_2_out_of_band_sources_cannot_be_ok() {
     let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
-    let code = asset_code(&env);
     let sig = BytesN::from_array(&env, &[0u8; 64]);
     let now = env.ledger().timestamp();
 
-    client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     let redstone = Symbol::new(&env, "redston");
     // 60 bps deviation > 50 bps band
     let out_of_band = SCALE + (SCALE * 60 / 10_000);
@@ -364,26 +361,25 @@ fn regression_invariant_2_out_of_band_sources_cannot_be_ok() {
 #[test]
 fn regression_invariant_3_halt_persists_across_valid_and_time_updates() {
     let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
-    let code = asset_code(&env);
     let sig = BytesN::from_array(&env, &[0u8; 64]);
     let now = env.ledger().timestamp();
     let redstone = Symbol::new(&env, "redston");
 
     // Establish initial Ok
-    client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
     assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
     // Trigger halt with +5% move
     let jumped = SCALE * 105 / 100;
-    client.publish_nav(&publisher, &asset, &code, &jumped, &now, &sig);
+    client.publish_nav(&publisher, &asset, &jumped, &now, &sig);
     client.publish_source(&publisher, &asset, &redstone, &jumped, &now);
     assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
 
     // Advancing time and publishing fresh matching values at the jumped price: must still remain Halted
     env.ledger().with_mut(|l| l.timestamp = now + 500);
     let later = env.ledger().timestamp();
-    client.publish_nav(&publisher, &asset, &code, &jumped, &later, &sig);
+    client.publish_nav(&publisher, &asset, &jumped, &later, &sig);
     client.publish_source(&publisher, &asset, &redstone, &jumped, &later);
     assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
 
@@ -398,7 +394,6 @@ fn regression_invariant_3_halt_persists_across_valid_and_time_updates() {
 #[test]
 fn regression_invariant_4_degraded_and_halted_preserve_last_ok_value() {
     let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
-    let code = asset_code(&env);
     let sig = BytesN::from_array(&env, &[0u8; 64]);
     let now = env.ledger().timestamp();
     let redstone = Symbol::new(&env, "redston");
@@ -409,7 +404,7 @@ fn regression_invariant_4_degraded_and_halted_preserve_last_ok_value() {
     assert_eq!(initial.value, 0);
 
     // Establish first Ok value
-    client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
     let ok_price = client.guarded_price(&asset);
     assert_eq!(ok_price.status, PriceStatus::Ok);
@@ -423,7 +418,7 @@ fn regression_invariant_4_degraded_and_halted_preserve_last_ok_value() {
 
     // Agreeing huge jump causes Halted -> value must stay at SCALE
     let jumped = SCALE * 120 / 100;
-    client.publish_nav(&publisher, &asset, &code, &jumped, &now, &sig);
+    client.publish_nav(&publisher, &asset, &jumped, &now, &sig);
     client.publish_source(&publisher, &asset, &redstone, &jumped, &now);
     let halted = client.guarded_price(&asset);
     assert_eq!(halted.status, PriceStatus::Halted);
@@ -456,26 +451,25 @@ fn regression_invariant_5_rapid_publish_and_time_advance_sequence() {
 #[test]
 fn regression_halt_clear_with_divergent_sources_rehalts() {
     let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
-    let code = asset_code(&env);
     let sig = BytesN::from_array(&env, &[0u8; 64]);
     let now = env.ledger().timestamp();
     let redstone = Symbol::new(&env, "redston");
 
     // Initial Ok
-    client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+    client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
     assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
     // Jump by +5% triggers halt, storing jumped as PendingHaltValue
     let jumped = SCALE * 105 / 100;
-    client.publish_nav(&publisher, &asset, &code, &jumped, &now, &sig);
+    client.publish_nav(&publisher, &asset, &jumped, &now, &sig);
     client.publish_source(&publisher, &asset, &redstone, &jumped, &now);
     assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
 
     // While halted, sources are republished at original SCALE
     env.ledger().with_mut(|l| l.timestamp = now + 100);
     let later = env.ledger().timestamp();
-    client.publish_nav(&publisher, &asset, &code, &SCALE, &later, &sig);
+    client.publish_nav(&publisher, &asset, &SCALE, &later, &sig);
     client.publish_source(&publisher, &asset, &redstone, &SCALE, &later);
     assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
 

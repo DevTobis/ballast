@@ -31,7 +31,7 @@ PRD does not allow, or silently drops something it promises).
 | `cure_s` stored, never enforced | §8 (`PRD.md:555`) passes `cure_s` to `open`; invariant 3 requires an "expired cure window" before liquidation | `cure_s` is stored on the `Line` (`contracts/credit-line/src/lib.rs:143,360`) and never read; the "no quick liquidation" rule is instead enforced by requiring the breach to have been flagged by a `poke` on an earlier ledger | bug — #147 |
 | `fee_bps` has no on-chain effect | §7 (`PRD.md:496`): the `credit_line` table has `fee_bps`; §5 says the platform fee "is taken on top" | no `fee_bps` anywhere in `contracts/`; it never reaches `open`, `Line`, or `repay` | planned — #146, #920 |
 | No `next accrual` getter | §9 (`PRD.md:606`): `GET /v1/credit-lines/{id}` returns "limit, drawn, LTV, state, next accrual" | no `next_accrual` getter exists; `ltv` returns debt as a single sum and needs a PriceGuard call | planned — #131, #918 |
-| `publish_nav` gains `asset_code` | §8 (`PRD.md:545`): `publish_nav(publisher, asset, value, ts, sig)` | `publish_nav` takes an extra `asset_code: Bytes` (`contracts/price-guard/src/lib.rs:989`) for the issuer-signature check | intended — a deliberate breaking change, documented in "price-guard's `publish_nav`" below |
+| `publish_nav` signature binding | §8 (`PRD.md:545`): `publish_nav(publisher, asset, value, ts, sig)` | `configure_issuer_key` binds `asset_code: Bytes` and `publish_nav` verifies `sig` over `ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}` | intended — cross-asset and cross-deployment replay prevention (#90) |
 | `unpause` is queue + execute | §8 (`PRD.md:542`): `unpause(admin, scope)` (timelocked) | no `unpause` entry point; instead `queue_unpause` (`contracts/registry/src/lib.rs:286`) + `execute_unpause` (`:323`), implementing the 48h timelock as an explicit two-step flow | intended |
 | `propose` flattens `RepoTerms` | §8 (`PRD.md:568`): `propose(cash_lender, terms: RepoTerms)` | `propose` takes the terms as separate parameters — `cash_lender, cash_borrower, asset, units, cash_amount, rate_bps, kind, maturity_at, agreement_hash` (`contracts/repo-dvp/src/lib.rs:597`); no `RepoTerms` type exists, and `cash_borrower` is named up front where the PRD only brings the borrower in at `accept_and_settle` | intended |
 | `repay` returns the applied amount | §8 (`PRD.md:558`): `repay(payer, line, amount)` (no return shown) | `repay(...) -> i128`, returning the amount applied (`min(amount, owed)`) (`contracts/credit-line/src/lib.rs:529`) | intended |
@@ -96,23 +96,28 @@ This produces `../target/wasm32v1-none/release/<crate>.wasm`. `cargo test -p <cr
 See `scripts/README.md`'s "Testnet end-to-end run" section for how to build, deploy, and wire up
 all six contracts against the public Stellar testnet.
 
-## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
+## `price-guard`'s `publish_nav` — issuer-signature verification and message binding
 
-`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
-e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
-`require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
-issuer key (`configure_issuer_key`, admin-only) over the canonical message
-`"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+When the contract's `require_nav_signature` flag is `true` (the default), `PriceGuard.publish_nav`
+verifies `sig` against the asset's registered issuer key (`configure_issuer_key`, admin-only)
+over the canonical message:
 
-This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
-`scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
-— see `TESTNET_DEPLOYMENT.md`):
+```text
+ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}
+```
 
-- `scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
-  after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
-  key for its test `RWA1` asset.
-- `scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
-  bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
+via `env.crypto().ed25519_verify(...)`.
+
+`asset_code: Bytes` (e.g. `"SPIKO"`, as raw UTF-8 bytes) is registered alongside the issuer public
+key via `configure_issuer_key(admin, asset, asset_code, issuer_pubkey)` rather than being passed into
+`publish_nav`. This binds the signature to both the specific `asset_code` and the contract deployment
+address (`{contract}` formatted as a StrKey address string `C...`), preventing cross-asset and
+cross-deployment replay attacks (#90).
+
+Both `scripts/configure-nav-key.sh` and `scripts/e2e-smoke.sh` have been updated for this grammar:
+- `scripts/configure-nav-key.sh` passes `--asset_code` to `configure_issuer_key`.
+- `scripts/e2e-smoke.sh` signs `ballast-nav-v1:${PRICE_GUARD_CID}:RWA1:${NAV_TS}:${NAV_VALUE}` via `scripts/sign-nav.mjs`
+  and calls `publish_nav` without `asset_code`.
 
 `require_nav_signature` defaults to `true` on a fresh deploy (see the crate's module doc comment on
 why this flag exists — it's a local-testing/bring-up affordance, not a security control) — a real

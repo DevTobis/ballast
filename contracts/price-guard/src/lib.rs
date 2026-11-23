@@ -149,6 +149,8 @@ enum DataKey {
     /// `configure_issuer_key`. `publish_nav` verifies `sig` against this when
     /// `require_nav_signature` is `true`.
     IssuerPubKey(Address),
+    /// Ticker symbol / asset code (UTF-8 bytes) registered for `asset`, set via `configure_issuer_key`.
+    AssetCode(Address),
     /// Global (not per-asset) admin-settable flag, default `true` when unset — see the module doc
     /// comment on why this exists and why it isn't a security control.
     RequireNavSignature,
@@ -202,12 +204,21 @@ mod decimal_ascii {
     }
 }
 
-/// Builds the canonical NAV message `"{asset_code}:{ts}:{value}"` (UTF-8 bytes) that both this
-/// contract and the off-chain `price-guard` service (`services/price-guard/src/navSignature.ts`)
+/// Builds the canonical NAV message `"ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}"` (UTF-8 bytes)
+/// that both this contract and the off-chain `price-guard` service (`services/price-guard/src/navSignature.ts`)
 /// sign/verify against. Keep these two builders in lockstep — see the module doc comment.
-fn build_nav_message(env: &Env, asset_code: &Bytes, ts: u64, value: i128) -> Bytes {
+fn build_nav_message(
+    env: &Env,
+    contract: &Address,
+    asset_code: &Bytes,
+    ts: u64,
+    value: i128,
+) -> Bytes {
     let colon = Bytes::from_slice(env, b":");
-    let mut message = asset_code.clone();
+    let mut message = Bytes::from_slice(env, b"ballast-nav-v1:");
+    message.append(&contract.to_string().to_bytes());
+    message.append(&colon);
+    message.append(asset_code);
     message.append(&colon);
     message.append(&decimal_ascii::u64_to_bytes(env, ts));
     message.append(&colon);
@@ -778,6 +789,7 @@ impl PriceGuard {
         env: Env,
         admin: Address,
         asset: Address,
+        asset_code: Bytes,
         issuer_pubkey: BytesN<32>,
     ) {
         admin.require_auth();
@@ -796,10 +808,19 @@ impl PriceGuard {
         env.storage()
             .instance()
             .set(&DataKey::IssuerPubKey(asset.clone()), &issuer_pubkey);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCode(asset.clone()), &asset_code);
         env.events().publish(
             (Symbol::new(&env, "configure_issuer_key"), asset),
-            issuer_pubkey,
+            (asset_code, issuer_pubkey),
         );
+    }
+
+    /// Read-only inspection of an asset's registered code.
+    pub fn asset_code(env: Env, asset: Address) -> Option<Bytes> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::AssetCode(asset))
     }
 
     /// Admin-only. Global (not per-asset) toggle for whether `publish_nav` verifies `sig` at all.
@@ -1054,7 +1075,6 @@ impl PriceGuard {
         env: Env,
         publisher: Address,
         asset: Address,
-        asset_code: Bytes,
         value: i128,
         ts: u64,
         sig: BytesN<64>,
@@ -1071,7 +1091,18 @@ impl PriceGuard {
                 .instance()
                 .get(&DataKey::IssuerPubKey(asset.clone()))
                 .expect("price-guard: no issuer public key configured for asset (call configure_issuer_key)");
-            let message = build_nav_message(&env, &asset_code, ts, value);
+            let asset_code: Bytes = env
+                .storage()
+                .instance()
+                .get(&DataKey::AssetCode(asset.clone()))
+                .expect("price-guard: no asset code configured for asset (call configure_issuer_key)");
+            let message = build_nav_message(
+                &env,
+                &env.current_contract_address(),
+                &asset_code,
+                ts,
+                value,
+            );
             // Panics (traps the whole invocation) if `sig` doesn't verify — see
             // `soroban_sdk::crypto::Crypto::ed25519_verify`'s doc comment.
             env.crypto().ed25519_verify(&issuer_pubkey, &message, &sig);
@@ -1243,6 +1274,10 @@ mod test {
             &max_staleness_s,
         );
 
+        let code = asset_code(&env);
+        let (pubkey, _) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
+
         // These tests exercise the median/band/staleness/halt logic, not signature verification
         // (which has its own dedicated tests below) — turn the check off so a zero-filled `sig`
         // doesn't panic every call here.
@@ -1280,13 +1315,14 @@ mod test {
 
     fn sign_nav(
         env: &Env,
+        contract: &Address,
         signing_key: &ed25519_dalek::SigningKey,
         code: &Bytes,
         ts: u64,
         value: i128,
     ) -> BytesN<64> {
         use ed25519_dalek::Signer;
-        let message = build_nav_message(env, code, ts, value);
+        let message = build_nav_message(env, contract, code, ts, value);
         let mut message_bytes = [0u8; 256];
         let len = message.len() as usize;
         message.copy_into_slice(&mut message_bytes[..len]);
@@ -1302,7 +1338,6 @@ mod test {
         client.publish_nav(
             &publisher,
             &asset,
-            &code,
             &SCALE,
             &env.ledger().timestamp(),
             &sig,
@@ -1318,7 +1353,7 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         // 5% off from SCALE -> 500 bps, well beyond a 50 bps band.
         let redstone = Symbol::new(&env, "redston");
         client.publish_source(&publisher, &asset, &redstone, &(SCALE + SCALE / 20), &now);
@@ -1333,7 +1368,7 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let t0 = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &t0, &sig);
         let redstone = Symbol::new(&env, "redston");
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &t0);
 
@@ -1352,7 +1387,7 @@ mod test {
         let redstone = Symbol::new(&env, "redston");
 
         // First establish a good median at SCALE.
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &t0, &sig);
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &t0);
         let first = client.guarded_price(&asset);
         assert_eq!(first.status, PriceStatus::Ok);
@@ -1360,7 +1395,7 @@ mod test {
         // Now both sources agree on a value 2% higher -> within band (50bps band would actually
         // reject this pair too, so widen band check: use a large jump both sources agree on).
         let moved = SCALE + SCALE / 50; // +2%
-        client.publish_nav(&publisher, &asset, &code, &moved, &(t0 + 10), &sig);
+        client.publish_nav(&publisher, &asset, &moved, &(t0 + 10), &sig);
         client.publish_source(&publisher, &asset, &redstone, &moved, &(t0 + 10));
 
         let second = client.guarded_price(&asset);
@@ -1382,7 +1417,7 @@ mod test {
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
         let redstone = Symbol::new(&env, "redston");
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
 
         let price = client.guarded_price(&asset);
@@ -1398,12 +1433,12 @@ mod test {
                                              // passes require_auth() in this test env; what matters here is the pubkey/signature match.
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now, SCALE);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
 
         let redstone = Symbol::new(&env, "redston");
         client.publish_source(&publisher, &asset, &redstone, &SCALE, &now);
@@ -1420,13 +1455,13 @@ mod test {
         let admin = Address::generate(&env);
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
         // Signed over a DIFFERENT value than what's actually published -> verification must fail.
-        let sig = sign_nav(&env, &signing_key, &code, now, SCALE + 1);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now, SCALE + 1);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     }
 
     // --- publisher rotation ------------------------------------------------------------------
@@ -1442,12 +1477,11 @@ mod test {
         // A week of staleness so the 48h wait does not age the readings out: this test is about
         // the rotation preserving them, not about freshness.
         let (env, client, old_publisher, _risk, asset) = setup(50, 10_000, 7 * 24 * 3600);
-        let code = asset_code(&env);
         let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
         let source = feed(&env);
         let t0 = env.ledger().timestamp();
 
-        client.publish_nav(&old_publisher, &asset, &code, &SCALE, &t0, &zero_sig);
+        client.publish_nav(&old_publisher, &asset, &SCALE, &t0, &zero_sig);
         client.publish_source(&old_publisher, &asset, &source, &SCALE, &t0);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
@@ -1533,7 +1567,6 @@ mod test {
                 args: (
                     new_publisher.clone(),
                     asset.clone(),
-                    code.clone(),
                     SCALE,
                     now,
                     zero_sig.clone(),
@@ -1543,7 +1576,7 @@ mod test {
             },
         };
         env.mock_auths(&[nav_auth.clone(), nav_auth]);
-        client.publish_nav(&new_publisher, &asset, &code, &SCALE, &now, &zero_sig);
+        client.publish_nav(&new_publisher, &asset, &SCALE, &now, &zero_sig);
     }
 
     #[test]
@@ -1622,13 +1655,13 @@ mod test {
         let admin = Address::generate(&env);
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &signing_key, &code, now, SCALE);
         let other_code = Bytes::from_slice(&env, b"OTHERASSET");
-        client.publish_nav(&publisher, &asset, &other_code, &SCALE, &now, &sig);
+        let sig = sign_nav(&env, &client.address, &signing_key, &other_code, now, SCALE);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     }
 
     #[test]
@@ -1638,12 +1671,12 @@ mod test {
         let admin = Address::generate(&env);
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &signing_key, &code, now + 1, SCALE);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, now + 1, SCALE);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     }
 
     #[test]
@@ -1653,13 +1686,13 @@ mod test {
         let admin = Address::generate(&env);
         let code = asset_code(&env);
         let (pubkey, _signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         let other_signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
         let now = env.ledger().timestamp();
-        let sig = sign_nav(&env, &other_signing_key, &code, now, SCALE);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        let sig = sign_nav(&env, &client.address, &other_signing_key, &code, now, SCALE);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
     }
 
     #[test]
@@ -1669,12 +1702,12 @@ mod test {
         let admin = Address::generate(&env);
         let code = asset_code(&env);
         let (pubkey, _signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         let now = env.ledger().timestamp();
         let random_sig = BytesN::from_array(&env, &[0x5au8; 64]);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &random_sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &random_sig);
     }
 
     /// Records current behaviour (issue #16), not a guarantee: a signature over an older
@@ -1686,14 +1719,14 @@ mod test {
         let admin = Address::generate(&env);
         let code = asset_code(&env);
         let (pubkey, signing_key) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         client.configure_signature_requirement(&admin, &true);
 
         env.ledger().set_timestamp(1_000);
         let now = env.ledger().timestamp();
         let historical_ts = now - 1;
-        let sig = sign_nav(&env, &signing_key, &code, historical_ts, SCALE);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &historical_ts, &sig);
+        let sig = sign_nav(&env, &client.address, &signing_key, &code, historical_ts, SCALE);
+        client.publish_nav(&publisher, &asset, &SCALE, &historical_ts, &sig);
     }
 
     // --- adversarial cases -------------------------------------------------------------------
@@ -1710,7 +1743,7 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
@@ -1731,12 +1764,11 @@ mod test {
     #[test]
     fn scripted_replay_ustry_manipulation_2026_02_22() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let mut now = env.ledger().timestamp();
         let feed_name = feed(&env);
 
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
 
         struct Step {
             step: u32,
@@ -1808,7 +1840,7 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
@@ -1826,11 +1858,11 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
 
         let jumped = SCALE * 13 / 10; // +30%
-        client.publish_nav(&publisher, &asset, &code, &jumped, &now, &sig);
+        client.publish_nav(&publisher, &asset, &jumped, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &jumped, &now);
 
         // Nobody has asked for the price yet: the publish itself latched the halt, so a draw that
@@ -1854,14 +1886,14 @@ mod test {
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let mut now = env.ledger().timestamp();
         let mut value = SCALE;
-        client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+        client.publish_nav(&publisher, &asset, &value, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
 
         for _ in 0..24 {
             now += 3_600;
             env.ledger().set_timestamp(now);
             value = value * 10_001 / 10_000; // +1 bp per hour
-            client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+            client.publish_nav(&publisher, &asset, &value, &now, &sig);
             client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
         }
 
@@ -1880,14 +1912,14 @@ mod test {
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
         let mut value = SCALE;
-        client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+        client.publish_nav(&publisher, &asset, &value, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
         // +0.9% per publish: inside the 1% daily band on every step, +2.7% by the third publish.
         for _ in 0..3 {
             value = value * 1_009 / 1_000;
-            client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+            client.publish_nav(&publisher, &asset, &value, &now, &sig);
             client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
         }
 
@@ -1909,11 +1941,11 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
-        client.publish_nav(&publisher, &asset, &code, &moved, &now, &sig);
+        client.publish_nav(&publisher, &asset, &moved, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &moved, &now);
         client.guarded_price(&asset)
     }
@@ -1950,7 +1982,7 @@ mod test {
         let now = env.ledger().timestamp();
 
         // Within clock skew is fine.
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &(now + MAX_FUTURE_SKEW_S), &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &(now + MAX_FUTURE_SKEW_S), &sig);
 
         // Beyond it is refused outright (a ms-for-s mix-up lands here).
         let far = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1965,7 +1997,7 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
@@ -1981,7 +2013,7 @@ mod test {
         let now = env.ledger().timestamp();
         for bad in [0i128, -SCALE] {
             let nav = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                client.publish_nav(&publisher, &asset, &code, &bad, &now, &sig);
+                client.publish_nav(&publisher, &asset, &bad, &now, &sig);
             }));
             let src = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 client.publish_source(&publisher, &asset, &feed(&env), &bad, &now);
@@ -2024,10 +2056,10 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
         let jumped = SCALE * 2;
-        client.publish_nav(&publisher, &asset, &code, &jumped, &now, &sig);
+        client.publish_nav(&publisher, &asset, &jumped, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &jumped, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
 
@@ -2051,13 +2083,12 @@ mod test {
     #[test]
     fn halted_guard_stays_halted_across_further_publishes_and_keeps_last_good() {
         let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let t0 = env.ledger().timestamp();
         let feed = feed(&env);
 
         // Establish a good baseline at SCALE.
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &t0, &sig);
         client.publish_source(&publisher, &asset, &feed, &SCALE, &t0);
         let baseline = client.guarded_price(&asset);
         assert_eq!(baseline.status, PriceStatus::Ok);
@@ -2065,7 +2096,7 @@ mod test {
 
         // Both sources agree on a jump beyond the daily band -> halt latches at publish time.
         let jumped = SCALE * 13 / 10;
-        client.publish_nav(&publisher, &asset, &code, &jumped, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &jumped, &t0, &sig);
         client.publish_source(&publisher, &asset, &feed, &jumped, &t0);
         let halted = client.guarded_price(&asset);
         assert_eq!(halted.status, PriceStatus::Halted);
@@ -2074,7 +2105,7 @@ mod test {
         // Post-halt publishes: sources agree on calm values (including the old price). The guard
         // must not move LastGood and must stay Halted.
         for value in [SCALE, SCALE + SCALE / 100, SCALE] {
-            client.publish_nav(&publisher, &asset, &code, &value, &t0, &sig);
+            client.publish_nav(&publisher, &asset, &value, &t0, &sig);
             client.publish_source(&publisher, &asset, &feed, &value, &t0);
             let price = client.guarded_price(&asset);
             assert_eq!(price.status, PriceStatus::Halted);
@@ -2095,7 +2126,7 @@ mod test {
         // A fresh publish at the confirmed value then evaluates normally. (Publishing the old calm
         // price instead would move 30% against the new baseline and halt again.)
         let t1 = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &jumped, &t1, &sig);
+        client.publish_nav(&publisher, &asset, &jumped, &t1, &sig);
         client.publish_source(&publisher, &asset, &feed, &jumped, &t1);
         let after = client.guarded_price(&asset);
         assert_eq!(after.status, PriceStatus::Ok);
@@ -2139,8 +2170,9 @@ mod test {
         assert!(has_event(&events, "configure_asset"), "configure_asset event must be emitted");
 
         // 2. configure_issuer_key event
+        let code = asset_code(&env);
         let (pubkey, _) = test_issuer_keypair(&env);
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
         let events = env.events().all();
         assert!(has_event(&events, "configure_issuer_key"), "configure_issuer_key event must be emitted");
 
@@ -2150,10 +2182,9 @@ mod test {
         assert!(has_event(&events, "configure_signature_requirement"), "configure_signature_requirement event must be emitted");
 
         // 4. nav_published event
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&price_publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&price_publisher, &asset, &SCALE, &now, &sig);
         let events = env.events().all();
         assert!(has_event(&events, "nav_published"), "nav_published event must be emitted");
 
@@ -2165,7 +2196,7 @@ mod test {
 
         // 6. halt_latched event & status_changed event (from Ok -> Halted)
         let jumped = SCALE * 2;
-        client.publish_nav(&price_publisher, &asset, &code, &jumped, &now, &sig);
+        client.publish_nav(&price_publisher, &asset, &jumped, &now, &sig);
         client.publish_source(&price_publisher, &asset, &feed(&env), &jumped, &now);
         let events = env.events().all();
         assert!(has_event(&events, "halt_latched"), "halt_latched event must be emitted");
@@ -2210,6 +2241,7 @@ mod test {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         use soroban_sdk::IntoVal;
         let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let code = asset_code(&env);
         let stranger = Address::generate(&env);
         let (pubkey, _) = test_issuer_keypair(&env);
 
@@ -2218,19 +2250,19 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "configure_issuer_key",
-                args: (stranger.clone(), asset.clone(), pubkey.clone()).into_val(&env),
+                args: (stranger.clone(), asset.clone(), code.clone(), pubkey.clone()).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_issuer_key(&stranger, &asset, &pubkey);
+            client.configure_issuer_key(&stranger, &asset, &code, &pubkey);
         }));
         assert!(result.is_err(), "only the stored admin may configure issuer key");
 
         // Scoped auths cannot be built for generated contract addresses, so the real admin's
         // success path runs under mock_all_auths like the rest of this module.
         env.mock_all_auths();
-        client.configure_issuer_key(&admin, &asset, &pubkey);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey);
     }
 
     #[test]
@@ -2263,13 +2295,12 @@ mod test {
     #[test]
     fn publish_extends_ttl_and_survives_ledger_advancement() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
         let feed_name = feed(&env);
 
         // Initial publish establishes the persistent source entries and instance state.
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
 
         let initial_price = client.guarded_price(&asset);
@@ -2284,7 +2315,7 @@ mod test {
         // State remains accessible because publish extended instance and persistent TTL.
         // A subsequent publish and read both succeed.
         let next_now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &next_now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &next_now, &sig);
         client.publish_source(&publisher, &asset, &feed_name, &SCALE, &next_now);
 
         let next_price = client.guarded_price(&asset);
@@ -2302,16 +2333,32 @@ mod test {
     fn build_nav_message_matches_golden_vectors() {
         let env = Env::default();
 
+        let contract1 = Address::from_str(
+            &env,
+            "CA66MNFKUT2SJDXOCZFTUNW6OGE5T5IVGUNZL53QR5PSMFWB4VJIZ4CC",
+        );
         let message = build_nav_message(
             &env,
+            &contract1,
             &Bytes::from_slice(&env, b"SPIKO"),
             1_700_000_000,
             10_234_567,
         );
-        assert_eq!(message, Bytes::from_slice(&env, b"SPIKO:1700000000:10234567"));
+        assert_eq!(
+            message,
+            Bytes::from_slice(
+                &env,
+                b"ballast-nav-v1:CA66MNFKUT2SJDXOCZFTUNW6OGE5T5IVGUNZL53QR5PSMFWB4VJIZ4CC:SPIKO:1700000000:10234567"
+            )
+        );
 
+        let contract2 = Address::from_str(
+            &env,
+            "CD4TZ6XYKNTBLXJP23XSZFMDMDYEG6WNOCCFM3A757YM6IGLXEQBF2RY",
+        );
         let message = build_nav_message(
             &env,
+            &contract2,
             &Bytes::from_slice(&env, b"CETES28"),
             4_102_444_800,
             i128::MAX,
@@ -2320,9 +2367,37 @@ mod test {
             message,
             Bytes::from_slice(
                 &env,
-                b"CETES28:4102444800:170141183460469231731687303715884105727"
+                b"ballast-nav-v1:CD4TZ6XYKNTBLXJP23XSZFMDMDYEG6WNOCCFM3A757YM6IGLXEQBF2RY:CETES28:4102444800:170141183460469231731687303715884105727"
             )
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn signature_for_deployment_a_is_rejected_by_deployment_b() {
+        let (env, client_a, admin, publisher, risk, asset) =
+            setup_with_admin(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let (pubkey, signing_key) = test_issuer_keypair(&env);
+        client_a.configure_issuer_key(&admin, &asset, &code, &pubkey);
+        client_a.configure_signature_requirement(&admin, &true);
+
+        // Register a second deployment B with the same key and asset code
+        let id_b = env.register(PriceGuard, ());
+        let client_b = PriceGuardClient::new(&env, &id_b);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        client_b.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+        client_b.configure_asset(&admin, &asset, &50, &10_000, &86400, &50, &3600);
+        client_b.configure_issuer_key(&admin, &asset, &code, &pubkey);
+        client_b.configure_signature_requirement(&admin, &true);
+
+        let now = env.ledger().timestamp();
+        // Signature intended for deployment A
+        let sig_for_a = sign_nav(&env, &client_a.address, &signing_key, &code, now, SCALE);
+
+        // Attempting to publish that signature on deployment B must fail / panic
+        client_b.publish_nav(&publisher, &asset, &SCALE, &now, &sig_for_a);
     }
 
     #[test]
@@ -2467,14 +2542,15 @@ mod test {
     #[test]
     fn timelock_issuer_key_initial_and_rotation() {
         let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(100, 200, 3600);
+        let code = asset_code(&env);
         let (pubkey1, _) = test_issuer_keypair(&env);
         let pubkey2 = BytesN::from_array(&env, &[7u8; 32]);
 
-        client.configure_issuer_key(&admin, &asset, &pubkey1);
+        client.configure_issuer_key(&admin, &asset, &code, &pubkey1);
         assert_eq!(client.issuer_pubkey(&asset), Some(pubkey1.clone()));
 
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_issuer_key(&admin, &asset, &pubkey2);
+            client.configure_issuer_key(&admin, &asset, &code, &pubkey2);
         }));
         assert!(res.is_err(), "direct rotation of issuer key must fail");
 
@@ -2639,12 +2715,11 @@ mod test {
     #[test]
     fn test_price_guard_upgrade_and_state_persistence() {
         let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
         let feed_name = feed(&env);
 
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
@@ -2698,7 +2773,7 @@ mod test {
         let val2 = SCALE + 50_000; // 10_050_000 (1.005)
         let expected = (val1 + val2) / 2; // 10_025_000 (1.0025)
 
-        client.publish_nav(&publisher, &asset, &code, &val1, &now, &sig);
+        client.publish_nav(&publisher, &asset, &val1, &now, &sig);
         let feed_name = feed(&env);
         client.publish_source(&publisher, &asset, &feed_name, &val2, &now);
 
@@ -2724,7 +2799,7 @@ mod test {
         let v4 = SCALE + 50_000; // 10_050_000
         let expected = (v2 + v3) / 2;
 
-        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        client.publish_nav(&publisher, &asset, &v1, &now, &sig);
         let s2 = Symbol::new(&env, "feed_2");
         let s3 = Symbol::new(&env, "feed_3");
         let s4 = Symbol::new(&env, "feed_4");
@@ -2752,7 +2827,7 @@ mod test {
         let v2 = SCALE + 30_000;
         let v3 = SCALE + 60_000;
 
-        client.publish_nav(&publisher, &asset, &code, &v1, &now, &sig);
+        client.publish_nav(&publisher, &asset, &v1, &now, &sig);
         let s2 = Symbol::new(&env, "feed_2");
         let s3 = Symbol::new(&env, "feed_3");
         client.publish_source(&publisher, &asset, &s2, &v2, &now);
@@ -2771,7 +2846,7 @@ mod test {
         let now = env.ledger().timestamp();
         assert_eq!(client.last_good(&asset), None);
 
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         // One source is Degraded, which never records a last good value.
         assert_eq!(client.last_good(&asset), None);
 
@@ -2787,7 +2862,7 @@ mod test {
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
 
         // Drop every mocked authorisation: a getter that required auth would now panic.
@@ -2801,19 +2876,18 @@ mod test {
     #[test]
     fn halt_info_shows_baseline_and_tripping_value_then_clears_on_confirm() {
         let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let t0 = env.ledger().timestamp();
         let feed = feed(&env);
         assert_eq!(client.halt_info(&asset), None);
 
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &t0, &sig);
         client.publish_source(&publisher, &asset, &feed, &SCALE, &t0);
         assert_eq!(client.halt_info(&asset), None);
 
         // Both sources agree on a jump beyond the daily band, which latches the halt.
         let jumped = SCALE * 13 / 10;
-        client.publish_nav(&publisher, &asset, &code, &jumped, &t0, &sig);
+        client.publish_nav(&publisher, &asset, &jumped, &t0, &sig);
         client.publish_source(&publisher, &asset, &feed, &jumped, &t0);
         assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
         assert_eq!(
@@ -2871,12 +2945,11 @@ mod test {
     #[test]
     fn admin_can_remove_source_and_free_slot() {
         let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
 
         // Publish NAV (slot 1) + 7 feeds (slots 2..8) -> total 8 sources.
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &now, &sig);
         for i in 1..=7 {
             let name = Symbol::new(&env, &std::format!("feed_{}", i));
             client.publish_source(&publisher, &asset, &name, &SCALE, &now);
@@ -2946,7 +3019,6 @@ mod test {
     #[test]
     fn degraded_and_halted_return_last_good_timestamp_instead_of_now() {
         let (env, client, publisher, risk, asset) = setup(50, 100, 3_600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
 
         // No prior good price yet -> Degraded with ts == 0.
@@ -2958,7 +3030,7 @@ mod test {
 
         // Publish an Ok price at t = 1000.
         env.ledger().with_mut(|l| l.timestamp = 1_000);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &1_000, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &1_000, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &1_000);
         let ok_price = client.guarded_price(&asset);
         assert_eq!(ok_price.status, PriceStatus::Ok);
@@ -2976,7 +3048,7 @@ mod test {
         // still reports ts == 1000 (when the held last_good was recorded).
         env.ledger().with_mut(|l| l.timestamp = 5_500);
         let jumped = SCALE + 500_000; // +5%
-        client.publish_nav(&publisher, &asset, &code, &jumped, &5_500, &sig);
+        client.publish_nav(&publisher, &asset, &jumped, &5_500, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &jumped, &5_500);
         let halted = client.guarded_price(&asset);
         assert_eq!(halted.status, PriceStatus::Halted);
@@ -2997,7 +3069,6 @@ mod test {
     #[test]
     fn legacy_bare_i128_last_good_migrates_with_zero_timestamp() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
-        let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
 
         // Simulate a pre-migration contract instance that stored a bare i128 under DataKey::LastGood.
@@ -3015,7 +3086,7 @@ mod test {
 
         // Next Ok publish at t = 3000 upgrades storage to LastGood { value, ts: 3000 }.
         env.ledger().with_mut(|l| l.timestamp = 3_000);
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &3_000, &sig);
+        client.publish_nav(&publisher, &asset, &SCALE, &3_000, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &3_000);
         let ok_price = client.guarded_price(&asset);
         assert_eq!(ok_price.status, PriceStatus::Ok);

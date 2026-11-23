@@ -17,9 +17,15 @@ export function attestorPublicKeyBase64(signer: KmsSigner): string {
  * Signs the canonical NAV message and verifies the result against the signer's own public key
  * before returning, so a misconfigured Vault/KMS key fails here instead of as an on-chain revert.
  */
-export async function attestNav(signer: KmsSigner, assetCode: string, ts: number, value: bigint): Promise<Buffer> {
-  const sig = await signer.signMessage(canonicalNavMessage(assetCode, ts, value));
-  if (!verifyNavSignature(assetCode, ts, value, sig, attestorPublicKeyBase64(signer))) {
+export async function attestNav(
+  signer: KmsSigner,
+  contractAddress: string,
+  assetCode: string,
+  ts: number,
+  value: bigint,
+): Promise<Buffer> {
+  const sig = await signer.signMessage(canonicalNavMessage(contractAddress, assetCode, ts, value));
+  if (!verifyNavSignature(contractAddress, assetCode, ts, value, sig, attestorPublicKeyBase64(signer))) {
     throw new Error(`navAttestor: signature for ${assetCode} does not verify against the signer's public key`);
   }
   return sig;

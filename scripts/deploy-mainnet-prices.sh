@@ -388,7 +388,7 @@ for row in "${ROWS[@]}"; do
   # No issuer signs NAV; the publisher key signs what the service read from the issuer's API.
   if step_done "ISSUERKEY_$CODE"; then log "  $CODE issuer key already set, skipping"; else
     run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_issuer_key \
-      --admin "$ADMIN" --asset "$SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
+      --admin "$ADMIN" --asset "$SAC" --asset_code "$CODE" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
     mark_step "ISSUERKEY_$CODE"
   fi
 done
