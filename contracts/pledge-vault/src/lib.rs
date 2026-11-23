@@ -865,6 +865,57 @@ mod test {
         h.vault.release(&h.borrower, &1, &h.asset, &PRICE_SCALE);
     }
 
+    // ── #190: release at Warning and MarginCall boundaries ─────────────────
+
+    #[test]
+    fn release_passes_at_7990_bps_warning_allowed_boundary() {
+        // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
+        // Releasing 124 leaves 876 collateral units.
+        // Collateral value = 876 * 1.0 = 876 (haircut 0).
+        // LTV bps = 700 * 10_000 / 876 = 7,990 bps.
+        // With warning_bps configured at 8,000 (Warning boundary allowed), 7,990 bps is
+        // classified as Healthy (< 8,000 bps) and the release succeeds.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(124 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 876 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_panics_at_exactly_8000_bps_margin_call_boundary() {
+        // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
+        // Releasing 125 leaves 875 collateral units.
+        // Collateral value = 875 * 1.0 = 875 (haircut 0).
+        // LTV bps = 700 * 10_000 / 875 = exactly 8,000 bps.
+        // At 8,000 bps, the line reaches the threshold (classified as Warning/MarginCall)
+        // and panics.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(125 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_at_7990_bps_panics_under_default_warning_threshold_after_rule_update() {
+        // Under default thresholds (warning_bps: 7_000, margin_call_bps: 8_000, liquidation_bps: 9_000)
+        // and following the rule update in #181 (where release requires MarginState::Healthy),
+        // releasing 124 leaves 876 collateral -> 7,990 bps.
+        // Because 7,990 bps >= 7,000 bps (Warning band), release panics under the updated rule.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(124 * PRICE_SCALE));
+    }
+
     #[test]
     fn release_with_no_debt_works_on_a_degraded_price() {
         let h = setup(500, 0, PRICE_SCALE);
