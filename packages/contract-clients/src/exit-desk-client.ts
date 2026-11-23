@@ -1,5 +1,5 @@
 import { BaseContractClient } from "./base-client.js";
-import { scAddress, scI128 } from "./scval.js";
+import { scAddress, scI128, scU64 } from "./scval.js";
 
 /**
  * The on-chain shape of `ExitDesk::quote`'s return (contracts/exit-desk/src/lib.rs) — distinct
@@ -33,13 +33,35 @@ export class ExitDeskClient extends BaseContractClient {
     units: bigint,
     minUsdcOut: bigint,
     to: string,
+    deadline?: bigint,
   ): Promise<string> {
+    if (deadline !== undefined) {
+      return this.exitBefore(source, assetAddress, units, minUsdcOut, to, deadline);
+    }
     return this.invoke(source, "exit", [
       scAddress(source),
       scAddress(assetAddress),
       scI128(units),
       scI128(minUsdcOut),
       scAddress(to),
+    ]);
+  }
+
+  exitBefore(
+    source: string,
+    assetAddress: string,
+    units: bigint,
+    minUsdcOut: bigint,
+    to: string,
+    deadline: bigint,
+  ): Promise<string> {
+    return this.invoke(source, "exit_before", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scI128(units),
+      scI128(minUsdcOut),
+      scAddress(to),
+      scU64(deadline),
     ]);
   }
 

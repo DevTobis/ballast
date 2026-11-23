@@ -215,6 +215,77 @@ fn exit_happy_path_settles_both_legs() {
 }
 
 #[test]
+fn exit_before_at_or_before_deadline_succeeds() {
+    let h = setup();
+    h.env.ledger().set_timestamp(1_000);
+    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let holder = Address::generate(&h.env);
+    let payout_to = Address::generate(&h.env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);
+
+    let now = h.env.ledger().timestamp();
+    // Exactly at the deadline
+    let usdc_out = ExitDeskClient::new(&h.env, &h.desk).exit_before(
+        &holder,
+        &h.rwa,
+        &units,
+        &0,
+        &payout_to,
+        &now,
+    );
+
+    assert!(usdc_out > 0);
+    assert_eq!(MockTokenClient::new(&h.env, &h.rwa).balance(&holder), 0);
+    assert_eq!(MockTokenClient::new(&h.env, &h.rwa).balance(&h.desk), units);
+    assert_eq!(
+        MockTokenClient::new(&h.env, &h.usdc).balance(&payout_to),
+        usdc_out
+    );
+
+    // Well before the deadline
+    let holder2 = Address::generate(&h.env);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder2, &units);
+    let usdc_out2 = ExitDeskClient::new(&h.env, &h.desk).exit_before(
+        &holder2,
+        &h.rwa,
+        &units,
+        &0,
+        &holder2,
+        &(now + 3_600),
+    );
+    assert!(usdc_out2 > 0);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: deadline has passed")]
+fn exit_before_after_deadline_panics() {
+    let h = setup();
+    h.env.ledger().set_timestamp(1_000);
+    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let holder = Address::generate(&h.env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);
+
+    let now = h.env.ledger().timestamp();
+    // 1 second past deadline
+    ExitDeskClient::new(&h.env, &h.desk).exit_before(
+        &holder,
+        &h.rwa,
+        &units,
+        &0,
+        &holder,
+        &(now - 1),
+    );
+}
+
+#[test]
 #[should_panic(expected = "exit-desk: price is not Ok")]
 fn exit_panics_on_degraded_price() {
     let h = setup();

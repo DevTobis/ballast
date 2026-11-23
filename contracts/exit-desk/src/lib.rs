@@ -349,11 +349,43 @@ impl ExitDesk {
     /// "Settlement", "Anchor payout hop"). Always re-quotes fresh; never trusts a stale
     /// client-supplied price.
     ///
+    /// Instant exit with an execution deadline: holder deposits `units` of `asset` and receives USDC at the
+    /// guarded price less the spread, provided the current ledger timestamp has not passed `deadline`.
+    pub fn exit_before(
+        env: Env,
+        holder: Address,
+        asset: Address,
+        units: i128,
+        min_usdc_out: i128,
+        to: Address,
+        deadline: u64,
+    ) -> i128 {
+        assert!(
+            env.ledger().timestamp() <= deadline,
+            "exit-desk: deadline has passed"
+        );
+        Self::exit_internal(env, holder, asset, units, min_usdc_out, to)
+    }
+
+    /// Instant exit: holder deposits `units` of `asset` and receives USDC at the guarded price less
+    /// the spread, in one atomic transaction.
+    ///
     /// PRD §5 Phase 2 "Eligibility": the holder must already be authorised for `asset`. This is
     /// enforced entirely by the asset's own SAC/SEP-57 authorization checks inside
     /// `token::Client::transfer` below — an unauthorized holder's transfer simply reverts there,
     /// so no extra eligibility check is needed in this contract.
     pub fn exit(
+        env: Env,
+        holder: Address,
+        asset: Address,
+        units: i128,
+        min_usdc_out: i128,
+        to: Address,
+    ) -> i128 {
+        Self::exit_before(env, holder, asset, units, min_usdc_out, to, u64::MAX)
+    }
+
+    fn exit_internal(
         env: Env,
         holder: Address,
         asset: Address,

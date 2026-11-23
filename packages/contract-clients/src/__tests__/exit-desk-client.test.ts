@@ -35,4 +35,16 @@ describe("ExitDeskClient", () => {
     expect(typeof xdr).toBe("string");
     expect(xdr.length).toBeGreaterThan(0);
   });
+
+  it("exit() with deadline calls exit_before and returns non-empty unsigned XDR", async () => {
+    const xdr = await client.exit(source, asset, 1_000n, 950_000n, source, 1_800_000_000n);
+    expect(typeof xdr).toBe("string");
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("exitBefore() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.exitBefore(source, asset, 1_000n, 950_000n, source, 1_800_000_000n);
+    expect(typeof xdr).toBe("string");
+    expect(xdr.length).toBeGreaterThan(0);
+  });
 });
