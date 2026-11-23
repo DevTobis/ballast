@@ -1300,6 +1300,7 @@ fn configure_asset_rejects_liquidation_exceeding_10000() {
     assert!(res.is_err(), "liquidation > 10000 must be rejected");
     }
 
+#[test]
 fn disabled_asset_blocks_propose_and_accept_and_settle() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
@@ -2289,5 +2290,104 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.call_margin(&h.keeper, &id));
         let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
         assert!(!trade.pending_margin_call);
+    }
+
+    #[test]
+    fn admin_entry_points_emit_events() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+        // 1. set_usdc emits (usdc,) event
+        let alt_usdc = Address::generate(&h.env);
+        repo.set_usdc(&h.admin, &alt_usdc);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("usdc"));
+            let data: (Option<Address>, Address) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, Some(h.usdc.clone()));
+            assert_eq!(data.1, alt_usdc);
+        }
+
+        // 2. set_cure_grace emits (curegrace,) event
+        let new_grace = 3_600u64;
+        repo.set_cure_grace(&h.admin, &new_grace);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("curegrace"));
+            let data: (u64, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, MARGIN_CURE_GRACE_SECONDS);
+            assert_eq!(data.1, new_grace);
+        }
+
+        // 3. configure_asset emits (cfgasset, asset) event
+        let new_asset = Address::generate(&h.env);
+        let new_guard = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 6_000,
+            margin_call_bps: 7_500,
+            liquidation_bps: 9_000,
+        };
+        repo.configure_asset(&h.admin, &new_asset, &new_guard, &400, &thresholds);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            let topic1 = Address::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("cfgasset"));
+            assert_eq!(topic1, new_asset);
+            let data: (Address, u32, MarginThresholds) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, new_guard);
+            assert_eq!(data.1, 400);
+            assert_eq!(data.2.warning_bps, thresholds.warning_bps);
+            assert_eq!(data.2.margin_call_bps, thresholds.margin_call_bps);
+            assert_eq!(data.2.liquidation_bps, thresholds.liquidation_bps);
+        }
     }
 }
