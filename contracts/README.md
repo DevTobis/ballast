@@ -48,6 +48,13 @@ invariant 5 ("pausing cannot move funds") requires it.
 
 Read-only entry points (`quote`, `ltv`, `margin_view` and the other getters) are ungated as well.
 
+### Known gaps
+
+- `repo-dvp::propose` is not gated, although `require_not_paused`'s doc comment treats a new repo as
+  new risk. Tracked in #846.
+- The gating contracts read pause flags from their own storage and only `Registry::pause` writes a
+  flag, so a flag cannot currently be set on the contract that checks it. Tracked in #30 and #32.
+
 ## Credit-line lifecycle
 
 The credit line has two independent dimensions:
@@ -120,22 +127,20 @@ This is why `Warning` can remain `Open`: status is the lifecycle state, while ma
 |---|---|---|---|---|
 | `open` | Lender authorization required. `limit > 0`: `credit-line: limit must be positive` | `Open` | `Healthy` | `None` |
 | `draw` | Draws scope not paused: `ballast-common: paused`; borrower authorization; borrower matches line: `credit-line: not this line's borrower`; `amount > 0`: `credit-line: amount must be positive`; status is `Open`: `credit-line: line is not open`; funded-undrawn balance: `credit-line: draw exceeds funded-but-undrawn balance`; line limit: `credit-line: draw exceeds the line's limit`; guarded price status: `credit-line: price status is not Ok`; post-draw margin: `credit-line: draw would push the line past a healthy LTV` | `Open` unchanged | Refreshed to `Healthy` on success (post-draw LTV is guarded to remain healthy) | Unchanged |
-| `poke` — arm | No explicit guard; permissionless. Applies only when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is `None` | `Open` unchanged | Refreshed to `Liquidation` | Set to the current ledger sequence |
-| `poke` — preserve arm | No explicit guard; permissionless. Applies when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is already `Some(...)` | `Open` unchanged | Refreshed to `Liquidation` | Preserved unchanged |
-| `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | `Open` unchanged | Refreshed to the fresh state: `Healthy`, `Warning`, or `MarginCall` | Cleared to `None` |
+| `poke` — arm | No explicit guard; permissionless. Applies only when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is `None` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to `Liquidation` | Set to the current ledger sequence |
+| `poke` — preserve arm | No explicit guard; permissionless. Applies when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is already `Some(...)` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to `Liquidation` | Preserved unchanged |
+| `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to the fresh state: `Healthy`, `Warning`, `MarginCall`, or `Liquidation` (including `Liquidation` with a non-`Ok` price) | Cleared to `None` |
 | `liquidate` | Keeper authorization; breach exists: `credit-line: no confirmed breach flagged; call poke(line) first`; current ledger sequence is greater than `breach_ledger`: `credit-line: liquidation needs a later ledger than the flagged breach`; status is `Open`: `credit-line: line is not open`; fresh guarded price status: `credit-line: price status is not Ok`; fresh state: `credit-line: breach is no longer confirmed` | `Liquidating` | `Liquidation` | Preserved unchanged |
 | `close_liquidated` | Lender authorization; lender matches line: `credit-line: not this line's lender`; status is `Liquidating`: `credit-line: line is not being liquidated` | `Closed` | `Healthy` | Cleared to `None` |
 | `sync_from_vault` | Configured vault authorization; configured vault check: `credit-line: caller is not the configured vault`; vault not configured: `credit-line: vault not configured`; `units >= 0`: `credit-line: units cannot be negative`; matching line asset: `credit-line: not this line's collateral asset` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 | `sync_collateral` | Caller authorization and caller is stored admin or keeper: `ballast-common: caller is neither admin nor keeper`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 
+`poke` also maintains `unhealthy_since`: it sets the timestamp on the first `MarginCall` or
+`Liquidation` observation, preserves it while the line remains in either state, and clears it in
+`Healthy` or `Warning`. It performs this update without checking `status`, so `poke` may rewrite
+`margin_state` and `unhealthy_since` on `Liquidating` and `Closed` lines as well.
+
 For details about the surrounding contract and service layout, see [ARCHITECTURE.md](../ARCHITECTURE.md).
-
-### Known gaps
-
-- `repo-dvp::propose` is not gated, although `require_not_paused`'s doc comment treats a new repo as
-  new risk. Tracked in #846.
-- The gating contracts read pause flags from their own storage and only `Registry::pause` writes a
-  flag, so a flag cannot currently be set on the contract that checks it. Tracked in #30 and #32.
 
 ## Building
 
