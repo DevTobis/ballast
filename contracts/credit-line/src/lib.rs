@@ -2824,4 +2824,70 @@ mod test {
             assert_eq!(data, vault);
         }
     }
+
+    #[test]
+    fn sync_collateral_accepts_admin_and_keeper() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+
+        // Admin can call sync_collateral
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(100 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 100 * PRICE_SCALE);
+
+        // Keeper can call sync_collateral
+        h.credit_line
+            .sync_collateral(&h.keeper, &id, &(200 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 200 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "neither admin nor keeper")]
+    fn sync_collateral_rejects_stranger() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        let stranger = Address::generate(&h.env);
+        h.credit_line
+            .sync_collateral(&stranger, &id, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "units cannot be negative")]
+    fn sync_collateral_rejects_negative_units() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &-1);
+    }
+
+    #[test]
+    #[should_panic(expected = "units cannot be negative")]
+    fn sync_from_vault_rejects_negative_units() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        let vault = Address::generate(&h.env);
+        h.credit_line.set_vault(&h.admin, &vault);
+        h.credit_line
+            .sync_from_vault(&vault, &id, &h.asset, &-1);
+    }
+
+    #[test]
+    fn sync_from_vault_allows_and_records_zero_units() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        let vault = Address::generate(&h.env);
+        h.credit_line.set_vault(&h.admin, &vault);
+
+        // Set non-zero units first
+        h.credit_line
+            .sync_from_vault(&vault, &id, &h.asset, &(500 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 500 * PRICE_SCALE);
+
+        // Setting zero is allowed and recorded
+        h.credit_line.sync_from_vault(&vault, &id, &h.asset, &0);
+        assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+
+        // Also verify sync_collateral accepts zero
+        h.credit_line.sync_collateral(&h.keeper, &id, &0);
+        assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+    }
 }
