@@ -9,9 +9,13 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
-| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
+| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close`/`default_at_maturity` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
+
+### Permissionless entry points
+
+`CreditLine::poke` and `ltv` (as well as `extend_ttl` and read-only views across contracts) are completely permissionless: anyone may call them without requiring keeper authorization. This is safe because `poke` and `ltv` only ever make stored margin state match a fresh, guarded price from `PriceGuard`, never move user funds, and cannot fabricate a breach.
 
 The keeper is trusted for **timing and completeness**, and for three **values** it supplies (see
 "Keeper-supplied values" below). Every other amount a settlement uses comes from the contract's
