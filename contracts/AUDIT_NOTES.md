@@ -166,7 +166,8 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not
-  pause-gated. `margin_view` is a free read.
+  pause-gated. `margin_view` is a free read. Accrued interest in `evaluate_margin` is capped at
+  `maturity_at`, ensuring post-maturity exposure matches what `unwind` collects and what `default_close` covers (#218).
 - **Default.** `default_close` is keeper-only, needs the cure window to have passed, re-evaluates
   the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
   guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the

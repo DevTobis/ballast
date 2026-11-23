@@ -866,6 +866,41 @@ fn margin_view_reports_the_position_without_changing_it() {
 }
 
 #[test]
+fn margin_exposure_stops_accruing_after_maturity_matching_unwind_total_due() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let trade = repo.trade(&id);
+    let settled_at = trade.settled_at.unwrap();
+    let maturity_at = trade.maturity_at;
+
+    // Advance to maturity: exposure must equal total_due at maturity
+    h.env.ledger().set_timestamp(maturity_at);
+    let view_at_maturity = repo.margin_view(&id);
+    let expected_due = total_due(&trade, settled_at);
+    assert_eq!(view_at_maturity.exposure, expected_due);
+
+    // Advance 7 days past maturity: exposure must not grow further and still match expected_due
+    h.env.ledger().set_timestamp(maturity_at + 7 * 86_400);
+    let view_post_maturity = repo.margin_view(&id);
+    assert_eq!(view_post_maturity.exposure, expected_due);
+
+    // Call margin past maturity: verify margin_call_amount is sized from expected_due
+    repo.call_margin(&h.keeper, &id);
+    let trade_called = repo.trade(&id);
+    assert!(trade_called.pending_margin_call);
+
+    // Advance past cure deadline and default_close: lender units are sized using exposure which equals expected_due
+    let deadline = trade_called.cure_deadline.unwrap();
+    h.env.ledger().set_timestamp(deadline + 10);
+    repo.default_close(&h.keeper, &id);
+
+    // At $1.00 price, lender_units = ceil(exposure / price) = expected_due
+    let lender_units = rwa_balance(&h, &h.cash_lender);
+    assert_eq!(lender_units, expected_due);
+}
+
+#[test]
 fn the_admin_can_shorten_the_cure_window_for_new_calls() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);

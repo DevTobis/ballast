@@ -503,7 +503,7 @@ fn clear_margin_call(trade: &mut RepoTrade) {
 
 /// Reads the guarded price and returns `(exposure, collateral_value, margin_state, price)` for a
 /// settled trade, or `None` when the price is not one the guard stands behind (`Degraded` or
-/// `Halted`). `exposure` is principal plus interest accrued so far; `collateral_value` has the
+/// `Halted`). `exposure` is principal plus interest accrued up to `maturity_at`; `collateral_value` has the
 /// asset's haircut applied.
 fn evaluate_margin(
     env: &Env,
@@ -518,7 +518,12 @@ fn evaluate_margin(
     let collateral_value = risk::collateral_value(trade.units, guarded.value, config.haircut_bps);
     let now = env.ledger().timestamp();
     let settled_at = trade.settled_at.unwrap_or(now);
-    let accrued = accrue_interest(trade.cash_amount, trade.rate_bps, now.saturating_sub(settled_at));
+    let accrual_end = now.min(trade.maturity_at);
+    let accrued = accrue_interest(
+        trade.cash_amount,
+        trade.rate_bps,
+        accrual_end.saturating_sub(settled_at),
+    );
     let exposure = trade
         .cash_amount
         .checked_add(accrued)
