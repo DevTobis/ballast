@@ -1748,4 +1748,114 @@ mod test {
         assert_eq!(confirmed.mode, CustodyMode::IssuerLien);
         assert_eq!(confirmed.lien_ref, Some(lien_ref));
     }
+
+    // TODO: set these flags through a real on-chain pause entry point once pause wiring lands.
+    // `pledge-vault` has no pause writer today, so the tests set the flag directly via
+    // `as_contract`; see the dead-pause-flag entry-point bugs #30/#32 and the open pause-reach
+    // tracking issue #210.
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pledge_panics_while_pledges_scope_paused() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, true);
+        });
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pledge_panics_while_all_scope_paused() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::All, true);
+        });
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn release_and_liquidate_keep_working_while_pledges_paused() {
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, true);
+        });
+
+        // Release is risk-reducing (invariant 4): it must not be pause-gated.
+        h.vault
+            .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 950 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 50 * PRICE_SCALE);
+
+        // Liquidation is enforcement (invariant 5): it must not be pause-gated either.
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+        assert_eq!(h.token.balance(&lender), 400 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 550 * PRICE_SCALE);
+
+        // New pledges stay blocked while the flag is set.
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        }));
+        assert!(blocked.is_err(), "pledge must stay paused");
+    }
+
+    #[test]
+    fn release_and_liquidate_keep_working_while_all_paused() {
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::All, true);
+        });
+
+        h.vault
+            .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 950 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 50 * PRICE_SCALE);
+
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+        assert_eq!(h.token.balance(&lender), 400 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 550 * PRICE_SCALE);
+
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        }));
+        assert!(blocked.is_err(), "pledge must stay paused under All");
+    }
+
+    #[test]
+    fn pledge_resumes_after_the_pause_flag_is_cleared() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, true);
+        });
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        }));
+        assert!(blocked.is_err(), "pledge must be refused while paused");
+
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, false);
+        });
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 100 * PRICE_SCALE);
+    }
 }
