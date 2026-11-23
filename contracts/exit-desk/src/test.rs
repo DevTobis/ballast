@@ -785,3 +785,46 @@ fn cancel_unpause_cancels_pending_unpause() {
     assert!(exec_res.is_err(), "executing cancelled unpause must fail");
 }
 
+#[test]
+fn read_only_getters_and_capacity_track_state() {
+    let h = setup();
+    let per_holder_cap = 150 * PRICE_SCALE;
+    let inventory_cap = 500 * PRICE_SCALE;
+    configure(&h, 100, per_holder_cap, inventory_cap);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let holder = Address::generate(&h.env);
+
+    // Initial state
+    assert_eq!(desk.usdc(), h.usdc);
+    let cfg = desk.asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 100);
+    assert_eq!(cfg.per_holder_daily_cap, per_holder_cap);
+    assert_eq!(cfg.desk_inventory_cap, inventory_cap);
+    assert_eq!(desk.inventory(&h.rwa), 0);
+    assert_eq!(desk.daily_used(&holder, &h.rwa), 0);
+    assert_eq!(desk.capacity(&holder, &h.rwa), (per_holder_cap, inventory_cap));
+
+    // After exit of 100 units
+    let exit_units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &(200 * PRICE_SCALE));
+    desk.exit(&holder, &h.rwa, &exit_units, &0, &holder);
+
+    assert_eq!(desk.inventory(&h.rwa), exit_units);
+    assert_eq!(desk.daily_used(&holder, &h.rwa), exit_units);
+    assert_eq!(
+        desk.capacity(&holder, &h.rwa),
+        (per_holder_cap - exit_units, inventory_cap - exit_units)
+    );
+
+    // After another exit using the rest of holder cap (50 units)
+    desk.exit(&holder, &h.rwa, &(50 * PRICE_SCALE), &0, &holder);
+    assert_eq!(desk.daily_used(&holder, &h.rwa), per_holder_cap);
+    assert_eq!(
+        desk.capacity(&holder, &h.rwa),
+        (0, inventory_cap - 150 * PRICE_SCALE)
+    );
+}
+

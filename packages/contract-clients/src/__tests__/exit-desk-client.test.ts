@@ -24,6 +24,31 @@ describe("ExitDeskClient", () => {
     expect(result).toBeDefined();
   });
 
+  it("usdc() simulates a read and does not throw", async () => {
+    const result = await client.usdc();
+    expect(result).toBeDefined();
+  });
+
+  it("assetConfig() simulates a read and does not throw", async () => {
+    const result = await client.assetConfig(asset);
+    expect(result).toBeDefined();
+  });
+
+  it("inventory() simulates a read and does not throw", async () => {
+    const result = await client.inventory(asset);
+    expect(result).toBeDefined();
+  });
+
+  it("dailyUsed() simulates a read and does not throw", async () => {
+    const result = await client.dailyUsed(source, asset);
+    expect(result).toBeDefined();
+  });
+
+  it("capacity() simulates a read and does not throw", async () => {
+    const result = await client.capacity(source, asset);
+    expect(result).toBeDefined();
+  });
+
   it("setUsdc() returns non-empty unsigned XDR", async () => {
     const xdr = await client.setUsdc(source, asset);
     expect(typeof xdr).toBe("string");

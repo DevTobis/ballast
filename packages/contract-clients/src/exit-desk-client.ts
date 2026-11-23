@@ -17,10 +17,37 @@ export interface OnChainExitQuote {
   expiresAt: bigint | number;
 }
 
+export interface OnChainExitDeskAssetConfig {
+  priceGuard: string;
+  spreadBps: number;
+  perHolderDailyCap: bigint;
+  deskInventoryCap: bigint;
+}
+
 export class ExitDeskClient extends BaseContractClient {
   /** Read-only; simulated rather than returned as unsigned XDR since it changes no state. */
   quote(assetAddress: string, units: bigint): Promise<OnChainExitQuote> {
     return this.read<OnChainExitQuote>("quote", [scAddress(assetAddress), scI128(units)]);
+  }
+
+  usdc(): Promise<string> {
+    return this.read<string>("usdc", []);
+  }
+
+  assetConfig(assetAddress: string): Promise<OnChainExitDeskAssetConfig> {
+    return this.read<OnChainExitDeskAssetConfig>("asset_config", [scAddress(assetAddress)]);
+  }
+
+  inventory(assetAddress: string): Promise<bigint> {
+    return this.read<bigint>("inventory", [scAddress(assetAddress)]);
+  }
+
+  dailyUsed(holder: string, assetAddress: string): Promise<bigint> {
+    return this.read<bigint>("daily_used", [scAddress(holder), scAddress(assetAddress)]);
+  }
+
+  capacity(holder: string, assetAddress: string): Promise<[bigint, bigint]> {
+    return this.read<[bigint, bigint]>("capacity", [scAddress(holder), scAddress(assetAddress)]);
   }
 
   setUsdc(admin: string, usdc: string): Promise<string> {
