@@ -192,6 +192,8 @@ fn setup() -> Harness {
             margin_call_bps: 8_000,
             liquidation_bps: 9_500,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
     MockPriceGuardClient::new(&env, &price_guard).set_price(
         &rwa,
@@ -1146,6 +1148,8 @@ fn configure_asset_accepts_valid_thresholds() {
             margin_call_bps: 8_000,
             liquidation_bps: 9_000,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
 
     // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
@@ -1159,6 +1163,8 @@ fn configure_asset_accepts_valid_thresholds() {
             margin_call_bps: 9_999,
             liquidation_bps: 10_000,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
 }
 
@@ -1180,6 +1186,8 @@ fn configure_asset_rejects_equal_thresholds() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res1.is_err(), "warning == margin_call must be rejected");
@@ -1196,6 +1204,8 @@ fn configure_asset_rejects_equal_thresholds() {
                 margin_call_bps: 9_000,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "margin_call == liquidation must be rejected");
@@ -1218,6 +1228,8 @@ fn configure_asset_rejects_zero_thresholds() {
                 margin_call_bps: 0,
                 liquidation_bps: 0,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res.is_err(), "zero thresholds must be rejected");
@@ -1234,6 +1246,8 @@ fn configure_asset_rejects_zero_thresholds() {
                 margin_call_bps: 0,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "zero margin_call_bps must be rejected");
@@ -1257,6 +1271,8 @@ fn configure_asset_rejects_out_of_order_thresholds() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_500,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res1.is_err(), "warning > margin_call must be rejected");
@@ -1273,6 +1289,8 @@ fn configure_asset_rejects_out_of_order_thresholds() {
                 margin_call_bps: 9_500,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "margin_call > liquidation must be rejected");
@@ -1295,11 +1313,165 @@ fn configure_asset_rejects_liquidation_exceeding_10000() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 10_001,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res.is_err(), "liquidation > 10000 must be rejected");
-    }
+}
 
+#[test]
+fn configure_asset_validates_positive_limits() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+    let thresholds = MarginThresholds {
+        warning_bps: 7_000,
+        margin_call_bps: 8_000,
+        liquidation_bps: 9_000,
+    };
+
+    // max_cash_per_trade == 0
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &thresholds,
+            &0i128,
+            &(30 * 24 * 3_600u64),
+        );
+    }));
+    assert!(res1.is_err(), "zero max_cash_per_trade must be rejected");
+
+    // max_cash_per_trade < 0
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &thresholds,
+            &-100i128,
+            &(30 * 24 * 3_600u64),
+        );
+    }));
+    assert!(res2.is_err(), "negative max_cash_per_trade must be rejected");
+
+    // max_term_seconds == 0
+    let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &thresholds,
+            &1_000_000_000_000i128,
+            &0u64,
+        );
+    }));
+    assert!(res3.is_err(), "zero max_term_seconds must be rejected");
+}
+
+#[test]
+fn propose_and_settle_enforces_per_asset_risk_limits() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let capped_asset = h.rwa.clone();
+
+    // Max cash 50 USDC, max term 2 hours (7200 seconds)
+    let max_cash = 50 * PRICE_SCALE;
+    let max_term = 7_200u64;
+
+    repo.configure_asset(
+        &h.admin,
+        &capped_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+        &max_cash,
+        &max_term,
+    );
+
+    let units = 100 * PRICE_SCALE;
+    let valid_maturity = h.env.ledger().timestamp() + 3_600; // 1h (within 2h)
+
+    // 1. Propose exceeds max_cash_per_trade (51 cash > 50 max_cash) -> rejected
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &capped_asset,
+            &units,
+            &(max_cash + 1),
+            &500u32,
+            &RepoKind::Intraday,
+            &valid_maturity,
+            &hash(&h, 7),
+        );
+    }));
+    assert!(res1.is_err(), "propose exceeding max_cash must be rejected");
+
+    // 2. Propose exceeds max_term_seconds (7201 seconds > 7200 max_term) -> rejected
+    let over_term_maturity = h.env.ledger().timestamp() + max_term + 1;
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &capped_asset,
+            &units,
+            &max_cash,
+            &500u32,
+            &RepoKind::Intraday,
+            &over_term_maturity,
+            &hash(&h, 7),
+        );
+    }));
+    assert!(res2.is_err(), "propose exceeding max_term must be rejected");
+
+    // 3. Propose within limits -> succeeds
+    let id = repo.propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &capped_asset,
+        &units,
+        &max_cash,
+        &500u32,
+        &RepoKind::Intraday,
+        &valid_maturity,
+        &hash(&h, 7),
+    );
+    assert_eq!(repo.trade(&id).status, RepoStatus::Proposed);
+
+    // 4. If limits are lowered after proposal, accept_and_settle rejects oversized trade
+    repo.configure_asset(
+        &h.admin,
+        &capped_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+        &(max_cash - 10 * PRICE_SCALE), // limit lowered to 40
+        &max_term,
+    );
+    MockTokenClient::new(&h.env, &capped_asset).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &max_cash);
+
+    let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(res3.is_err(), "settle exceeding lowered max_cash must be rejected");
+}
+
+#[test]
 fn disabled_asset_blocks_propose_and_accept_and_settle() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
@@ -1438,6 +1610,8 @@ mod sac {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_500,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
         MockPriceGuardClient::new(&env, &price_guard).set_price(
             &rwa,
@@ -2208,7 +2382,15 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.set_cure_grace(&h.admin, &3_600));
         extends_the_instance(&h, |repo| repo.set_maturity_grace(&h.admin, &3_600));
         extends_the_instance(&h, |repo| {
-            repo.configure_asset(&h.admin, &h.rwa, &h.price_guard, &500, &thresholds)
+            repo.configure_asset(
+                &h.admin,
+                &h.rwa,
+                &h.price_guard,
+                &500,
+                &thresholds,
+                &1_000_000_000_000i128,
+                &(30 * 24 * 3_600u64),
+            )
         });
         extends_the_instance(&h, |repo| repo.disable_asset(&h.admin, &h.rwa));
         extends_the_instance(&h, |repo| repo.enable_asset(&h.admin, &h.rwa));

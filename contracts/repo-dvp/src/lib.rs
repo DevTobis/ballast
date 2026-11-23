@@ -211,6 +211,8 @@ pub struct RepoAssetConfig {
     pub price_guard: Address,
     pub haircut_bps: u32,
     pub thresholds: MarginThresholds,
+    pub max_cash_per_trade: i128,
+    pub max_term_seconds: u64,
 }
 
 #[contracttype]
@@ -680,6 +682,8 @@ impl RepoDvp {
         price_guard: Address,
         haircut_bps: u32,
         thresholds: MarginThresholds,
+        max_cash_per_trade: i128,
+        max_term_seconds: u64,
     ) {
         require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
@@ -688,14 +692,30 @@ impl RepoDvp {
             "repo-dvp: haircut exceeds 100%"
         );
         thresholds.validate();
+        assert!(
+            max_cash_per_trade > 0,
+            "repo-dvp: max_cash_per_trade must be positive"
+        );
+        assert!(
+            max_term_seconds > 0,
+            "repo-dvp: max_term_seconds must be positive"
+        );
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
             &RepoAssetConfig {
                 price_guard,
                 haircut_bps,
                 thresholds,
+                max_cash_per_trade,
+                max_term_seconds,
             },
         );
+    }
+
+    /// Reads the active configuration for an asset.
+    pub fn asset_config(env: Env, asset: Address) -> RepoAssetConfig {
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset)
     }
 
     /// Disables an asset so that new proposals and settlements are refused. Admin only.
@@ -761,12 +781,22 @@ impl RepoDvp {
             rate_bps <= MAX_RATE_BPS,
             "repo-dvp: rate_bps exceeds the maximum rate"
         );
-        require_term_fits_kind(&kind, maturity_at - env.ledger().timestamp());
+        let term_seconds = maturity_at - env.ledger().timestamp();
+        require_term_fits_kind(&kind, term_seconds);
+
         // Refuse before any allowance is granted: a trade in an asset that was never
         // passed to `configure_asset` would settle leg 1 and then strand the lender
         // with no margin protection — `call_margin` and `default_close` read this
         // config and would revert until maturity.
-        read_asset_config(&env, &asset);
+        let config = read_asset_config(&env, &asset);
+        assert!(
+            cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        assert!(
+            term_seconds <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         // Pre-authorize leg 1 (see the module docs): the lender signs this call, not the
         // borrower's later `accept_and_settle`.
@@ -871,7 +901,16 @@ impl RepoDvp {
         }
         // Belt and braces for proposals that predate the check in `propose`: never
         // move either leg for an asset with no margin parameters.
-        read_asset_config(&env, &trade.asset);
+        let config = read_asset_config(&env, &trade.asset);
+        assert!(
+            trade.cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        let now = env.ledger().timestamp();
+        assert!(
+            trade.maturity_at.saturating_sub(now) <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         let asset_client = token::Client::new(&env, &trade.asset);
         asset_client.transfer(
