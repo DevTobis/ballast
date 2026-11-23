@@ -1164,10 +1164,62 @@ mod test {
         });
 
         // Execution must fail because the pending entry was removed
+        let msg = panic_message(|| client.execute_param(&id))
+            .expect("execute_param should panic after cancellation");
+        assert!(msg.contains("registry: no such pending change"));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn cancel_param_rejects_an_unknown_id() {
+        let (_env, client, admin, _risk, _asset) = setup();
+        client.cancel_param(&admin, &999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn cancel_param_after_execute_fails() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(900));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        // Cancel after execution must panic
+        client.cancel_param(&admin, &id);
+    }
+
+    #[test]
+    fn a_stranger_cannot_cancel_param() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(900));
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_param",
+                args: (&stranger, id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.execute_param(&id);
+            client.cancel_param(&stranger, &id);
         }));
-        assert!(result.is_err(), "execute_param should fail after cancellation");
+        assert!(result.is_err(), "only the stored admin may cancel a param change");
+
+        // The queued param change is still intact and can be executed after 48h
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 900);
     }
 
     #[test]
@@ -1186,11 +1238,65 @@ mod test {
             l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
         });
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.execute_unpause(&id);
-        }));
-        assert!(result.is_err(), "execute_unpause should fail after cancellation");
+        let msg = panic_message(|| client.execute_unpause(&id))
+            .expect("execute_unpause should panic after cancellation");
+        assert!(msg.contains("registry: no such pending unpause"));
         assert!(client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn cancel_unpause_rejects_an_unknown_id() {
+        let (_env, client, admin, _risk, _asset) = setup();
+        client.cancel_unpause(&admin, &999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn cancel_unpause_after_execute_fails() {
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        // Cancel after execution must panic
+        client.cancel_unpause(&admin, &id);
+    }
+
+    #[test]
+    fn a_stranger_cannot_cancel_unpause() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_unpause",
+                args: (&stranger, id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_unpause(&stranger, &id);
+        }));
+        assert!(result.is_err(), "only the stored admin may cancel an unpause");
+
+        // The queued unpause is still intact and can be executed after 48h
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        assert!(!client.is_paused(&PauseScope::Draws));
     }
 
     #[test]
