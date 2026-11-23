@@ -1085,6 +1085,64 @@ impl RepoDvp {
             .publish((symbol_short!("topup"), id), (extra_units, cured));
     }
 
+    /// The cash borrower releases excess collateral from a settled trade when over-collateralised.
+    /// Refused if a margin call is open, if the price is not usable for new risk, or if the
+    /// post-release LTV would reach or exceed the warning threshold.
+    pub fn release_excess(env: Env, cash_borrower: Address, id: u64, units: i128) {
+        cash_borrower.require_auth();
+        ttl::extend_instance(&env);
+        assert!(units > 0, "repo-dvp: release amount must be positive");
+
+        let mut trade = read_trade(&env, id);
+        assert_eq!(trade.status, RepoStatus::Settled, "repo-dvp: trade is not settled");
+        assert_eq!(
+            trade.cash_borrower, cash_borrower,
+            "repo-dvp: only the cash borrower can release excess"
+        );
+        assert!(
+            !trade.pending_margin_call,
+            "repo-dvp: cannot release with an open margin call"
+        );
+        assert!(
+            units < trade.units,
+            "repo-dvp: cannot release all collateral"
+        );
+
+        let config = read_asset_config(&env, &trade.asset);
+        let guarded = PriceGuardClient::new(&env, &config.price_guard).guarded_price(&trade.asset);
+        assert!(
+            guarded.is_usable_for_new_risk(),
+            "repo-dvp: price is not usable"
+        );
+
+        let new_units = trade.units - units;
+        let post_collateral_value = risk::collateral_value(new_units, guarded.value, config.haircut_bps);
+        let now = env.ledger().timestamp();
+        let settled_at = trade.settled_at.unwrap_or(now);
+        let accrued = accrue_interest(trade.cash_amount, trade.rate_bps, now.saturating_sub(settled_at));
+        let exposure = trade
+            .cash_amount
+            .checked_add(accrued)
+            .expect("repo-dvp: overflow computing exposure");
+
+        let post_ltv = risk::ltv_bps(exposure, post_collateral_value);
+        assert!(
+            post_ltv < config.thresholds.warning_bps,
+            "repo-dvp: post-release LTV exceeds warning threshold"
+        );
+
+        token::Client::new(&env, &trade.asset).transfer(
+            &env.current_contract_address(),
+            to_muxed(&cash_borrower),
+            &units,
+        );
+
+        trade.units = new_units;
+        write_trade(&env, &trade);
+        env.events()
+            .publish((symbol_short!("release"), id), units);
+    }
+
     /// If the cash borrower has not cured an outstanding margin call by `cure_deadline`, the cash
     /// lender takes title to as much of the pledged RWA as covers what is owed and the trade
     /// closes. See the module docs for exactly what bookkeeping this does and does not do.

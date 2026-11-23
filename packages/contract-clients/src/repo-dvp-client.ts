@@ -86,6 +86,11 @@ export class RepoDvpClient extends BaseContractClient {
     return this.invoke(source, "top_up", [scAddress(source), scU64(id), scI128(extraUnits)]);
   }
 
+  /** The cash borrower releases excess collateral from a settled trade when over-collateralised. */
+  releaseExcess(source: string, id: bigint, units: bigint): Promise<string> {
+    return this.invoke(source, "release_excess", [scAddress(source), scU64(id), scI128(units)]);
+  }
+
   /** Read-only margin snapshot; simulated, so it costs nothing and changes nothing. */
   marginView(id: bigint): Promise<OnChainRepoMargin> {
     return this.read<OnChainRepoMargin>("margin_view", [scU64(id)]);
