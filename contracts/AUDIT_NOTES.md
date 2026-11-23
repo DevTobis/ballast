@@ -8,7 +8,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | Role | Can | Cannot |
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
-| `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
+| `pauser` | pause draws/pledges/exits by scope (currently reaches Registry only; see #210, #223, #233) | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
@@ -183,6 +183,13 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 ## Known limits
 
+- **Emergency pause wiring across contracts.** Pause flags are stored per contract instance and
+  are currently only set on `Registry`. The `pauser` role's invocation of `Registry.pause` does not
+  centrally reach `ExitDesk` or `RepoDvp` because their operations check local contract instance
+  storage rather than cross-calling `Registry` (see #210, #223, #233). Until centralized pause sync
+  or cross-contract checks are implemented, emergency stops must be invoked directly on each target
+  contract.
+  - [ ] Follow-up: Revert this limit note and restore the intended unified security model once pause-wiring fixes merge.
 - Real RWAs cannot be held by these contracts unless the issuer allows it (`AUTH_REQUIRED`
   issuers must authorise the vault's trustline). Etherfuse's issuer sets `auth_revocable` and
   `clawback_enabled`, so it can freeze or claw back tokens held in the vault; price that in.
