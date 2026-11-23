@@ -54,15 +54,15 @@
 //! that sum via `transfer_from`; a defaulted trade's unconsumed share stays in the live
 //! allowance only until the next settle re-approves the accurate sum or the allowance expires.
 //!
-//! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
-//! `default_close` gives the cash lender full title to the pledged RWA units and closes the
-//! trade. It does **not** attempt to net the collateral's current market value against the
-//! outstanding cash exposure (principal + accrued interest) and settle any residual USDC in
-//! either direction — a real implementation would need `call_margin`'s guarded-price read here
-//! too, plus a place for a shortfall (lender under-recovered) or an excess (borrower is owed
-//! change) to be booked. That accounting is left to the off-chain `ledger`/`margin-monitor`
-//! services (PRD §6.5); on-chain, "lender keeps the collateral, trade closed" is the full
-//! outcome.
+//! **Margin default path (PRD §5 Phase 3 "Fail path"):**
+//! If the cash borrower has not cured an outstanding margin call by `cure_deadline`, the trade
+//! can be closed via `default_close` (keeper-only). The position is re-evaluated at default
+//! time: if the price has recovered since the call, the borrower has cured and this refuses.
+//! The collateral is valued at the guarded price with no haircut; the cash lender receives
+//! `ceil(exposure / price)` units, capped at what is pledged, and any surplus units above that
+//! return to the borrower. If the collateral is worth less than the exposure, the lender takes
+//! all pledged units and bears the shortfall. No USDC moves on default.
+//!
 //! **Maturity default path (PRD §5 Phase 3 "Fail path"):**
 //! If the cash borrower fails to fund leg 2 at maturity, `unwind` reverts. Once the trade remains
 //! unpaid past `maturity_at + maturity_grace` (default 24h, admin-configurable with a 60s floor),
