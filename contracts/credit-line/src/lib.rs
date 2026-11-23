@@ -1032,9 +1032,9 @@ mod test {
         }
     }
 
-    fn open_and_fund(h: &Harness, limit: i128, fund_amount: i128) -> u64 {
+    fn open_line(h: &Harness, limit: i128) -> u64 {
         let agreement = BytesN::from_array(&h.env, &[7u8; 32]);
-        let id = h.credit_line.open(
+        h.credit_line.open(
             &h.lender,
             &h.borrower,
             &h.asset,
@@ -1042,7 +1042,11 @@ mod test {
             &1_000,
             &86_400,
             &agreement,
-        );
+        )
+    }
+
+    fn open_and_fund(h: &Harness, limit: i128, fund_amount: i128) -> u64 {
+        let id = open_line(h, limit);
         h.token.mint(&h.lender, &fund_amount);
         h.credit_line.fund(&h.lender, &id, &fund_amount);
         id
@@ -1065,6 +1069,90 @@ mod test {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_000,
             },
+        );
+    }
+
+    #[test]
+    fn fund_accumulates_balance_and_transfers_token() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_line(&h, 1_000 * PRICE_SCALE);
+
+        h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(400 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).funded, 400 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.credit_line.address), 400 * PRICE_SCALE);
+
+        h.credit_line.fund(&h.lender, &id, &(600 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).funded, 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.credit_line.address), 1_000 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: amount must be positive")]
+    fn fund_rejects_zero_amount() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_line(&h, 1_000 * PRICE_SCALE);
+        h.credit_line.fund(&h.lender, &id, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: not this line's lender")]
+    fn fund_rejects_non_lender() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_line(&h, 1_000 * PRICE_SCALE);
+        let stranger = Address::generate(&h.env);
+        h.token.mint(&stranger, &(100 * PRICE_SCALE));
+        h.credit_line.fund(&stranger, &id, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line is closed")]
+    fn fund_rejects_closed_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        h.credit_line.close_liquidated(&h.lender, &id);
+        h.token.mint(&h.lender, &(100 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: asset not configured")]
+    fn fund_rejects_unconfigured_asset() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let unconfigured_asset = Address::generate(&h.env);
+        let agreement = BytesN::from_array(&h.env, &[7u8; 32]);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &unconfigured_asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &86_400,
+            &agreement,
+        );
+        h.token.mint(&h.lender, &(100 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn funding_a_liquidating_line_is_allowed() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
+
+        let before_funded = h.credit_line.line(&id).funded;
+        let before_balance = h.token.balance(&h.credit_line.address);
+
+        h.token.mint(&h.lender, &(500 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(500 * PRICE_SCALE));
+
+        assert_eq!(
+            h.credit_line.line(&id).funded,
+            before_funded + 500 * PRICE_SCALE
+        );
+        assert_eq!(
+            h.token.balance(&h.credit_line.address),
+            before_balance + 500 * PRICE_SCALE
         );
     }
 
