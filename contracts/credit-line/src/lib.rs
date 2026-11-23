@@ -1120,6 +1120,57 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "credit-line: price status is not Ok")]
+    fn no_draw_on_halted_price() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Halted);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(10 * PRICE_SCALE), &to);
+    }
+
+    /// `margin::classify` uses `>=` for each threshold band (`ltv_bps >= thresholds.warning_bps`).
+    /// With 0% haircut, $1.00 price, 1,000 units collateral (collateral value $1,000), and thresholds
+    /// 7000/8000/9000:
+    /// - Drawing 699.9999999 produces LTV = 6,999 bps (< 7000 bps warning_bps). Because the boundary
+    ///   is inclusive (`>=`), 6,999 bps is strictly below the warning threshold and classifies as
+    ///   Healthy, allowing the draw to succeed.
+    #[test]
+    fn draw_just_below_warning_threshold_succeeds() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        // 699.9999999 is 1 stroop below 700 * PRICE_SCALE
+        let amount = 700 * PRICE_SCALE - 1;
+        h.credit_line.draw(&h.borrower, &id, &amount, &to);
+        assert_eq!(h.token.balance(&to), amount);
+        assert_eq!(h.credit_line.line(&id).drawn, amount);
+    }
+
+    /// `margin::classify` uses `>=` for each threshold band (`ltv_bps >= thresholds.warning_bps`).
+    /// Drawing 700 against 1,000 collateral at $1.00 produces an LTV of exactly 7,000 bps. Because the
+    /// warning boundary is inclusive (`>= 7000`), 7,000 bps is classified as Warning, and draw
+    /// panics because only MarginState::Healthy is allowed for new draws.
+    #[test]
+    #[should_panic(expected = "credit-line: draw would push the line past a healthy LTV")]
+    fn draw_at_exact_warning_threshold_fails() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(700 * PRICE_SCALE), &to);
+    }
+
+    #[test]
     fn repay_works_while_draws_paused_but_draw_does_not() {
         let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
