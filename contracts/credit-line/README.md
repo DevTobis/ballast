@@ -73,6 +73,7 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|
+| `line_funded` | `(Symbol("line_funded"), line: u64)` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` |
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
 | `liquidation_started` | `(Symbol("liquidation_started"), line: u64)` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` |
@@ -81,6 +82,10 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 | `margin_state_changed` | `(Symbol("margin_state_changed"), line: u64)` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke` |
 | `asset_configured` | `(Symbol("asset_configured"), asset: Address)` | `(price_guard: Address, usdc: Address, haircut_bps: u32, thresholds: MarginThresholds)` | `configure_asset` |
 | `vault_set` | `(Symbol("vault_set"),)` | `vault: Address` | `set_vault` |
+
+`line_funded` is published after the state write, so `funded_total` is the line's `funded`
+figure once the deposit has been applied (`funded_before + amount`). A reverted funding
+publishes nothing.
 
 `undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
 figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
