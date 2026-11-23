@@ -901,6 +901,83 @@ mod test {
         h.vault.release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
     }
 
+    // ── #192: release validation and price status error paths ────────────────
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn release_of_zero_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.vault.release(&h.borrower, &1, &h.asset, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release exceeds pledged units")]
+    fn release_exceeding_position_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.vault.release(&h.borrower, &1, &h.asset, &(1_001 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: price status is not Ok")]
+    fn release_with_debt_on_halted_price_panics() {
+        // Zero-debt releases skip the price check (#1110 / PRD §8 invariant 5),
+        // but any debt requires a usable price (PriceStatus::Ok).
+        let h = setup(500, 100 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Halted);
+        h.vault.release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn release_failure_modes_leave_position_and_token_balances_unchanged() {
+        // Zero-debt releases skip price checks (issue #1110), but when debt > 0,
+        // price must be Ok. For all failed release attempts, state must remain untouched.
+        let h = setup(500, 100 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 1_000 * PRICE_SCALE);
+
+        // 1. Zero units fails
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &0);
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        // 2. Units exceeding position fails
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &(1_001 * PRICE_SCALE));
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        // 3. Degraded price fails when debt > 0 (issue #1110)
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Degraded);
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        // 4. Halted price fails when debt > 0 (issue #1110)
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Halted);
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 1_000 * PRICE_SCALE);
+    }
+
     #[test]
     fn record_lien_and_liquidate_lien_mode() {
         let h = setup(500, 0, PRICE_SCALE);
