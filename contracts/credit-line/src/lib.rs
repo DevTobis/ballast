@@ -1093,6 +1093,34 @@ mod test {
     }
 
     #[test]
+    fn third_party_can_repay_borrowers_draw() {
+        // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        // Draw 200 to the borrower.
+        h.credit_line
+            .draw(&h.borrower, &id, &(200 * PRICE_SCALE), &h.borrower.clone());
+        assert_eq!(h.token.balance(&h.borrower), 200 * PRICE_SCALE);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.drawn, 200 * PRICE_SCALE);
+
+        // A third party mints 200 and repays the borrower's line in full.
+        let payer = Address::generate(&h.env);
+        h.token.mint(&payer, &(200 * PRICE_SCALE));
+        let applied = h.credit_line.repay(&payer, &id, &(200 * PRICE_SCALE));
+        assert_eq!(applied, 200 * PRICE_SCALE);
+
+        // The payer — not the borrower — was debited, and the line is clear.
+        assert_eq!(h.token.balance(&payer), 0);
+        assert_eq!(h.token.balance(&h.borrower), 200 * PRICE_SCALE);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.drawn, 0);
+    }
+
+    #[test]
     #[should_panic(expected = "credit-line: draw would push the line past a healthy LTV")]
     fn never_over_lent() {
         let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
