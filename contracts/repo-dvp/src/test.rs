@@ -5,7 +5,8 @@
 
 use super::*;
 use ballast_common::price::{PriceStatus, PRICE_SCALE};
-use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{IntoVal, TryFromVal};
 use soroban_sdk::Env;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -240,6 +241,51 @@ fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_
         &maturity_at,
         &hash(h, 7),
     )
+}
+
+#[test]
+fn propose_emits_propose_event() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    let id = RepoDvpClient::new(&h.env, &h.repo).propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &h.rwa,
+        &units,
+        &cash_amount,
+        &500u32,
+        &RepoKind::Intraday,
+        &maturity,
+        &hash(&h, 7),
+    );
+
+    let events = h.env.events().all();
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected event from repo-dvp");
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("propose"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let expected_data: (Address, Address, Address, i128, i128, u64) = (
+        h.cash_lender.clone(),
+        h.cash_borrower.clone(),
+        h.rwa.clone(),
+        units,
+        cash_amount,
+        maturity,
+    );
+    let data_val: soroban_sdk::Val = expected_data.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+        .expect("failed to convert expected data to ScVal");
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "data mismatch");
+        }
+    }
 }
 
 // --- #216: a repo's term has to fit its kind, and its rate has a ceiling -------------------
@@ -1298,8 +1344,9 @@ fn configure_asset_rejects_liquidation_exceeding_10000() {
         );
     }));
     assert!(res.is_err(), "liquidation > 10000 must be rejected");
-    }
+}
 
+#[test]
 fn disabled_asset_blocks_propose_and_accept_and_settle() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
