@@ -848,6 +848,56 @@ fn default_before_the_cure_window_ends_is_refused() {
 }
 
 #[test]
+fn unwind_clears_pending_margin_call_and_cure_deadline() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    repo.call_margin(&h.keeper, &id);
+    let trade = repo.trade(&id);
+    assert!(trade.pending_margin_call);
+    assert!(trade.margin_call_amount > 0);
+    assert!(trade.cure_deadline.is_some());
+
+    // Advance to maturity and source repayment cash
+    let maturity = trade.maturity_at;
+    let settled_at = trade.settled_at.unwrap();
+    let due = total_due(&trade, settled_at);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &due);
+    h.env.ledger().set_timestamp(maturity);
+
+    repo.unwind(&h.cash_borrower, &id);
+
+    let unwound = repo.trade(&id);
+    assert_eq!(unwound.status, RepoStatus::Unwound);
+    assert!(!unwound.pending_margin_call, "pending_margin_call must be false");
+    assert_eq!(unwound.margin_call_amount, 0, "margin_call_amount must be 0");
+    assert_eq!(unwound.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
+fn default_close_clears_pending_margin_call_and_cure_deadline() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    repo.call_margin(&h.keeper, &id);
+    let trade = repo.trade(&id);
+    assert!(trade.pending_margin_call);
+    assert!(trade.margin_call_amount > 0);
+    let deadline = trade.cure_deadline.expect("cure deadline should be set");
+
+    h.env.ledger().set_timestamp(deadline);
+    repo.default_close(&h.keeper, &id);
+
+    let defaulted = repo.trade(&id);
+    assert_eq!(defaulted.status, RepoStatus::Defaulted);
+    assert!(!defaulted.pending_margin_call, "pending_margin_call must be false");
+    assert_eq!(defaulted.margin_call_amount, 0, "margin_call_amount must be 0");
+    assert_eq!(defaulted.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
 fn margin_view_reports_the_position_without_changing_it() {
     let h = setup();
     let id = settled_under_margin(&h);

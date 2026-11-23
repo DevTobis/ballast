@@ -979,6 +979,7 @@ impl RepoDvp {
             &trade.units,
         );
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Unwound;
         write_trade(&env, &trade);
         release_borrower_due(&env, &trade);
@@ -1147,6 +1148,7 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
         release_borrower_due(&env, &trade);
@@ -1222,6 +1224,7 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
 
