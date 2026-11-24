@@ -130,7 +130,8 @@ mod test {
     #[test]
     fn classifies_at_every_threshold_boundary() {
         let t = thresholds();
-        // Thresholds are inclusive on the upper state (>=).
+        // Thresholds are inclusive on the upper state (`classify` uses `>=`): an LTV exactly at a
+        // threshold is already in the higher state, one bp below it is still in the lower one.
         assert_eq!(classify(0, &t), MarginState::Healthy);
         assert_eq!(classify(6_999, &t), MarginState::Healthy);
         assert_eq!(classify(7_000, &t), MarginState::Warning);
