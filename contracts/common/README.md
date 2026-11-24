@@ -44,7 +44,7 @@ Provides role-based access control and role rotation primitives. A role is enfor
   - `enum RoleKind { Pauser, Keeper, PricePublisher, Risk }`
   - `struct PendingAdmin { pub new_admin: Address }`
   - `struct PendingRoleChange { pub role: RoleKind, pub new_address: Address, pub executes_at: u64 }`
-  - Functions: `write_roles`, `has_roles`, `read_roles`, `require_admin`, `require_pauser`, `require_keeper`, `require_price_publisher`, `require_risk`, `propose_admin`, `accept_admin`, `pending_admin`, `role`, `queue_role_change`, `execute_role_change`, `pending_role_change`.
+  - Functions: `write_roles`, `has_roles`, `read_roles`, `require_admin`, `require_pauser`, `require_keeper`, `require_price_publisher`, `require_risk`, `require_admin_or_keeper`, `propose_admin`, `accept_admin`, `pending_admin`, `role`, `queue_role_change`, `execute_role_change`, `pending_role_change`.
 - **Storage Keys Used:**
   - Instance: `RolesKey::Roles`, `RolesKey::PendingAdmin`
   - Persistent: `RolesKey::PendingRoleChange(u64)` (extended with timelock TTL)
@@ -52,6 +52,7 @@ Provides role-based access control and role rotation primitives. A role is enfor
   - `read_roles`: `"ballast-common: roles not initialized"` if roles have not been set.
   - `accept_admin`: `"ballast-common: no pending admin proposal"` if called without an active proposal.
   - `execute_role_change`: `"ballast-common: no such pending role change"` if the ID does not exist; `"ballast-common: timelock has not elapsed"` if invoked before `executes_at`.
+  - `require_admin_or_keeper`: `"ballast-common: caller is neither admin nor keeper"` if caller is neither stored admin nor keeper.
   - Host authorization failure panics on any failed `require_auth()` call.
 - **Consuming Contracts:**
   - `contracts/credit-line`
