@@ -69,6 +69,7 @@ mod test {
         // Stellar classic SAC convention where 1 unit = 10^7 stroops.
         // Conversion example: a $100.50 NAV reading converts to 100.50 * 10^7 = 1_005_000_000 stroops.
         assert_eq!(PRICE_SCALE, 10_000_000);
+        assert_eq!(10_050 * PRICE_SCALE / 100, 1_005_000_000);
     }
 
     #[test]
@@ -107,4 +108,3 @@ mod test {
         assert!(!halted_price.is_usable_for_liquidation());
     }
 }
-

@@ -75,6 +75,17 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   issuers publish unsigned data. The attestor key is the same key that is authorised to publish, so
   on-chain the signature adds no protection against a compromised publisher: it records who relayed
   the value. Do not describe it as issuer attestation.
+- **The NAV signature requirement is per asset** (`DataKey::RequireNavSignature(asset)`, `true`
+  when unset). Turning it off for one asset leaves the others checked. Turning it on is immediate;
+  turning it off is immediate only during an asset's bring-up (no flag stored and no reading ever
+  published for it), and otherwise must go through `queue_config` and the 48h timelock. The deploy
+  scripts set it to `true` explicitly for every asset they configure.
+- **Per-asset state is in persistent storage**, one entry per key with its TTL extended on every
+  read and write; the instance entry holds only the roles, a pending admin transfer and the
+  timelock id counter, so it does not grow with the asset count. This moved the keys out of
+  instance storage and **requires a fresh PriceGuard deploy**: an in-place `execute_upgrade` would
+  leave every asset unconfigured and, once reconfigured, without its `LastGood` baseline, `Halted`
+  latch or issuer key. See `contracts/README.md`.
 - Roles rotate in place: `price_publisher` and the other non-admin roles go through
   `queue_role_change` / `execute_role_change` (48h), while the admin moves with the two-step
   `propose_admin` / `accept_admin` pair. A publisher rotation preserves `LastGood`, a `Halted` latch,
