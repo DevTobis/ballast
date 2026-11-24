@@ -49,7 +49,7 @@ ZERO_HASH="0000000000000000000000000000000000000000000000000000000000000000"
 log "Opening a credit line: lender=$LENDER borrower=$BORROWER limit=10,000 TUSD @ 7% APR"
 LINE_ID=$(inv --id "$CREDIT_LINE_CID" --source lender -- open \
   --lender "$LENDER" --borrower "$BORROWER" --asset "$RWA_SAC" \
-  --limit 100000000000 --rate_bps 700 --cure_s 86400 --agreement "$ZERO_HASH")
+  --limit 100000000000 --rate_bps 700 --fee_bps 0 --cure_s 86400 --agreement "$ZERO_HASH")
 log "  line id = $LINE_ID"
 
 log "Lender funds the line with 10,000 TUSD"
