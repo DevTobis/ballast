@@ -61,9 +61,19 @@ use ballast_common::{
     price::{GuardedPrice, PriceSource, PriceStatus},
     timelock, ttl, upgrade,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, TryFromVal, Val,
+    Vec,
+};
 
 const ISSUER_SOURCE: &str = "issuer";
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastGood {
+    pub value: i128,
+    pub ts: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +83,17 @@ pub struct AssetGuardConfig {
     pub max_staleness_s: u64,
     pub window_seconds: u64,
     pub window_move_band_bps: u32,
+}
+
+/// What a risk operator needs to see before calling `confirm_halt_cleared`, returned by
+/// `halt_info` while an asset is halted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HaltInfo {
+    /// The baseline `guarded_price` keeps returning while halted. `None` if none was ever recorded.
+    pub last_good: Option<i128>,
+    /// The median that tripped the halt; confirming promotes it to the new `last_good`.
+    pub pending: Option<i128>,
 }
 
 #[contracttype]
@@ -385,6 +406,25 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
     }
 }
 
+/// Reads the `LastGood` baseline. A value stored by an earlier version as a bare `i128` decodes
+/// with `ts = 0` until the next `Ok` evaluation rewrites it.
+fn read_last_good(env: &Env, asset: &Address) -> Option<LastGood> {
+    let raw: Val = env
+        .storage()
+        .instance()
+        .get(&DataKey::LastGood(asset.clone()))?;
+    if let Ok(value) = i128::try_from_val(env, &raw) {
+        return Some(LastGood { value, ts: 0 });
+    }
+    LastGood::try_from_val(env, &raw).ok()
+}
+
+fn write_last_good(env: &Env, asset: &Address, value: i128, ts: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LastGood(asset.clone()), &LastGood { value, ts });
+}
+
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
 /// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
 ///
@@ -397,22 +437,21 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
 /// the daily-move check would then compare against a baseline days old and halt on ordinary yield
 /// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
 fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
-    let config = read_config(&env, &asset);
-    let all_sources = read_all_sources(&env, &asset);
+    let config = read_config(env, &asset);
+    let all_sources = read_all_sources(env, &asset);
 
-    let mut fresh_values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
-    let mut fresh_sources: soroban_sdk::Vec<PriceSource> = soroban_sdk::Vec::new(&env);
+    let mut fresh_values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
+    let mut fresh_sources: soroban_sdk::Vec<PriceSource> = soroban_sdk::Vec::new(env);
     for source in all_sources.iter() {
-        if is_fresh(&env, &source, config.max_staleness_s) {
+        if is_fresh(env, &source, config.max_staleness_s) {
             fresh_values.push_back(source.value);
             fresh_sources.push_back(source.clone());
         }
     }
 
-    let last_good: Option<i128> = env
-        .storage()
-        .instance()
-        .get(&DataKey::LastGood(asset.clone()));
+    let last_good = read_last_good(env, &asset);
+    let last_good_val = last_good.as_ref().map(|lg| lg.value);
+    let last_good_ts = last_good.as_ref().map_or(0, |lg| lg.ts);
     let already_halted: bool = env
         .storage()
         .instance()
@@ -422,25 +461,25 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let now = env.ledger().timestamp();
 
     if already_halted {
-        let val = last_good.unwrap_or(0);
+        let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Halted, val);
         return GuardedPrice {
             asset,
             value: val,
             status: PriceStatus::Halted,
-            ts: now,
+            ts: last_good_ts,
             sources: fresh_sources,
         };
     }
 
     if fresh_values.len() < 2 {
-        let val = last_good.unwrap_or(0);
+        let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Degraded, val);
         return GuardedPrice {
             asset,
             value: val,
             status: PriceStatus::Degraded,
-            ts: now,
+            ts: last_good_ts,
             sources: fresh_sources,
         };
     }
@@ -460,18 +499,18 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         *slot = plain_values.get(i);
     }
     if !within_band(&as_array[..len], config.band_bps) {
-        let val = last_good.unwrap_or(0);
+        let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Degraded, val);
         return GuardedPrice {
             asset,
             value: val,
             status: PriceStatus::Degraded,
-            ts: now,
+            ts: last_good_ts,
             sources: fresh_sources,
         };
     }
 
-    if let Some(last) = last_good {
+    if let Some(last) = last_good_val {
         if last > 0 {
             let move_bps = (((median_value - last).abs()) * 10_000) / last;
             if move_bps > config.daily_move_band_bps as i128 {
@@ -490,7 +529,7 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                     asset,
                     value: last,
                     status: PriceStatus::Halted,
-                    ts: now,
+                    ts: last_good_ts,
                     sources: fresh_sources,
                 };
             }
@@ -521,7 +560,12 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                     .instance()
                     .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
                 // Report the last good value, like every other Halted path, not the older reference.
-                let held = last_good.unwrap_or(reference);
+                let held = last_good_val.unwrap_or(reference);
+                let held_ts = if last_good_val.is_some() {
+                    last_good_ts
+                } else {
+                    rolling_ref_ts.unwrap_or(0)
+                };
                 env.events().publish(
                     (Symbol::new(env, "halt_latched"), asset.clone()),
                     (held, median_value),
@@ -531,7 +575,7 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                     asset,
                     value: held,
                     status: PriceStatus::Halted,
-                    ts: now,
+                    ts: held_ts,
                     sources: fresh_sources,
                 };
             }
@@ -549,9 +593,7 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
             .set(&DataKey::RollingReferenceUpdated(asset.clone()), &now);
     }
 
-    env.storage()
-        .instance()
-        .set(&DataKey::LastGood(asset.clone()), &median_value);
+    write_last_good(env, &asset, median_value, now);
 
     check_and_emit_status_change(env, &asset, PriceStatus::Ok, median_value);
 
@@ -979,6 +1021,32 @@ impl PriceGuard {
         env.storage().instance().get(&DataKey::IssuerPubKey(asset))
     }
 
+    /// Read-only: the halt latch for `asset`. `None` while the asset is not halted. While halted,
+    /// shows the baseline `guarded_price` is holding and the value `confirm_halt_cleared` would
+    /// promote, so a risk operator can check both before confirming.
+    pub fn halt_info(env: Env, asset: Address) -> Option<HaltInfo> {
+        ttl::extend_instance(&env);
+        let halted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Halted(asset.clone()))
+            .unwrap_or(false);
+        if !halted {
+            return None;
+        }
+        Some(HaltInfo {
+            last_good: read_last_good(&env, &asset).map(|lg| lg.value),
+            pending: env.storage().instance().get(&DataKey::PendingHaltValue(asset)),
+        })
+    }
+
+    /// Read-only: the last guarded value that reached `Ok`, which `guarded_price` falls back to
+    /// while `Degraded` or `Halted`. `None` if the asset has never reached `Ok`.
+    pub fn last_good(env: Env, asset: Address) -> Option<i128> {
+        ttl::extend_instance(&env);
+        read_last_good(&env, &asset).map(|lg| lg.value)
+    }
+
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
     /// asset's registered issuer key (`configure_issuer_key`) whenever `require_nav_signature` is
     /// `true` (the default), over the canonical message built from `asset_code`/`ts`/`value`.
@@ -1086,15 +1154,14 @@ impl PriceGuard {
         access::require_risk(&env);
         ttl::extend_instance(&env);
 
+        let now = env.ledger().timestamp();
         let mut new_last_good = 0i128;
         if let Some(pending) = env
             .storage()
             .instance()
             .get::<_, i128>(&DataKey::PendingHaltValue(asset.clone()))
         {
-            env.storage()
-                .instance()
-                .set(&DataKey::LastGood(asset.clone()), &pending);
+            write_last_good(&env, &asset, pending, now);
             new_last_good = pending;
             env.storage()
                 .instance()
@@ -1103,17 +1170,13 @@ impl PriceGuard {
                 .instance()
                 .set(
                     &DataKey::RollingReferenceUpdated(asset.clone()),
-                    &env.ledger().timestamp(),
+                    &now,
                 );
             env.storage()
                 .instance()
                 .remove(&DataKey::PendingHaltValue(asset.clone()));
-        } else if let Some(last) = env
-            .storage()
-            .instance()
-            .get::<_, i128>(&DataKey::LastGood(asset.clone()))
-        {
-            new_last_good = last;
+        } else if let Some(last) = read_last_good(&env, &asset) {
+            new_last_good = last.value;
         }
         env.storage().instance().remove(&DataKey::Halted(asset.clone()));
 
@@ -2614,8 +2677,8 @@ mod test {
 
         // State persists: the last good price and config established before upgrade are still in storage
         env.as_contract(&client.address, || {
-            let last_good: Option<i128> = env.storage().instance().get(&DataKey::LastGood(asset.clone()));
-            assert_eq!(last_good, Some(SCALE));
+            let last_good = read_last_good(&env, &asset);
+            assert_eq!(last_good.map(|lg| lg.value), Some(SCALE));
             let config = read_config(&env, &asset);
             assert_eq!(config.band_bps, 50);
             assert_eq!(config.daily_move_band_bps, 10_000);
@@ -2793,6 +2856,74 @@ mod test {
         assert_eq!(price.sources.len(), 5);
     }
 
+    #[test]
+    fn last_good_is_none_until_the_asset_reaches_ok_then_tracks_the_median() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        assert_eq!(client.last_good(&asset), None);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        // One source is Degraded, which never records a last good value.
+        assert_eq!(client.last_good(&asset), None);
+
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+    }
+
+    #[test]
+    fn getters_need_no_auth_and_do_not_change_state() {
+        use soroban_sdk::testutils::MockAuth;
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+
+        // Drop every mocked authorisation: a getter that required auth would now panic.
+        env.mock_auths(&[] as &[MockAuth]);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.halt_info(&asset), None);
+    }
+
+    #[test]
+    fn halt_info_shows_baseline_and_tripping_value_then_clears_on_confirm() {
+        let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let t0 = env.ledger().timestamp();
+        let feed = feed(&env);
+        assert_eq!(client.halt_info(&asset), None);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &SCALE, &t0);
+        assert_eq!(client.halt_info(&asset), None);
+
+        // Both sources agree on a jump beyond the daily band, which latches the halt.
+        let jumped = SCALE * 13 / 10;
+        client.publish_nav(&publisher, &asset, &code, &jumped, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &jumped, &t0);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
+        assert_eq!(
+            client.halt_info(&asset),
+            Some(HaltInfo {
+                last_good: Some(SCALE),
+                pending: Some(jumped),
+            })
+        );
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+
+        // Confirming promotes the tripping value and lifts the latch.
+        client.confirm_halt_cleared(&risk, &asset);
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.last_good(&asset), Some(jumped));
+    }
+
     // `within_band` boundaries. The band is inclusive: a spread of exactly `band_bps` is still
     // within band, one bp more is not.
 
@@ -2903,6 +3034,91 @@ mod test {
         // Real admin succeeds.
         env.mock_all_auths();
         client.remove_source(&admin, &asset, &feed_name);
+    }
+
+    #[test]
+    fn degraded_and_halted_return_last_good_timestamp_instead_of_now() {
+        let (env, client, publisher, risk, asset) = setup(50, 100, 3_600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        // No prior good price yet -> Degraded with ts == 0.
+        env.ledger().with_mut(|l| l.timestamp = 500);
+        let initial = client.guarded_price(&asset);
+        assert_eq!(initial.status, PriceStatus::Degraded);
+        assert_eq!(initial.value, 0);
+        assert_eq!(initial.ts, 0);
+
+        // Publish an Ok price at t = 1000.
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &1_000, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &1_000);
+        let ok_price = client.guarded_price(&asset);
+        assert_eq!(ok_price.status, PriceStatus::Ok);
+        assert_eq!(ok_price.value, SCALE);
+        assert_eq!(ok_price.ts, 1_000);
+
+        // Advance ledger to t = 5000 so readings go stale (max_staleness_s = 3600).
+        env.ledger().with_mut(|l| l.timestamp = 5_000);
+        let degraded = client.guarded_price(&asset);
+        assert_eq!(degraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded.value, SCALE);
+        assert_eq!(degraded.ts, 1_000);
+
+        // Publish a fresh jump at t = 5500 that exceeds daily_move_band_bps (100 bps) -> Halted
+        // still reports ts == 1000 (when the held last_good was recorded).
+        env.ledger().with_mut(|l| l.timestamp = 5_500);
+        let jumped = SCALE + 500_000; // +5%
+        client.publish_nav(&publisher, &asset, &code, &jumped, &5_500, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &jumped, &5_500);
+        let halted = client.guarded_price(&asset);
+        assert_eq!(halted.status, PriceStatus::Halted);
+        assert_eq!(halted.value, SCALE);
+        assert_eq!(halted.ts, 1_000);
+
+        // Clearing the halt at t = 6000 accepts `jumped` as LastGood at t = 6000; once readings
+        // age out at t = 10_000, Degraded reports the t = 6000 timestamp.
+        env.ledger().with_mut(|l| l.timestamp = 6_000);
+        client.confirm_halt_cleared(&risk, &asset);
+        env.ledger().with_mut(|l| l.timestamp = 10_000);
+        let degraded_after_clear = client.guarded_price(&asset);
+        assert_eq!(degraded_after_clear.status, PriceStatus::Degraded);
+        assert_eq!(degraded_after_clear.value, jumped);
+        assert_eq!(degraded_after_clear.ts, 6_000);
+    }
+
+    #[test]
+    fn legacy_bare_i128_last_good_migrates_with_zero_timestamp() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        // Simulate a pre-migration contract instance that stored a bare i128 under DataKey::LastGood.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::LastGood(asset.clone()), &SCALE);
+        });
+
+        env.ledger().with_mut(|l| l.timestamp = 2_500);
+        let degraded = client.guarded_price(&asset);
+        assert_eq!(degraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded.value, SCALE);
+        assert_eq!(degraded.ts, 0);
+
+        // Next Ok publish at t = 3000 upgrades storage to LastGood { value, ts: 3000 }.
+        env.ledger().with_mut(|l| l.timestamp = 3_000);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &3_000, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &3_000);
+        let ok_price = client.guarded_price(&asset);
+        assert_eq!(ok_price.status, PriceStatus::Ok);
+        assert_eq!(ok_price.ts, 3_000);
+
+        env.ledger().with_mut(|l| l.timestamp = 7_000);
+        let degraded_upgraded = client.guarded_price(&asset);
+        assert_eq!(degraded_upgraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded_upgraded.value, SCALE);
+        assert_eq!(degraded_upgraded.ts, 3_000);
     }
 
     mod invariants;
