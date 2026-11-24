@@ -1,0 +1,22 @@
+[package]
+name = "ltv-view-wire-shape"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+test-mismatch-demo = []
+
+[dependencies]
+ballast-common = { workspace = true }
+ballast-credit-line = { path = "../credit-line", features = ["testutils"] }
+ballast-pledge-vault = { path = "../pledge-vault", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

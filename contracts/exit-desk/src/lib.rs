@@ -333,15 +333,97 @@ impl ExitDesk {
         compute_quote(&env, &asset, units)
     }
 
+    /// The USDC the desk can pay exits from right now: its own balance of the configured USDC
+    /// token, or zero while no USDC token has been set. `exit` refuses a payout larger than this
+    /// (`exit-desk: insufficient USDC float`), so comparing it with a quote's `usdc_out` tells a
+    /// caller whether that quote can be paid before a holder is asked to sign. A read, like
+    /// `quote`: the float can still move before the exit lands.
+    pub fn available_usdc(env: Env) -> i128 {
+        match env.storage().instance().get::<_, Address>(&DataKey::Usdc) {
+            Some(usdc) => token::Client::new(&env, &usdc).balance(&env.current_contract_address()),
+            None => 0,
+        }
+    }
+
+    /// Read-only helper returning the configured asset parameters for `asset`.
+    pub fn asset_config(env: Env, asset: Address) -> AssetConfig {
+        read_asset_config(&env, &asset)
+    }
+
+    /// Read-only helper returning the current accumulated RWA inventory for `asset`.
+    pub fn inventory(env: Env, asset: Address) -> i128 {
+        let key = DataKey::Inventory(asset);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Read-only helper returning the units `holder` has exited for `asset` within the
+    /// current UTC day.
+    pub fn daily_used(env: Env, holder: Address, asset: Address) -> i128 {
+        let day_bucket = env.ledger().timestamp() / SECONDS_PER_DAY;
+        let key = DataKey::DailyUsed(holder, asset, day_bucket);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Read-only convenience returning remaining capacity in units for `(holder, asset)`:
+    /// `(holder_room, desk_room)` for the current UTC day.
+    /// `holder_room` is remaining units under `per_holder_daily_cap`.
+    /// `desk_room` is remaining units under `desk_inventory_cap`.
+    /// Both are bounded below by 0.
+    pub fn capacity(env: Env, holder: Address, asset: Address) -> (i128, i128) {
+        let config = read_asset_config(&env, &asset);
+        let day_bucket = env.ledger().timestamp() / SECONDS_PER_DAY;
+        let daily_key = DataKey::DailyUsed(holder, asset.clone(), day_bucket);
+        let daily_used: i128 = env.storage().persistent().get(&daily_key).unwrap_or(0);
+        let holder_room = (config.per_holder_daily_cap - daily_used).max(0);
+
+        let inventory_key = DataKey::Inventory(asset);
+        let inventory: i128 = env.storage().persistent().get(&inventory_key).unwrap_or(0);
+        let desk_room = (config.desk_inventory_cap - inventory).max(0);
+
+        (holder_room, desk_room)
+    }
+
     /// Swaps `units` of `asset` from `holder` into USDC paid to `to` (PRD §5 Phase 2
     /// "Settlement", "Anchor payout hop"). Always re-quotes fresh; never trusts a stale
     /// client-supplied price.
+    ///
+    /// Instant exit with an execution deadline: holder deposits `units` of `asset` and receives USDC at the
+    /// guarded price less the spread, provided the current ledger timestamp has not passed `deadline`.
+    pub fn exit_before(
+        env: Env,
+        holder: Address,
+        asset: Address,
+        units: i128,
+        min_usdc_out: i128,
+        to: Address,
+        deadline: u64,
+    ) -> i128 {
+        assert!(
+            env.ledger().timestamp() <= deadline,
+            "exit-desk: deadline has passed"
+        );
+        Self::exit_internal(env, holder, asset, units, min_usdc_out, to)
+    }
+
+    /// Instant exit: holder deposits `units` of `asset` and receives USDC at the guarded price less
+    /// the spread, in one atomic transaction.
     ///
     /// PRD §5 Phase 2 "Eligibility": the holder must already be authorised for `asset`. This is
     /// enforced entirely by the asset's own SAC/SEP-57 authorization checks inside
     /// `token::Client::transfer` below — an unauthorized holder's transfer simply reverts there,
     /// so no extra eligibility check is needed in this contract.
     pub fn exit(
+        env: Env,
+        holder: Address,
+        asset: Address,
+        units: i128,
+        min_usdc_out: i128,
+        to: Address,
+    ) -> i128 {
+        Self::exit_before(env, holder, asset, units, min_usdc_out, to, u64::MAX)
+    }
+
+    fn exit_internal(
         env: Env,
         holder: Address,
         asset: Address,
@@ -385,14 +467,21 @@ impl ExitDesk {
             panic!("exit-desk: exceeds desk inventory cap");
         }
 
+        // The payout comes out of the USDC the desk holds. Check it can be paid before anything
+        // is taken from the holder, so that a short float fails here, with a message that says
+        // so, rather than in the token's own transfer further down, with one that does not.
+        let usdc = read_usdc(&env);
+        let usdc_client = token::Client::new(&env, &usdc);
+        if usdc_client.balance(&env.current_contract_address()) < quote.usdc_out {
+            panic!("exit-desk: insufficient USDC float");
+        }
+
         // Atomic settlement: RWA in from the holder, USDC out to `to`. Both transfers happen
         // unconditionally in this one call; a panic in either aborts the whole invocation and
         // neither leg applies.
         let rwa_client = token::Client::new(&env, &asset);
         rwa_client.transfer(&holder, to_muxed(&env.current_contract_address()), &units);
 
-        let usdc = read_usdc(&env);
-        let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(
             &env.current_contract_address(),
             to_muxed(&to),

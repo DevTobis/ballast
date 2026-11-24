@@ -32,6 +32,29 @@ struct PendingUnpause {
     executes_at: u64,
 }
 
+/// Read-only view of a queued parameter change (`queue_param`), for consoles and ops scripts that
+/// need to show what is waiting in the timelock without guessing ids.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingParamView {
+    /// The asset the queued change targets.
+    pub asset: Address,
+    /// The parameter change that will be applied on execution.
+    pub change: ParamChange,
+    /// Ledger timestamp at which the change becomes executable.
+    pub executes_at: u64,
+}
+
+/// Read-only view of a queued unpause (`queue_unpause`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUnpauseView {
+    /// The pause scope the queued unpause will lift.
+    pub scope: PauseScope,
+    /// Ledger timestamp at which the unpause becomes executable.
+    pub executes_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     Asset(Address),
@@ -162,7 +185,22 @@ impl Registry {
         access::require_admin(&env);
         ttl::extend_instance(&env);
         // Fail fast if the asset doesn't exist yet, rather than queuing a change for nothing.
-        read_asset(&env, &asset);
+        let mut preview = read_asset(&env, &asset);
+        match &change {
+            ParamChange::HaircutBaseBps(v) => {
+                preview.haircut_base_bps = *v;
+                if let Err(message) = preview.validate(&env, &asset) {
+                    panic!("{}", message);
+                }
+            }
+            ParamChange::HaircutFxBps(v) => {
+                preview.haircut_fx_bps = *v;
+                if let Err(message) = preview.validate(&env, &asset) {
+                    panic!("{}", message);
+                }
+            }
+            _ => {}
+        }
 
         let id = timelock::next_id(&env);
         let key = DataKey::PendingParam(id);
@@ -242,6 +280,19 @@ impl Registry {
             (Symbol::new(&env, "param_executed"), id),
             (pending.asset, change, config),
         );
+    }
+
+    /// The queued parameter change for `id`, if one is still pending. Returns `None` for unknown,
+    /// already-executed or cancelled ids. Read-only: it neither mutates state nor extends TTLs.
+    pub fn pending_param(env: Env, id: u64) -> Option<PendingParamView> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingParam(id))
+            .map(|pending: PendingParamChange| PendingParamView {
+                asset: pending.asset,
+                change: pending.change,
+                executes_at: pending.executes_at,
+            })
     }
 
     /// The emergency brake (PRD §6.4/§8): raises `haircut_base_bps` immediately, with no
@@ -336,6 +387,18 @@ impl Registry {
         env.storage().persistent().remove(&key);
         env.events()
             .publish((Symbol::new(&env, "unpause_executed"), id), pending.scope);
+    }
+
+    /// The queued unpause for `id`, if one is still pending. Returns `None` for unknown,
+    /// already-executed or cancelled ids. Read-only: it neither mutates state nor extends TTLs.
+    pub fn pending_unpause(env: Env, id: u64) -> Option<PendingUnpauseView> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingUnpause(id))
+            .map(|pending: PendingUnpause| PendingUnpauseView {
+                scope: pending.scope,
+                executes_at: pending.executes_at,
+            })
     }
 
     pub fn is_paused(env: Env, scope: PauseScope) -> bool {
@@ -457,6 +520,85 @@ mod test {
 
         let updated = client.asset(&asset);
         assert_eq!(updated.haircut_base_bps, 700);
+    }
+
+    /// Runs `f` and returns the panic message it produced, or `None` if it did not panic.
+    fn panic_message(f: impl FnOnce()) -> Option<String> {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
+        let message = if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            String::new()
+        };
+        Some(message)
+    }
+
+    #[test]
+    fn execute_param_rejects_an_unknown_id() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        let message = panic_message(|| client.execute_param(&999)).expect("unknown id must fail");
+        assert!(
+            message.contains("registry: no such pending change"),
+            "unexpected panic message: {message}"
+        );
+    }
+
+    #[test]
+    fn execute_param_cannot_be_replayed_once_executed() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(700));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        let after_first = client.asset(&asset);
+        assert_eq!(after_first.haircut_base_bps, 700);
+
+        // The pending entry is deleted on success, so the same id has nothing left to apply.
+        let message = panic_message(|| client.execute_param(&id))
+            .expect("a second execution of the same id must fail");
+        assert!(
+            message.contains("registry: no such pending change"),
+            "unexpected panic message: {message}"
+        );
+        let after_second = client.asset(&asset);
+        assert_eq!(after_second.haircut_base_bps, after_first.haircut_base_bps);
+        assert_eq!(after_second.haircut_fx_bps, after_first.haircut_fx_bps);
+        assert_eq!(after_second.price_band_bps, after_first.price_band_bps);
+        assert_eq!(
+            after_second.daily_move_band_bps,
+            after_first.daily_move_band_bps
+        );
+        assert_eq!(after_second.redemption_lag_days, after_first.redemption_lag_days);
+        assert_eq!(after_second.status, after_first.status);
+    }
+
+    #[test]
+    fn execute_param_rejects_a_queued_unpause_id() {
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        let message = panic_message(|| client.execute_param(&unpause_id))
+            .expect("an unpause id must not be executable as a param change");
+        assert!(
+            message.contains("registry: no such pending change"),
+            "unexpected panic message: {message}"
+        );
+
+        // The failed call leaves the queued unpause intact and still executable as an unpause.
+        assert!(client.is_paused(&PauseScope::Draws));
+        client.execute_unpause(&unpause_id);
+        assert!(!client.is_paused(&PauseScope::Draws));
     }
 
     #[test]
@@ -674,16 +816,11 @@ mod test {
 
     #[test]
     fn pause_is_immediate_unpause_is_timelocked() {
-        let (env, client, admin, _risk, asset) = setup();
-        let _ = asset;
+        let (env, client, admin, _risk, _asset) = setup();
 
-        let pauser = Address::generate(&env);
-        // Re-initialize isn't possible; instead call pause with the actual configured pauser by
-        // reading it back out is not exposed, so this test exercises the read-your-writes path
-        // via `is_paused` using the pauser captured at setup time instead.
-        let _ = pauser;
-
-        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        // The configured pauser is read back through the public `roles()` getter rather than
+        // poking storage, so this also pins the read-your-writes path for role addresses.
+        client.pause(&client.roles().pauser, &PauseScope::Draws);
         assert!(client.is_paused(&PauseScope::Draws));
 
         let id = client.queue_unpause(&admin, &PauseScope::Draws);
@@ -1070,10 +1207,62 @@ mod test {
         });
 
         // Execution must fail because the pending entry was removed
+        let msg = panic_message(|| client.execute_param(&id))
+            .expect("execute_param should panic after cancellation");
+        assert!(msg.contains("registry: no such pending change"));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn cancel_param_rejects_an_unknown_id() {
+        let (_env, client, admin, _risk, _asset) = setup();
+        client.cancel_param(&admin, &999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending change")]
+    fn cancel_param_after_execute_fails() {
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(900));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        // Cancel after execution must panic
+        client.cancel_param(&admin, &id);
+    }
+
+    #[test]
+    fn a_stranger_cannot_cancel_param() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _risk, asset) = setup();
+        let id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(900));
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_param",
+                args: (&stranger, id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.execute_param(&id);
+            client.cancel_param(&stranger, &id);
         }));
-        assert!(result.is_err(), "execute_param should fail after cancellation");
+        assert!(result.is_err(), "only the stored admin may cancel a param change");
+
+        // The queued param change is still intact and can be executed after 48h
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        assert_eq!(client.asset(&asset).haircut_base_bps, 900);
     }
 
     #[test]
@@ -1092,11 +1281,150 @@ mod test {
             l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
         });
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.execute_unpause(&id);
-        }));
-        assert!(result.is_err(), "execute_unpause should fail after cancellation");
+        let msg = panic_message(|| client.execute_unpause(&id))
+            .expect("execute_unpause should panic after cancellation");
+        assert!(msg.contains("registry: no such pending unpause"));
         assert!(client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn cancel_unpause_rejects_an_unknown_id() {
+        let (_env, client, admin, _risk, _asset) = setup();
+        client.cancel_unpause(&admin, &999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn cancel_unpause_after_execute_fails() {
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        // Cancel after execution must panic
+        client.cancel_unpause(&admin, &id);
+    }
+
+    #[test]
+    fn a_stranger_cannot_cancel_unpause() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cancel_unpause",
+                args: (&stranger, id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_unpause(&stranger, &id);
+        }));
+        assert!(result.is_err(), "only the stored admin may cancel an unpause");
+
+        // The queued unpause is still intact and can be executed after 48h
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        assert!(!client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn execute_unpause_rejects_an_unknown_id() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        client.execute_unpause(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: no such pending unpause")]
+    fn execute_unpause_cannot_be_replayed_once_executed() {
+        let (env, client, admin, _risk, _asset) = setup();
+        client.pause(&client_pauser(&env, &client), &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        assert!(!client.is_paused(&PauseScope::Draws));
+
+        // The pending entry is deleted on success, so the same id has nothing left to apply.
+        client.execute_unpause(&id);
+    }
+
+    #[test]
+    fn a_replayed_execute_unpause_does_not_undo_a_later_pause() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let pauser = client_pauser(&env, &client);
+        client.pause(&pauser, &PauseScope::Draws);
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        // Pausing again after the unpause must stick, and a second execute of the old id must
+        // fail without lifting it.
+        client.pause(&pauser, &PauseScope::Draws);
+        let replay = client.try_execute_unpause(&id);
+        assert!(replay.is_err());
+        assert!(client.is_paused(&PauseScope::Draws));
+    }
+
+    #[test]
+    fn unpausing_all_leaves_a_separately_paused_scope_paused() {
+        let (env, client, admin, _risk, _asset) = setup();
+        let pauser = client_pauser(&env, &client);
+        client.pause(&pauser, &PauseScope::Draws);
+        client.pause(&pauser, &PauseScope::All);
+        assert!(client.is_paused(&PauseScope::Pledges));
+
+        let id = client.queue_unpause(&admin, &PauseScope::All);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        // `All` is its own flag: clearing it does not clear the per-scope flag set earlier.
+        assert!(!client.is_paused(&PauseScope::All));
+        assert!(client.is_paused(&PauseScope::Draws));
+        assert!(!client.is_paused(&PauseScope::Pledges));
+        assert!(!client.is_paused(&PauseScope::Exits));
+        assert!(!client.is_paused(&PauseScope::Repos));
+    }
+
+    /// Recorded behaviour: `queue_unpause` does not check that the scope is currently paused, so
+    /// queuing and executing an unpause for a scope that is not paused succeeds and is a no-op.
+    /// Rejecting it would be a contract change; this test pins the current behaviour.
+    #[test]
+    fn unpausing_a_scope_that_is_not_paused_succeeds_as_a_no_op() {
+        let (env, client, admin, _risk, _asset) = setup();
+        assert!(!client.is_paused(&PauseScope::Exits));
+
+        let id = client.queue_unpause(&admin, &PauseScope::Exits);
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+
+        assert!(!client.is_paused(&PauseScope::Exits));
     }
 
     #[test]
@@ -1430,5 +1758,126 @@ mod test {
             assert_eq!(loaded.haircut_base_bps, 300);
             assert_eq!(loaded.status, config.status);
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: total haircut cannot exceed 100%")]
+    fn queued_haircut_base_and_fx_exceeding_100_percent_panics_on_execute() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        // Queue HaircutBaseBps(10_000) and HaircutFxBps(5_000) against the initial config
+        // (base = 300, fx = 0). Each is individually <= 10_000 against the initial sibling,
+        // but executing both would push total_haircut_bps to 15_000.
+        let id_base = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(10_000));
+        let id_fx = client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(5_000));
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+
+        client.execute_param(&id_base);
+        assert_eq!(client.asset(&asset).total_haircut_bps(), 10_000);
+
+        // The second execute must panic because 10_000 + 5_000 > 10_000.
+        client.execute_param(&id_fx);
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: total haircut cannot exceed 100%")]
+    fn queue_param_rejects_haircut_fx_when_sum_exceeds_100_percent_at_queue_time() {
+        let (env, client, admin, _risk, asset) = setup();
+
+        let id_base = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(10_000));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id_base);
+
+        // Now that haircut_base_bps is 10_000, queueing HaircutFxBps(5_000) is rejected immediately.
+        client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(5_000));
+    }
+
+    #[test]
+    #[should_panic(expected = "registry: haircut cannot exceed 100%")]
+    fn raise_haircut_now_rejects_when_combined_with_fx_exceeds_100_percent() {
+        let (env, client, admin, risk, asset) = setup();
+
+        let id_fx = client.queue_param(&admin, &asset, &ParamChange::HaircutFxBps(9_700));
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id_fx);
+        assert_eq!(client.asset(&asset).total_haircut_bps(), 10_000);
+
+        // Raising base by even 1 bps when base (300) + fx (9_700) == 10_000 must panic.
+        client.raise_haircut_now(&risk, &asset, &1);
+    }
+
+    #[test]
+    fn roles_returns_the_addresses_configured_at_initialize() {
+        let (_env, client, admin, risk, _asset) = setup();
+        let roles = client.roles();
+        assert_eq!(roles.admin, admin);
+        assert_eq!(roles.risk, risk);
+        // A second read is stable and does not mutate state.
+        assert_eq!(client.roles(), roles);
+    }
+
+    #[test]
+    fn pending_param_reports_queued_changes_and_none_once_gone() {
+        let (env, client, admin, _risk, asset) = setup();
+        assert_eq!(client.pending_param(&999), None);
+
+        let change = ParamChange::HaircutBaseBps(700);
+        let id = client.queue_param(&admin, &asset, &change);
+        let view = client
+            .pending_param(&id)
+            .expect("queued change must be visible");
+        assert_eq!(view.asset, asset);
+        assert_eq!(view.change, change);
+        assert_eq!(
+            view.executes_at,
+            env.ledger().timestamp() + ballast_common::timelock::TIMELOCK_DELAY_SECONDS
+        );
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_param(&id);
+        assert_eq!(client.pending_param(&id), None);
+    }
+
+    #[test]
+    fn pending_unpause_reports_queued_unpauses_and_none_once_gone() {
+        let (env, client, admin, _risk, _asset) = setup();
+        assert_eq!(client.pending_unpause(&999), None);
+
+        let id = client.queue_unpause(&admin, &PauseScope::Draws);
+        let view = client
+            .pending_unpause(&id)
+            .expect("queued unpause must be visible");
+        assert_eq!(view.scope, PauseScope::Draws);
+        assert_eq!(
+            view.executes_at,
+            env.ledger().timestamp() + ballast_common::timelock::TIMELOCK_DELAY_SECONDS
+        );
+
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+        client.execute_unpause(&id);
+        assert_eq!(client.pending_unpause(&id), None);
+    }
+
+    #[test]
+    fn cancelled_pending_entries_report_none() {
+        let (_env, client, admin, _risk, asset) = setup();
+        let param_id = client.queue_param(&admin, &asset, &ParamChange::HaircutBaseBps(700));
+        client.cancel_param(&admin, &param_id);
+        assert_eq!(client.pending_param(&param_id), None);
+
+        let unpause_id = client.queue_unpause(&admin, &PauseScope::Draws);
+        client.cancel_unpause(&admin, &unpause_id);
+        assert_eq!(client.pending_unpause(&unpause_id), None);
     }
 }

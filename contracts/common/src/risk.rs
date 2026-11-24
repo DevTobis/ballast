@@ -44,6 +44,20 @@ pub fn ltv_bps(debt: i128, collateral_value: i128) -> u32 {
     bps.clamp(0, u32::MAX as i128) as u32
 }
 
+/// Panics unless `haircut_bps` is at most 100% ([`BPS_DENOMINATOR`]).
+///
+/// [`collateral_value`] makes the same check, but only when a position is valued, which is after
+/// the asset's config has been stored: a haircut above 100% would be accepted and would then make
+/// every later valuation of that asset panic. A contract calls this where the haircut is
+/// configured, so a value that cannot be used is refused up front, and every contract that takes
+/// a haircut refuses the same inputs with the same message.
+pub fn validate_haircut_bps(haircut_bps: u32) {
+    assert!(
+        haircut_bps as i128 <= BPS_DENOMINATOR,
+        "risk: haircut_bps cannot exceed 10000 bps (100%)"
+    );
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -159,6 +173,107 @@ mod test {
                 lhs <= rhs,
                 "Result exceeds exact rational value: {lhs} > {rhs} for units={units}, price={price}, haircut={haircut_bps}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_haircut_bps_accepts_zero_up_to_exactly_one_hundred_percent() {
+        validate_haircut_bps(0);
+        validate_haircut_bps(500);
+        validate_haircut_bps(10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
+    fn validate_haircut_bps_rejects_one_bp_over_one_hundred_percent() {
+        validate_haircut_bps(10_001);
+    }
+
+    #[test]
+    #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
+    fn validate_haircut_bps_rejects_the_largest_u32() {
+        validate_haircut_bps(u32::MAX);
+    }
+
+    /// The point of validating up front: whatever passes can always be valued later.
+    #[test]
+    fn a_validated_haircut_never_makes_collateral_value_panic() {
+        for haircut_bps in [0, 1, 5_000, 9_999, 10_000] {
+            validate_haircut_bps(haircut_bps);
+            assert!(collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, haircut_bps) >= 0);
+        }
+        // A 100% haircut is the edge of what is usable: the position is worth nothing.
+        assert_eq!(
+            collateral_value(1_000 * PRICE_SCALE, PRICE_SCALE, 10_000),
+            0
+        );
+    }
+
+    // --- property tests (issue #87) -----------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn prop_collateral_value_monotonicity(
+            u1 in 0i128..=10_000_000_000_000_000i128,
+            u2 in 0i128..=10_000_000_000_000_000i128,
+            p1 in 0i128..=10_000_000_000_000_000i128,
+            p2 in 0i128..=10_000_000_000_000_000i128,
+            h1 in 0u32..=10_000u32,
+            h2 in 0u32..=10_000u32,
+        ) {
+            let (min_u, max_u) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+            let (min_p, max_p) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
+            let (min_h, max_h) = if h1 <= h2 { (h1, h2) } else { (h2, h1) };
+
+            // Non-decreasing in units: u1 <= u2 => cv(u1, p, h) <= cv(u2, p, h)
+            prop_assert!(collateral_value(min_u, p1, h1) <= collateral_value(max_u, p1, h1));
+
+            // Non-decreasing in price: p1 <= p2 => cv(u, p1, h) <= cv(u, p2, h)
+            prop_assert!(collateral_value(u1, min_p, h1) <= collateral_value(u1, max_p, h1));
+
+            // Non-increasing in haircut: h1 <= h2 => cv(u, p, h1) >= cv(u, p, h2)
+            prop_assert!(collateral_value(u1, p1, min_h) >= collateral_value(u1, p1, max_h));
+        }
+
+        #[test]
+        fn prop_ltv_bps_monotonicity(
+            d1 in 0i128..=10_000_000_000_000_000i128,
+            d2 in 0i128..=10_000_000_000_000_000i128,
+            c1 in 0i128..=10_000_000_000_000_000i128,
+            c2 in 0i128..=10_000_000_000_000_000i128,
+        ) {
+            let (min_d, max_d) = if d1 <= d2 { (d1, d2) } else { (d2, d1) };
+            let (min_c, max_c) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+
+            // Non-decreasing in debt: d1 <= d2 => ltv(d1, c) <= ltv(d2, c)
+            prop_assert!(ltv_bps(min_d, c1) <= ltv_bps(max_d, c1));
+
+            // Non-increasing in collateral value: c1 <= c2 => ltv(d, c1) >= ltv(d, c2)
+            prop_assert!(ltv_bps(d1, min_c) >= ltv_bps(d1, max_c));
+        }
+
+        #[test]
+        fn prop_collateral_value_upper_bounded_by_gross(
+            units in 0i128..=10_000_000_000_000_000i128,
+            guarded_price in 0i128..=10_000_000_000_000_000i128,
+            haircut_bps in 0u32..=10_000u32,
+        ) {
+            let gross = (units * guarded_price) / PRICE_SCALE;
+            let cv = collateral_value(units, guarded_price, haircut_bps);
+            prop_assert!(cv <= gross);
+        }
+
+        #[test]
+        fn prop_ltv_bps_never_panics_below_1e30(
+            debt in 0i128..=1_000_000_000_000_000_000_000_000_000_000i128,
+            collateral_value in 0i128..=1_000_000_000_000_000_000_000_000_000_000i128,
+        ) {
+            let ltv = ltv_bps(debt, collateral_value);
+            prop_assert!(ltv <= u32::MAX);
         }
     }
 }
