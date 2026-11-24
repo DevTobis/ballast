@@ -11,8 +11,12 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// `haircut_bps` is basis points out of 10,000 and is the *total* haircut (base + liquidity +
 /// FX + concentration add-ons, already summed by the caller per PRD §6.4).
 ///
-/// Rounding: Integer division truncates toward zero at each step (rounds down for positive inputs,
-/// never rounding up), ensuring collateral is never over-valued.
+/// Rounding: always down, never up. The value is computed in two steps, each an integer division
+/// that truncates toward zero: `gross = units * guarded_price / PRICE_SCALE`, then
+/// `gross * (10_000 - haircut_bps) / 10_000`. For non-negative inputs each truncation can only
+/// lower the result, so it is never above the exact rational value
+/// `units * guarded_price * (10_000 - haircut_bps) / (PRICE_SCALE * 10_000)`, and collateral is
+/// never over-valued (`CreditLine`, `PledgeVault` and `RepoDvP` all value positions with this).
 pub fn collateral_value(units: i128, guarded_price: i128, haircut_bps: u32) -> i128 {
     assert!(
         haircut_bps as i128 <= BPS_DENOMINATOR,
@@ -82,21 +86,16 @@ mod test {
         assert_eq!(ltv_bps(0, 0), 0);
     }
 
-    // Issue #118: risk::collateral_value haircut boundaries: 0, 10_000 and 10_001 bps
+    // --- collateral_value haircut boundaries (issue #118) --------------------------------------
+    // The 10_000 bps -> 0 boundary is asserted in
+    // `a_validated_haircut_never_makes_collateral_value_panic` below.
+
     #[test]
     fn collateral_value_haircut_zero_returns_gross() {
         let units = 1_000 * PRICE_SCALE;
         let price = PRICE_SCALE;
         let v = collateral_value(units, price, 0);
         assert_eq!(v, 1_000 * PRICE_SCALE);
-    }
-
-    #[test]
-    fn collateral_value_haircut_10_000_returns_zero() {
-        let units = 1_000 * PRICE_SCALE;
-        let price = PRICE_SCALE;
-        let v = collateral_value(units, price, 10_000);
-        assert_eq!(v, 0);
     }
 
     #[test]
@@ -107,7 +106,7 @@ mod test {
         collateral_value(units, price, 10_001);
     }
 
-    // Issue #119: risk::collateral_value rounding with non-round inputs
+    // --- collateral_value rounding (issue #119) -----------------------------------------------
     #[test]
     fn collateral_value_rounding_with_non_round_inputs() {
         // Table of (units, price, haircut_bps, expected)

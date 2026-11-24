@@ -160,7 +160,7 @@ enum DataKey {
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
 /// NAV message's `ts`/`value` segments on-chain — mirrors `alloc_free_sort` above in spirit
 /// (stack-only buffers, no heap).
-pub(crate) mod decimal_ascii {
+mod decimal_ascii {
     use soroban_sdk::{Bytes, Env};
 
     /// u64::MAX is 20 digits.
@@ -3291,181 +3291,108 @@ mod test {
         client.remove_source(&admin, &asset, &feed_name);
     }
 
-    // Issue #116: Test publish_nav failure modes: unconfigured asset and missing issuer key
+    // --- publish_nav / publish_source / guarded_price failure modes (issue #116) -------------
+    //
+    // These use `setup_fresh_deployment`, not `setup`: `setup` turns the signature requirement
+    // off, which would hide the missing-issuer-key panic.
+
     #[test]
     #[should_panic(expected = "price-guard: asset not configured")]
-    fn publish_nav_unconfigured_asset_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(PriceGuard, ());
-        let client = PriceGuardClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let pauser = Address::generate(&env);
-        let keeper = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let risk = Address::generate(&env);
-        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
-
-        let unconfigured_asset = Address::generate(&env);
-        let code = asset_code(&env);
+    fn publish_nav_for_an_unconfigured_asset_panics() {
+        let (env, client, _admin, publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        let never_configured = Address::generate(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &unconfigured_asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &never_configured, &asset_code(&env), &SCALE, &now, &sig);
     }
 
     #[test]
-    #[should_panic(expected = "no issuer public key configured")]
-    fn publish_nav_missing_issuer_key_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(PriceGuard, ());
-        let client = PriceGuardClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let pauser = Address::generate(&env);
-        let keeper = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let risk = Address::generate(&env);
-        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
-
-        let asset = Address::generate(&env);
-        client.configure_asset(
-            &admin,
-            &asset,
-            &50,
-            &100,
-            &DEFAULT_WINDOW_SECONDS,
-            &DEFAULT_WINDOW_MOVE_BAND_BPS,
-            &3600,
-        );
-
-        // Signature requirement is enabled by default, but configure_issuer_key is not called.
-        let code = asset_code(&env);
+    #[should_panic(
+        expected = "price-guard: no issuer public key configured for asset (call configure_issuer_key)"
+    )]
+    fn publish_nav_with_signature_required_and_no_issuer_key_panics() {
+        let (env, client, _admin, publisher, _risk, asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        // Fresh deployment: the requirement defaults to on and `configure_issuer_key` was never
+        // called for `asset`.
+        assert!(client.require_nav_signature());
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &asset_code(&env), &SCALE, &now, &sig);
     }
 
     #[test]
-    fn publish_nav_with_signature_requirement_off_succeeds_without_issuer_key() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(PriceGuard, ());
-        let client = PriceGuardClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let pauser = Address::generate(&env);
-        let keeper = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let risk = Address::generate(&env);
-        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
-
-        let asset = Address::generate(&env);
-        client.configure_asset(
-            &admin,
-            &asset,
-            &50,
-            &100,
-            &DEFAULT_WINDOW_SECONDS,
-            &DEFAULT_WINDOW_MOVE_BAND_BPS,
-            &3600,
-        );
-
-        // Turn signature requirement off
+    fn publish_nav_with_signature_requirement_off_succeeds_without_an_issuer_key() {
+        let (env, client, admin, publisher, _risk, asset) =
+            setup_fresh_deployment(50, 100, 3_600);
         client.configure_signature_requirement(&admin, &false);
 
-        let code = asset_code(&env);
+        // Same call as the test above (no issuer key, zero signature), now accepted.
         let sig = BytesN::from_array(&env, &[0u8; 64]);
         let now = env.ledger().timestamp();
-        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_nav(&publisher, &asset, &asset_code(&env), &SCALE, &now, &sig);
 
-        // Verify guarded price can be queried
+        // The NAV was stored as a fresh source: with one more source the price is Ok at SCALE,
+        // which it could not be if the NAV had been dropped (one source alone is Degraded).
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Degraded);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
         let price = client.guarded_price(&asset);
-        assert_eq!(price.status, PriceStatus::Degraded);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, SCALE);
     }
 
     #[test]
     #[should_panic(expected = "price-guard: asset not configured")]
-    fn guarded_price_unconfigured_asset_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(PriceGuard, ());
-        let client = PriceGuardClient::new(&env, &id);
-        let unconfigured_asset = Address::generate(&env);
-        client.guarded_price(&unconfigured_asset);
+    fn guarded_price_for_an_unconfigured_asset_panics() {
+        let (env, client, _admin, _publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        client.guarded_price(&Address::generate(&env));
     }
 
     #[test]
     #[should_panic(expected = "price-guard: asset not configured")]
-    fn publish_source_unconfigured_asset_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(PriceGuard, ());
-        let client = PriceGuardClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let pauser = Address::generate(&env);
-        let keeper = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let risk = Address::generate(&env);
-        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
-
-        let unconfigured_asset = Address::generate(&env);
+    fn publish_source_for_an_unconfigured_asset_panics() {
+        let (env, client, _admin, publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3_600);
         let now = env.ledger().timestamp();
-        client.publish_source(
-            &publisher,
-            &unconfigured_asset,
-            &Symbol::new(&env, "redston"),
-            &SCALE,
-            &now,
-        );
+        client.publish_source(&publisher, &Address::generate(&env), &feed(&env), &SCALE, &now);
     }
 
-    // Issue #121: Test the decimal_ascii u64 and i128 encoders against std formatting
-    #[test]
-    fn decimal_ascii_u64_matches_std_formatting() {
-        let env = Env::default();
-        let vectors: [u64; 5] = [
-            0,
-            9,
-            10,
-            1_700_000_000,
-            u64::MAX,
-        ];
+    // --- decimal_ascii encoders vs std formatting (issue #121) ---------------------------------
+    //
+    // These bytes go into the signed NAV message, so one wrong digit makes every valid signature
+    // fail to verify. `format!` is the oracle.
 
-        for n in vectors {
-            let bytes = decimal_ascii::u64_to_bytes(&env, n);
+    #[test]
+    fn decimal_ascii_u64_to_bytes_matches_std_formatting() {
+        let env = Env::default();
+        for n in [0u64, 9, 10, 1_700_000_000, u64::MAX] {
             let expected = format!("{}", n);
-            let mut actual = [0u8; 32];
-            let len = bytes.len() as usize;
-            bytes.copy_into_slice(&mut actual[..len]);
-            assert_eq!(&actual[..len], expected.as_bytes(), "Mismatch for u64: {n}");
-            if n == u64::MAX {
-                assert_eq!(bytes.len(), 20, "u64::MAX must fill 20 digits");
-            }
+            assert_eq!(
+                decimal_ascii::u64_to_bytes(&env, n),
+                Bytes::from_slice(&env, expected.as_bytes()),
+                "u64_to_bytes({n})"
+            );
         }
+        // u64::MAX is 20 digits: it fills the 20-byte buffer exactly, no truncation.
+        assert_eq!(decimal_ascii::u64_to_bytes(&env, u64::MAX).len(), 20);
     }
 
     #[test]
-    fn decimal_ascii_i128_matches_std_formatting() {
+    fn decimal_ascii_i128_to_bytes_matches_std_formatting() {
         let env = Env::default();
-        let vectors: [i128; 6] = [
-            0,
-            1,
-            -1,
-            10_000_000,
-            i128::MAX,
-            i128::MIN,
-        ];
-
-        for n in vectors {
-            let bytes = decimal_ascii::i128_to_bytes(&env, n);
+        for n in [0i128, 1, -1, 10_000_000, i128::MAX, i128::MIN] {
             let expected = format!("{}", n);
-            let mut actual = [0u8; 64];
-            let len = bytes.len() as usize;
-            bytes.copy_into_slice(&mut actual[..len]);
-            assert_eq!(&actual[..len], expected.as_bytes(), "Mismatch for i128: {n}");
-            if n == i128::MIN {
-                assert_eq!(bytes.len(), 40, "i128::MIN must be exactly 40 bytes (39 digits + minus)");
-            }
+            assert_eq!(
+                decimal_ascii::i128_to_bytes(&env, n),
+                Bytes::from_slice(&env, expected.as_bytes()),
+                "i128_to_bytes({n})"
+            );
         }
+        // i128::MAX is 39 digits; i128::MIN is 39 digits plus `-`, exactly the 40-byte buffer.
+        assert_eq!(decimal_ascii::i128_to_bytes(&env, i128::MAX).len(), 39);
+        assert_eq!(decimal_ascii::i128_to_bytes(&env, i128::MIN).len(), 40);
     }
 
     #[test]
