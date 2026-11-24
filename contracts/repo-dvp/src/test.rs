@@ -192,6 +192,8 @@ fn setup() -> Harness {
             margin_call_bps: 8_000,
             liquidation_bps: 9_500,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
     MockPriceGuardClient::new(&env, &price_guard).set_price(
         &rwa,
@@ -848,6 +850,56 @@ fn default_before_the_cure_window_ends_is_refused() {
 }
 
 #[test]
+fn unwind_clears_pending_margin_call_and_cure_deadline() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    repo.call_margin(&h.keeper, &id);
+    let trade = repo.trade(&id);
+    assert!(trade.pending_margin_call);
+    assert!(trade.margin_call_amount > 0);
+    assert!(trade.cure_deadline.is_some());
+
+    // Advance to maturity and source repayment cash
+    let maturity = trade.maturity_at;
+    let settled_at = trade.settled_at.unwrap();
+    let due = total_due(&trade, settled_at);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &due);
+    h.env.ledger().set_timestamp(maturity);
+
+    repo.unwind(&h.cash_borrower, &id);
+
+    let unwound = repo.trade(&id);
+    assert_eq!(unwound.status, RepoStatus::Unwound);
+    assert!(!unwound.pending_margin_call, "pending_margin_call must be false");
+    assert_eq!(unwound.margin_call_amount, 0, "margin_call_amount must be 0");
+    assert_eq!(unwound.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
+fn default_close_clears_pending_margin_call_and_cure_deadline() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    repo.call_margin(&h.keeper, &id);
+    let trade = repo.trade(&id);
+    assert!(trade.pending_margin_call);
+    assert!(trade.margin_call_amount > 0);
+    let deadline = trade.cure_deadline.expect("cure deadline should be set");
+
+    h.env.ledger().set_timestamp(deadline);
+    repo.default_close(&h.keeper, &id);
+
+    let defaulted = repo.trade(&id);
+    assert_eq!(defaulted.status, RepoStatus::Defaulted);
+    assert!(!defaulted.pending_margin_call, "pending_margin_call must be false");
+    assert_eq!(defaulted.margin_call_amount, 0, "margin_call_amount must be 0");
+    assert_eq!(defaulted.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
 fn margin_view_reports_the_position_without_changing_it() {
     let h = setup();
     let id = settled_under_margin(&h);
@@ -863,6 +915,41 @@ fn margin_view_reports_the_position_without_changing_it() {
         &h.rwa, &PRICE_SCALE, &PriceStatus::Degraded, &h.env.ledger().timestamp(),
     );
     assert!(!repo.margin_view(&id).price_ok);
+}
+
+#[test]
+fn margin_exposure_stops_accruing_after_maturity_matching_unwind_total_due() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let trade = repo.trade(&id);
+    let settled_at = trade.settled_at.unwrap();
+    let maturity_at = trade.maturity_at;
+
+    // Advance to maturity: exposure must equal total_due at maturity
+    h.env.ledger().set_timestamp(maturity_at);
+    let view_at_maturity = repo.margin_view(&id);
+    let expected_due = total_due(&trade, settled_at);
+    assert_eq!(view_at_maturity.exposure, expected_due);
+
+    // Advance 7 days past maturity: exposure must not grow further and still match expected_due
+    h.env.ledger().set_timestamp(maturity_at + 7 * 86_400);
+    let view_post_maturity = repo.margin_view(&id);
+    assert_eq!(view_post_maturity.exposure, expected_due);
+
+    // Call margin past maturity: verify margin_call_amount is sized from expected_due
+    repo.call_margin(&h.keeper, &id);
+    let trade_called = repo.trade(&id);
+    assert!(trade_called.pending_margin_call);
+
+    // Advance past cure deadline and default_close: lender units are sized using exposure which equals expected_due
+    let deadline = trade_called.cure_deadline.unwrap();
+    h.env.ledger().set_timestamp(deadline + 10);
+    repo.default_close(&h.keeper, &id);
+
+    // At $1.00 price, lender_units = ceil(exposure / price) = expected_due
+    let lender_units = rwa_balance(&h, &h.cash_lender);
+    assert_eq!(lender_units, expected_due);
 }
 
 #[test]
@@ -1146,6 +1233,8 @@ fn configure_asset_accepts_valid_thresholds() {
             margin_call_bps: 8_000,
             liquidation_bps: 9_000,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
 
     // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
@@ -1159,6 +1248,8 @@ fn configure_asset_accepts_valid_thresholds() {
             margin_call_bps: 9_999,
             liquidation_bps: 10_000,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
 }
 
@@ -1180,6 +1271,8 @@ fn configure_asset_rejects_equal_thresholds() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res1.is_err(), "warning == margin_call must be rejected");
@@ -1196,6 +1289,8 @@ fn configure_asset_rejects_equal_thresholds() {
                 margin_call_bps: 9_000,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "margin_call == liquidation must be rejected");
@@ -1218,6 +1313,8 @@ fn configure_asset_rejects_zero_thresholds() {
                 margin_call_bps: 0,
                 liquidation_bps: 0,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res.is_err(), "zero thresholds must be rejected");
@@ -1234,6 +1331,8 @@ fn configure_asset_rejects_zero_thresholds() {
                 margin_call_bps: 0,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "zero margin_call_bps must be rejected");
@@ -1257,6 +1356,8 @@ fn configure_asset_rejects_out_of_order_thresholds() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_500,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res1.is_err(), "warning > margin_call must be rejected");
@@ -1273,6 +1374,8 @@ fn configure_asset_rejects_out_of_order_thresholds() {
                 margin_call_bps: 9_500,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "margin_call > liquidation must be rejected");
@@ -1295,11 +1398,165 @@ fn configure_asset_rejects_liquidation_exceeding_10000() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 10_001,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res.is_err(), "liquidation > 10000 must be rejected");
-    }
+}
 
+#[test]
+fn configure_asset_validates_positive_limits() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let new_asset = Address::generate(&h.env);
+    let thresholds = MarginThresholds {
+        warning_bps: 7_000,
+        margin_call_bps: 8_000,
+        liquidation_bps: 9_000,
+    };
+
+    // max_cash_per_trade == 0
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &thresholds,
+            &0i128,
+            &(30 * 24 * 3_600u64),
+        );
+    }));
+    assert!(res1.is_err(), "zero max_cash_per_trade must be rejected");
+
+    // max_cash_per_trade < 0
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &thresholds,
+            &-100i128,
+            &(30 * 24 * 3_600u64),
+        );
+    }));
+    assert!(res2.is_err(), "negative max_cash_per_trade must be rejected");
+
+    // max_term_seconds == 0
+    let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &h.price_guard,
+            &500u32,
+            &thresholds,
+            &1_000_000_000_000i128,
+            &0u64,
+        );
+    }));
+    assert!(res3.is_err(), "zero max_term_seconds must be rejected");
+}
+
+#[test]
+fn propose_and_settle_enforces_per_asset_risk_limits() {
+    let h = setup();
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let capped_asset = h.rwa.clone();
+
+    // Max cash 50 USDC, max term 2 hours (7200 seconds)
+    let max_cash = 50 * PRICE_SCALE;
+    let max_term = 7_200u64;
+
+    repo.configure_asset(
+        &h.admin,
+        &capped_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+        &max_cash,
+        &max_term,
+    );
+
+    let units = 100 * PRICE_SCALE;
+    let valid_maturity = h.env.ledger().timestamp() + 3_600; // 1h (within 2h)
+
+    // 1. Propose exceeds max_cash_per_trade (51 cash > 50 max_cash) -> rejected
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &capped_asset,
+            &units,
+            &(max_cash + 1),
+            &500u32,
+            &RepoKind::Intraday,
+            &valid_maturity,
+            &hash(&h, 7),
+        );
+    }));
+    assert!(res1.is_err(), "propose exceeding max_cash must be rejected");
+
+    // 2. Propose exceeds max_term_seconds (7201 seconds > 7200 max_term) -> rejected
+    let over_term_maturity = h.env.ledger().timestamp() + max_term + 1;
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &capped_asset,
+            &units,
+            &max_cash,
+            &500u32,
+            &RepoKind::Intraday,
+            &over_term_maturity,
+            &hash(&h, 7),
+        );
+    }));
+    assert!(res2.is_err(), "propose exceeding max_term must be rejected");
+
+    // 3. Propose within limits -> succeeds
+    let id = repo.propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &capped_asset,
+        &units,
+        &max_cash,
+        &500u32,
+        &RepoKind::Intraday,
+        &valid_maturity,
+        &hash(&h, 7),
+    );
+    assert_eq!(repo.trade(&id).status, RepoStatus::Proposed);
+
+    // 4. If limits are lowered after proposal, accept_and_settle rejects oversized trade
+    repo.configure_asset(
+        &h.admin,
+        &capped_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+        &(max_cash - 10 * PRICE_SCALE), // limit lowered to 40
+        &max_term,
+    );
+    MockTokenClient::new(&h.env, &capped_asset).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &max_cash);
+
+    let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(res3.is_err(), "settle exceeding lowered max_cash must be rejected");
+}
+
+#[test]
 fn disabled_asset_blocks_propose_and_accept_and_settle() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
@@ -1438,6 +1695,8 @@ mod sac {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_500,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
         MockPriceGuardClient::new(&env, &price_guard).set_price(
             &rwa,
@@ -2208,7 +2467,15 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.set_cure_grace(&h.admin, &3_600));
         extends_the_instance(&h, |repo| repo.set_maturity_grace(&h.admin, &3_600));
         extends_the_instance(&h, |repo| {
-            repo.configure_asset(&h.admin, &h.rwa, &h.price_guard, &500, &thresholds)
+            repo.configure_asset(
+                &h.admin,
+                &h.rwa,
+                &h.price_guard,
+                &500,
+                &thresholds,
+                &1_000_000_000_000i128,
+                &(30 * 24 * 3_600u64),
+            )
         });
         extends_the_instance(&h, |repo| repo.disable_asset(&h.admin, &h.rwa));
         extends_the_instance(&h, |repo| repo.enable_asset(&h.admin, &h.rwa));
@@ -2289,5 +2556,179 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.call_margin(&h.keeper, &id));
         let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
         assert!(!trade.pending_margin_call);
+    }
+}
+
+/// Contract event assertions serving as the formal contract between RepoDvp and off-chain
+/// consumers (services/indexer and services/ledger) as specified in AUDIT_NOTES.md.
+///
+/// Event schemas emitted by `RepoDvp`:
+/// - `unwind`: `topics: [Symbol("unwind"), u64(trade_id)]`, `data: i128(total_due)`
+///   Emitted when a repo is successfully unwound by repaying cash leg 2.
+/// - `mcall`: `topics: [Symbol("mcall"), u64(trade_id)]`, `data: i128(margin_call_amount)`
+///   Emitted when a margin call is opened or updated on an undercollateralized repo.
+/// - `cured`: `topics: [Symbol("cured"), u64(trade_id)]`, `data: i128(0)`
+///   Emitted when a previously pending margin call is cleared due to collateral price recovery.
+/// - `topup`: `topics: [Symbol("topup"), u64(trade_id)]`, `data: (i128(extra_units), bool(cured))`
+///   Emitted when a borrower deposits additional collateral units into escrow, indicating whether
+///   the position was cured in the same transaction.
+/// - `default`: `topics: [Symbol("default"), u64(trade_id)]`, `data: (i128(lender_units), i128(borrower_units))`
+///   Emitted when an expired margin call is defaulted via `default_close`, transferring collateral
+///   to the lender up to exposure and returning surplus to the borrower.
+/// - `mat_def`: `topics: [Symbol("mat_def"), u64(trade_id)]`, `data: (i128(lender_units), i128(borrower_units))`
+///   Emitted when an un-repaid trade is defaulted past maturity grace via `default_at_maturity`.
+mod indexer_events {
+    use super::*;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal, TryFromVal, Val, Vec};
+
+    fn settled_trade(h: &Harness, term_seconds: u64) -> u64 {
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 50 * PRICE_SCALE;
+        let maturity = h.env.ledger().timestamp() + term_seconds;
+        let id = propose(h, units, cash_amount, 500, maturity);
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+        id
+    }
+
+    fn assert_event<D: IntoVal<Env, Val>>(
+        h: &Harness,
+        events: &soroban_sdk::testutils::ContractEvents,
+        expected_topic0: Symbol,
+        expected_id: u64,
+        expected_data: D,
+    ) {
+        let filtered = events.filter_by_contract(&h.repo);
+        let last = filtered
+            .events()
+            .last()
+            .expect("expected an event emitted by repo-dvp");
+        let expected_topics: Vec<Val> = (expected_topic0, expected_id).into_val(&h.env);
+        let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+        let data_val: Val = expected_data.into_val(&h.env);
+        let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+            .expect("failed to convert expected data to ScVal");
+        match &last.body {
+            soroban_sdk::xdr::ContractEventBody::V0(body) => {
+                assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+                assert_eq!(body.data, expected_data_xdr, "data mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn unwind_emits_unwind_event_with_total_due() {
+        let h = setup();
+        let id = settled_trade(&h, 3_600);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let settled_at = trade.settled_at.unwrap();
+        h.env.ledger().set_timestamp(settled_at + 3_600);
+
+        let expected_total_due = total_due(&trade, settled_at);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &expected_total_due);
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_borrower, &id);
+        let events = h.env.events().all();
+
+        assert_event(&h, &events, symbol_short!("unwind"), id, expected_total_due);
+    }
+
+    #[test]
+    fn call_margin_emits_mcall_event_with_margin_call_amount() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let trade = repo.trade(&id);
+        assert!(trade.pending_margin_call);
+        assert!(trade.margin_call_amount > 0);
+
+        assert_event(&h, &events, symbol_short!("mcall"), id, trade.margin_call_amount);
+    }
+
+    #[test]
+    fn call_margin_emits_cured_event_when_price_recovers() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Price doubles, restoring healthy LTV
+        set_price(&h, 2 * PRICE_SCALE);
+        repo.call_margin(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let trade = repo.trade(&id);
+        assert!(!trade.pending_margin_call);
+
+        assert_event(&h, &events, symbol_short!("cured"), id, 0i128);
+    }
+
+    #[test]
+    fn top_up_emits_topup_event_with_units_and_cured_flag() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Top up insufficient to cure (1 unit: still under margin call)
+        let small_extra = 1 * PRICE_SCALE;
+        repo.top_up(&h.cash_borrower, &id, &small_extra);
+        let events1 = h.env.events().all();
+        assert_event(&h, &events1, symbol_short!("topup"), id, (small_extra, false));
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Top up sufficient to cure (100 units: doubles collateral, cures call)
+        let cure_extra = 100 * PRICE_SCALE;
+        repo.top_up(&h.cash_borrower, &id, &cure_extra);
+        let events2 = h.env.events().all();
+        assert_event(&h, &events2, symbol_short!("topup"), id, (cure_extra, true));
+        assert!(!repo.trade(&id).pending_margin_call);
+    }
+
+    #[test]
+    fn default_close_emits_default_event_with_unit_distribution() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let borrower_before = rwa_balance(&h, &h.cash_borrower);
+
+        repo.call_margin(&h.keeper, &id);
+        let deadline = repo.trade(&id).cure_deadline.expect("cure deadline set");
+        h.env.ledger().set_timestamp(deadline);
+
+        repo.default_close(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let lender_units = rwa_balance(&h, &h.cash_lender);
+        let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
+        assert!(lender_units > 0);
+        assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
+
+        assert_event(&h, &events, symbol_short!("default"), id, (lender_units, borrower_units));
+    }
+
+    #[test]
+    fn default_at_maturity_emits_mat_def_event_with_unit_distribution() {
+        let h = setup();
+        let id = settled_trade(&h, 3_600);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let maturity = trade.maturity_at;
+        let grace = RepoDvpClient::new(&h.env, &h.repo).maturity_grace_seconds();
+        h.env.ledger().set_timestamp(maturity + grace);
+
+        let borrower_before = rwa_balance(&h, &h.cash_borrower);
+        RepoDvpClient::new(&h.env, &h.repo).default_at_maturity(&h.cash_lender, &id);
+        let events = h.env.events().all();
+
+        let lender_units = rwa_balance(&h, &h.cash_lender);
+        let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
+
+        assert_event(&h, &events, symbol_short!("mat_def"), id, (lender_units, borrower_units));
     }
 }

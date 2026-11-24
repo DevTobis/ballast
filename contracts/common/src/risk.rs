@@ -111,4 +111,72 @@ mod test {
             0
         );
     }
+
+    // --- property tests (issue #87) -----------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn prop_collateral_value_monotonicity(
+            u1 in 0i128..=10_000_000_000_000_000i128,
+            u2 in 0i128..=10_000_000_000_000_000i128,
+            p1 in 0i128..=10_000_000_000_000_000i128,
+            p2 in 0i128..=10_000_000_000_000_000i128,
+            h1 in 0u32..=10_000u32,
+            h2 in 0u32..=10_000u32,
+        ) {
+            let (min_u, max_u) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+            let (min_p, max_p) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
+            let (min_h, max_h) = if h1 <= h2 { (h1, h2) } else { (h2, h1) };
+
+            // Non-decreasing in units: u1 <= u2 => cv(u1, p, h) <= cv(u2, p, h)
+            prop_assert!(collateral_value(min_u, p1, h1) <= collateral_value(max_u, p1, h1));
+
+            // Non-decreasing in price: p1 <= p2 => cv(u, p1, h) <= cv(u, p2, h)
+            prop_assert!(collateral_value(u1, min_p, h1) <= collateral_value(u1, max_p, h1));
+
+            // Non-increasing in haircut: h1 <= h2 => cv(u, p, h1) >= cv(u, p, h2)
+            prop_assert!(collateral_value(u1, p1, min_h) >= collateral_value(u1, p1, max_h));
+        }
+
+        #[test]
+        fn prop_ltv_bps_monotonicity(
+            d1 in 0i128..=10_000_000_000_000_000i128,
+            d2 in 0i128..=10_000_000_000_000_000i128,
+            c1 in 0i128..=10_000_000_000_000_000i128,
+            c2 in 0i128..=10_000_000_000_000_000i128,
+        ) {
+            let (min_d, max_d) = if d1 <= d2 { (d1, d2) } else { (d2, d1) };
+            let (min_c, max_c) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+
+            // Non-decreasing in debt: d1 <= d2 => ltv(d1, c) <= ltv(d2, c)
+            prop_assert!(ltv_bps(min_d, c1) <= ltv_bps(max_d, c1));
+
+            // Non-increasing in collateral value: c1 <= c2 => ltv(d, c1) >= ltv(d, c2)
+            prop_assert!(ltv_bps(d1, min_c) >= ltv_bps(d1, max_c));
+        }
+
+        #[test]
+        fn prop_collateral_value_upper_bounded_by_gross(
+            units in 0i128..=10_000_000_000_000_000i128,
+            guarded_price in 0i128..=10_000_000_000_000_000i128,
+            haircut_bps in 0u32..=10_000u32,
+        ) {
+            let gross = (units * guarded_price) / PRICE_SCALE;
+            let cv = collateral_value(units, guarded_price, haircut_bps);
+            prop_assert!(cv <= gross);
+        }
+
+        #[test]
+        fn prop_ltv_bps_never_panics_below_1e30(
+            debt in 0i128..=1_000_000_000_000_000_000_000_000_000_000i128,
+            collateral_value in 0i128..=1_000_000_000_000_000_000_000_000_000_000i128,
+        ) {
+            let ltv = ltv_bps(debt, collateral_value);
+            prop_assert!(ltv <= u32::MAX);
+        }
+    }
 }
