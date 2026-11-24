@@ -2736,33 +2736,36 @@ mod test {
     #[test]
     fn three_sources_with_an_outlier_beyond_the_band_degrade_and_keep_the_last_good_value() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
-        let mid = SCALE + 20_000; // 1.002
+        let last_good = SCALE + 10_000; // 1.010
+        let new_median = SCALE + 20_000; // 1.002
 
-        // Establish a last good value from three agreeing sources.
+        // Establish a last good value that differs from the next round's median, so the value
+        // assertion proves the guard kept the old price rather than returning the new median.
         publish_numbered_sources(
             &env,
             &client,
             &publisher,
             &asset,
-            &[SCALE, mid, SCALE + 40_000],
+            &[last_good, last_good, last_good],
         );
         let good = client.guarded_price(&asset);
         assert_eq!(good.status, PriceStatus::Ok);
-        assert_eq!(good.value, mid);
+        assert_eq!(good.value, last_good);
 
-        // Replace the third source with 1.060. The extremes (1.000 and 1.060) are 600 bps apart,
-        // well past the 50 bps band, even though the median (1.002) is still close to the others.
+        // The outlier round's median is 1.002, but the extremes (1.000 and 1.060) are 600 bps
+        // apart, well past the 50 bps band. A degraded result must keep 1.010, not 1.002.
         publish_numbered_sources(
             &env,
             &client,
             &publisher,
             &asset,
-            &[SCALE, mid, SCALE + 600_000],
+            &[SCALE, new_median, SCALE + 600_000],
         );
 
         let price = client.guarded_price(&asset);
         assert_eq!(price.status, PriceStatus::Degraded);
-        assert_eq!(price.value, mid);
+        assert_eq!(price.value, last_good);
+        assert_ne!(price.value, new_median);
     }
 
     #[test]
