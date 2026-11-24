@@ -191,9 +191,10 @@ stellar contract invoke \
 
 ### 5. Execute Queued Parameter Change After 48h (Permissionless)
 ```bash
+# Note: Execution is permissionless; any funded account (e.g. keeper) can execute once the timelock has elapsed.
 stellar contract invoke \
   --id "$REGISTRY_CID" \
-  --source any_caller \
+  --source keeper \
   --network testnet -- \
   execute_param \
   --id "$CHANGE_ID"
@@ -235,10 +236,10 @@ stellar contract invoke \
   --admin "$ADMIN" \
   --scope '"Draws"'
 
-# 2. After 48h: execute unpause (permissionless)
+# 2. After 48h: execute unpause (permissionless; any funded account, e.g. keeper)
 stellar contract invoke \
   --id "$REGISTRY_CID" \
-  --source any_caller \
+  --source keeper \
   --network testnet -- \
   execute_unpause \
   --id "$UNPAUSE_ID"
@@ -255,10 +256,10 @@ stellar contract invoke \
   --role '"Pauser"' \
   --new_address "$NEW_PAUSER"
 
-# 2. After 48h: execute rotation (permissionless)
+# 2. After 48h: execute rotation (permissionless; any funded account, e.g. keeper)
 stellar contract invoke \
   --id "$REGISTRY_CID" \
-  --source any_caller \
+  --source keeper \
   --network testnet -- \
   execute_role_change \
   --id "$ROLE_CHANGE_ID"
@@ -280,8 +281,8 @@ stellar contract invoke \
    - Synchronizing all protocol contracts dynamically from `Registry` is tracked as open architecture work (`ARCHITECTURE.md:59`).
 2. **Registry Pause Decoupling:**
    - `Registry::pause` and `is_paused` manage pause flags in `Registry`'s instance storage. However, operating contracts currently evaluate pause gates against their own local pause storage (`contracts/common/src/pause.rs:41`).
-   - `RepoDvP` exposes its own pause/unpause writer (#32), while `ExitDesk` pause integration is tracked in #30.
+   - `RepoDvP` exposes its own pause/unpause writer, while `ExitDesk` pause integration is decoupled from Registry pause storage.
 3. **`repo-dvp::propose` Ungated:**
    - `RepoDvP::propose` is currently ungated even though documentation specifies that new repo activity should be subject to `PauseScope::Repos` (#846).
 4. **Soroban Event Deprecation:**
-   - Events are published using `env.events().publish(...)`, which is deprecated in newer `soroban-sdk` releases in favor of the `#[contractevent]` macro (#1030).
+   - Events are published using `env.events().publish(...)`, which is deprecated in newer `soroban-sdk` releases in favor of the `#[contractevent]` macro.
