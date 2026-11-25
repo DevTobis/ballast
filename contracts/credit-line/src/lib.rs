@@ -28,8 +28,9 @@
 //! doc comment. A fully wired system would have this function call it cross-contract
 //! automatically; that dependency isn't set up in this pass (this crate deliberately doesn't take
 //! a Cargo dependency on `pledge-vault`), so an off-chain keeper service is expected to call both
-//! `CreditLine::liquidate` and `PledgeVault::liquidate`. This is the least clean part of this
-//! skeleton.
+//! `CreditLine::liquidate` and `PledgeVault::liquidate`. However, `close_liquidated` verifies
+//! cross-contract that collateral has actually left `PledgeVault` (`position_units == 0`) before
+//! closing, preventing the line from closing while collateral is still in the vault.
 //!
 //! **Invariant 6** ("the admin cannot move user funds"): every function that moves USDC out of
 //! this contract (`draw`) or pulls funds in from a specific party (`fund`, `repay`) requires
@@ -73,6 +74,13 @@ const MAX_FEE_BPS: u32 = 10_000;
 #[contractclient(name = "PriceGuardClient")]
 pub trait PriceGuardInterface {
     fn guarded_price(env: Env, asset: Address) -> GuardedPrice;
+}
+
+/// Cross-contract call to PledgeVault, declared as a local trait so CreditLine never takes a
+/// Cargo dependency on the pledge-vault crate.
+#[contractclient(name = "PledgeVaultClient")]
+pub trait PledgeVaultInterface {
+    fn position_units(env: Env, line: u64, asset: Address) -> i128;
 }
 
 fn muxed(addr: &Address) -> MuxedAddress {
@@ -771,6 +779,10 @@ impl CreditLine {
     /// Books the outcome of a liquidation and closes the line. Called by the lender once the
     /// keeper has moved the collateral to them in kind (`PledgeVault::liquidate`).
     ///
+    /// Verifies cross-contract via `PledgeVault::position_units` that the line's collateral has
+    /// actually left the vault (`position_units == 0`). If no vault is configured, close is allowed
+    /// only when zero units were pledged/seized.
+    ///
     /// The collateral is valued at the guarded price confirmed when the breach was flagged
     /// (`LiquidationRecord`), not at a price the lender supplies, so the lender cannot understate
     /// what they received. If it is worth more than the debt the lender pays the difference to the
@@ -790,6 +802,24 @@ impl CreditLine {
         );
 
         let mut record = read_liquidation(&env, line);
+
+        let vault_opt: Option<Address> = env.storage().instance().get(&DataKey::Vault);
+        match vault_opt {
+            Some(vault) => {
+                let remaining =
+                    PledgeVaultClient::new(&env, &vault).position_units(&line, &state.asset);
+                assert_eq!(
+                    remaining, 0,
+                    "credit-line: collateral has not left the vault"
+                );
+            }
+            None => {
+                assert!(
+                    record.seized_units == 0 && state.pledged_units == 0,
+                    "credit-line: vault not configured"
+                );
+            }
+        }
 
         let recovered = risk::collateral_value(record.seized_units, record.price, 0);
         let surplus = (recovered - record.debt).max(0);
@@ -1107,12 +1137,41 @@ mod test {
         }
     }
 
+    // A minimal in-crate test vault implementing `position_units` and `set_position_units` — same
+    // hermetic testing pattern as `mock_price_guard` and `mock_token`.
+    mod test_vault {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+        #[contract]
+        pub struct TestVault;
+
+        #[contracttype]
+        enum DataKey {
+            Units(u64, Address),
+        }
+
+        #[contractimpl]
+        impl TestVault {
+            pub fn set_position_units(env: Env, line: u64, asset: Address, units: i128) {
+                env.storage().instance().set(&DataKey::Units(line, asset), &units);
+            }
+
+            pub fn position_units(env: Env, line: u64, asset: Address) -> i128 {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Units(line, asset))
+                    .unwrap_or(0)
+            }
+        }
+    }
+
     struct Harness {
         env: Env,
         credit_line: CreditLineClient<'static>,
         token: mock_token::MockTokenClient<'static>,
         #[allow(dead_code)]
         price_guard: mock_price_guard::MockPriceGuardClient<'static>,
+        vault: test_vault::TestVaultClient<'static>,
         admin: Address,
         keeper: Address,
         lender: Address,
@@ -1134,6 +1193,9 @@ mod test {
         let price_guard = mock_price_guard::MockPriceGuardClient::new(&env, &pg_id);
         price_guard.set_price(&price, &status);
 
+        let vault_id = env.register(test_vault::TestVault, ());
+        let vault = test_vault::TestVaultClient::new(&env, &vault_id);
+
         let admin = Address::generate(&env);
         let pauser = Address::generate(&env);
         let keeper = Address::generate(&env);
@@ -1151,12 +1213,14 @@ mod test {
             liquidation_bps: 9_000,
         };
         credit_line.configure_asset(&admin, &asset, &pg_id, &token_id, &haircut_bps, &thresholds);
+        credit_line.set_vault(&admin, &vault_id);
 
         Harness {
             env,
             credit_line,
             token,
             price_guard,
+            vault,
             admin,
             keeper,
             lender,
@@ -1943,6 +2007,9 @@ mod test {
     #[should_panic(expected = "credit-line: vault not configured")]
     fn nothing_can_report_collateral_before_a_vault_is_configured() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
         h.credit_line.sync_from_vault(&Address::generate(&h.env), &id, &h.asset, &PRICE_SCALE);
     }
@@ -2380,6 +2447,10 @@ mod test {
                 .configure_asset(&impostor, &h.asset, &alt_pg, &alt_usdc, &2_500, &thresholds);
         }));
         assert!(res_cfg.is_err(), "impostor cannot reconfigure asset");
+
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
 
         let impostor_vault = Address::generate(&h.env);
         h.env.mock_auths(&[MockAuth {
@@ -3186,7 +3257,7 @@ mod test {
         h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
         assert_eq!(h.credit_line.debt_of(&id), 610 * PRICE_SCALE);
 
-        // Price drops to $0.65 -> 1,000 units = 650 (LTV 610/650 = 9,384 bps -> Liquidation).
+        // Price drops to $ .65 -> 1,000 units = 650 (LTV 610/650 = 9,384 bps -> Liquidation).
         h.price_guard
             .set_price(&(65 * PRICE_SCALE / 100), &PriceStatus::Ok);
         assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
@@ -3201,7 +3272,7 @@ mod test {
         assert_eq!(frozen.debt, 600 * PRICE_SCALE);
 
         let borrower_before = h.token.balance(&h.borrower);
-        // Full surplus = 650 - 600 = 50 (not shrunk to 40 by unpaid platform fee).
+        // Full surplus = 650 - 600 = 50 (not shrunk to 40 by unpaid platform fee)
         h.token.mint(&h.lender, &(50 * PRICE_SCALE));
         h.credit_line.close_liquidated(&h.lender, &id);
 
@@ -3232,5 +3303,94 @@ mod test {
         h.credit_line
             .withdraw_undrawn(&h.lender, &id, &(500 * PRICE_SCALE));
         assert_eq!(h.token.balance(&h.credit_line.address), 0);
+    }
+
+    /// Verifies that `close_liquidated` panics with the exact message
+    /// "credit-line: collateral has not left the vault" when collateral remains,
+    /// and that the line stays in `Liquidating` state (checked via `try_close_liquidated`).
+    #[test]
+    #[should_panic(expected = "credit-line: collateral has not left the vault")]
+    fn close_liquidated_fails_when_collateral_remains_in_vault() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        // Set remaining collateral in vault to 500 units (keeper hasn't swept yet).
+        h.vault.set_position_units(&id, &h.asset, &(500 * PRICE_SCALE));
+
+        // Verify via try_ that the line stays Liquidating on failure.
+        let res = h.credit_line.try_close_liquidated(&h.lender, &id);
+        assert!(res.is_err(), "must fail while collateral remains in vault");
+        assert_eq!(
+            h.credit_line.line(&id).status,
+            LineStatus::Liquidating,
+            "line must remain Liquidating when close_liquidated is blocked"
+        );
+
+        // Now trigger the panic directly so #[should_panic] catches the exact message.
+        h.credit_line.close_liquidated(&h.lender, &id);
+    }
+
+    #[test]
+    fn close_liquidated_succeeds_when_vault_units_are_zero() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        // Explicitly set vault position units to 0
+        h.vault.set_position_units(&id, &h.asset, &0);
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+        let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: vault not configured")]
+    fn close_liquidated_fails_when_vault_unconfigured_and_seized_units_positive() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        // Unconfigure vault
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+    }
+
+    #[test]
+    fn close_liquidated_succeeds_when_vault_unconfigured_and_seized_units_zero() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        // Unconfigure vault
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
+
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.env.as_contract(&h.credit_line.address, || {
+            let mut line = read_line(&h.env, id);
+            line.status = LineStatus::Liquidating;
+            line.pledged_units = 0;
+            write_line(&h.env, id, &line);
+
+            write_liquidation(
+                &h.env,
+                id,
+                &LiquidationRecord {
+                    seized_units: 0,
+                    price: PRICE_SCALE,
+                    debt: 0,
+                    closed: false,
+                    recovered: 0,
+                    surplus: 0,
+                    shortfall: 0,
+                },
+            );
+        });
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+        let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
     }
 }

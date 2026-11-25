@@ -88,15 +88,17 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - **Liquidation is in kind.** `liquidate` flips the line to `Liquidating` and *freezes* the seized
   units (the whole synced position), the confirmed guarded price and the debt in a
   `LiquidationRecord`. The keeper then moves the collateral to the lender with
-  `PledgeVault::liquidate`. These are two transactions by a trusted keeper; the contracts do not
-  link them. The keeper job refuses to liquidate while booked and on-chain pledged units differ
-  (`sync_collateral` lag), so the units it seizes equal the units the record uses.
-- **`close_liquidated`** (lender-signed) values the collateral at the *frozen* price with no
-  haircut, pays any surplus from the lender's USDC to the borrower in the same call, records any
-  shortfall, writes unrecovered principal off `funded` and closes the line. The lender cannot
-  choose the price or understate the collateral, but **can choose when to close**; until they do
-  the line stays `Liquidating` and the borrower's surplus is not paid. There is no borrower-side
-  or keeper-side close.
+  `PledgeVault::liquidate`. `close_liquidated` verifies cross-contract that collateral has actually
+  left the vault (`PledgeVault::position_units(line, asset) == 0`) before permitting the line to
+  close. If no vault is configured, `close_liquidated` refuses if any collateral was pledged or
+  seized (`record.seized_units > 0 || state.pledged_units > 0`), and succeeds only for uncollateralized
+  lines with zero seized units.
+- **`close_liquidated`** (lender-signed) verifies that collateral has cleared the vault, values the
+  collateral at the *frozen* price with no haircut, pays any surplus from the lender's USDC to the
+  borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
+  closes the line. The lender cannot choose the price, understate the collateral, or close while
+  collateral remains in the vault, but **can choose when to close**; until they do the line stays
+  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close.
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
@@ -199,3 +201,12 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   moving changes the encoding and needs the indexer and ledger readers updated together.
 - No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
   scripts in `scripts/` exercise them on testnet.
+
+## close_liquidated: dust pledged after liquidation
+
+`CreditLine::close_liquidated` calls `PledgeVault::position_units` cross-contract and panics
+(`"credit-line: collateral has not left the vault"`) if the result is non-zero.  This means that
+any collateral dust pledged to the vault **after** `liquidate` has flipped the line to `Liquidating`
+(e.g. a keeper or borrower pledges a hairline amount) will block `close_liquidated` until the
+keeper sweeps all units out of the vault.  Lenders should be aware that the keeper must drain the
+vault position to zero before the line can be closed.
