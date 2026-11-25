@@ -899,3 +899,239 @@ fn read_only_getters_and_capacity_track_state() {
     );
 }
 
+
+// --- configure_asset timelock (issue #214) ---
+
+const CAP: i128 = 1_000 * PRICE_SCALE;
+
+fn reconfigure(h: &Harness, price_guard: &Address, spread_bps: u32, holder_cap: i128, desk_cap: i128) {
+    ExitDeskClient::new(&h.env, &h.desk).configure_asset(
+        &h.admin,
+        &h.rwa,
+        price_guard,
+        &spread_bps,
+        &holder_cap,
+        &desk_cap,
+    );
+}
+
+fn queue(h: &Harness, price_guard: &Address, spread_bps: u32, holder_cap: i128, desk_cap: i128) -> u64 {
+    ExitDeskClient::new(&h.env, &h.desk).queue_configure_asset(
+        &h.admin,
+        &h.rwa,
+        price_guard,
+        &spread_bps,
+        &holder_cap,
+        &desk_cap,
+    )
+}
+
+fn advance(h: &Harness, seconds: u64) {
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + seconds);
+}
+
+#[test]
+fn configure_asset_applies_tightening_changes_immediately() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    // Wider spread and lower caps, same price guard: no delay.
+    reconfigure(&h, &h.price_guard, 250, CAP / 2, CAP / 4);
+    let cfg = ExitDeskClient::new(&h.env, &h.desk).asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 250);
+    assert_eq!(cfg.per_holder_daily_cap, CAP / 2);
+    assert_eq!(cfg.desk_inventory_cap, CAP / 4);
+}
+
+#[test]
+fn configure_asset_accepts_an_unchanged_config() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    // Re-running the deploy script with the same values must not fail.
+    configure(&h, 100, CAP, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_new_price_guard() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let attacker_guard = h.env.register(MockPriceGuard, ());
+    reconfigure(&h, &attacker_guard, 100, CAP, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_lower_spread() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    reconfigure(&h, &h.price_guard, 99, CAP, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_higher_holder_cap() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    reconfigure(&h, &h.price_guard, 100, CAP + 1, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_higher_inventory_cap() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    reconfigure(&h, &h.price_guard, 100, CAP, CAP + 1);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_mixed_change_that_loosens_anything() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    // Wider spread (tightening) but a higher cap (loosening): the whole change is timelocked.
+    reconfigure(&h, &h.price_guard, 500, CAP * 2, CAP);
+}
+
+#[test]
+fn queued_price_guard_change_applies_only_after_48h() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    // The new guard reports 10x the price.
+    let new_guard = h.env.register(MockPriceGuard, ());
+    MockPriceGuardClient::new(&h.env, &new_guard).set_price(
+        &h.rwa,
+        &(10 * PRICE_SCALE),
+        &PriceStatus::Ok,
+        &h.env.ledger().timestamp(),
+    );
+
+    let id = queue(&h, &new_guard, 100, CAP, CAP);
+    let pending = desk.pending_config(&id).expect("queued");
+    assert_eq!(pending.asset, h.rwa);
+    assert_eq!(pending.config.price_guard, new_guard);
+    assert_eq!(
+        pending.executes_at,
+        h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS
+    );
+
+    // Nothing changes while queued: quotes still use the old guard.
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, h.price_guard);
+    assert_eq!(desk.quote(&h.rwa, &PRICE_SCALE).price, 9_900_000);
+
+    // One second short of 48h: still refused.
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS - 1);
+    let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.execute_configure_asset(&id);
+    }));
+    assert!(early.is_err(), "execute before the timelock elapses must fail");
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, h.price_guard);
+
+    advance(&h, 1);
+    desk.execute_configure_asset(&id);
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, new_guard);
+    assert_eq!(desk.quote(&h.rwa, &PRICE_SCALE).price, 99_000_000);
+    assert!(desk.pending_config(&id).is_none());
+}
+
+#[test]
+fn queued_spread_decrease_and_cap_increase_apply_after_48h() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    let id = queue(&h, &h.price_guard, 10, CAP * 2, CAP * 3);
+    assert_eq!(desk.asset_config(&h.rwa).spread_bps, 100);
+
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    desk.execute_configure_asset(&id);
+
+    let cfg = desk.asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 10);
+    assert_eq!(cfg.per_holder_daily_cap, CAP * 2);
+    assert_eq!(cfg.desk_inventory_cap, CAP * 3);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: no such pending config")]
+fn a_queued_config_executes_only_once() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let id = queue(&h, &h.price_guard, 50, CAP, CAP);
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    desk.execute_configure_asset(&id);
+    desk.execute_configure_asset(&id);
+}
+
+#[test]
+fn cancelled_config_never_applies() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let attacker_guard = h.env.register(MockPriceGuard, ());
+
+    let id = queue(&h, &attacker_guard, 100, CAP, CAP);
+    desk.cancel_configure_asset(&h.admin, &id);
+    assert!(desk.pending_config(&id).is_none());
+
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    let exec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.execute_configure_asset(&id);
+    }));
+    assert!(exec.is_err(), "executing a cancelled config must fail");
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, h.price_guard);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: spread must be below 100%")]
+fn queue_configure_asset_validates_at_queue_time() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    queue(&h, &h.price_guard, 10_000, CAP, CAP);
+}
+
+#[test]
+#[should_panic]
+fn queue_configure_asset_rejects_non_admin() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let stranger = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).queue_configure_asset(
+        &stranger,
+        &h.rwa,
+        &h.price_guard,
+        &50,
+        &CAP,
+        &CAP,
+    );
+}
+
+#[test]
+#[should_panic]
+fn cancel_configure_asset_rejects_non_admin() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let id = queue(&h, &h.price_guard, 50, CAP, CAP);
+    let stranger = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).cancel_configure_asset(&stranger, &id);
+}
+
+#[test]
+fn a_queued_config_replaces_a_later_tightening_on_execute() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    let id = queue(&h, &h.price_guard, 50, CAP, CAP);
+    // The operator tightens meanwhile; the queued config is a full replacement and wins on execute.
+    reconfigure(&h, &h.price_guard, 300, CAP / 2, CAP / 2);
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    desk.execute_configure_asset(&id);
+
+    let cfg = desk.asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 50);
+    assert_eq!(cfg.per_holder_daily_cap, CAP);
+}

@@ -148,6 +148,12 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 ## ExitDesk
 
+- `configure_asset` applies at once only for the first listing of an asset, or for changes that
+  cannot raise payouts (same `price_guard`, spread not lower, caps not higher). A new `price_guard`,
+  a lower spread or a higher cap must be queued with `queue_configure_asset` and executed after the
+  48h timelock (`ballast_common::timelock`). The admin can cancel it in the meantime. The first
+  listing is still immediate, so a compromised admin could list a new asset with a hostile
+  `price_guard` against the shared float; that path is not timelocked.
 - The desk's USDC float and the RWA inventory it accumulates from exits have an admin-only `withdraw`.
   Without it the inventory only ever grew toward `desk_inventory_cap` and the desk eventually refused
   every exit, with no way to rebalance. Withdrawing an RWA frees the same amount under its cap. This is

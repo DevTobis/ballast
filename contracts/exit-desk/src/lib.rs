@@ -81,6 +81,16 @@ pub struct PendingUnpause {
     pub executes_at: u64,
 }
 
+/// A configuration change queued by `queue_configure_asset`, applied by
+/// `execute_configure_asset` once `executes_at` has passed.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingAssetConfig {
+    pub asset: Address,
+    pub config: AssetConfig,
+    pub executes_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     Usdc,
@@ -94,6 +104,38 @@ enum DataKey {
     /// (`timestamp / 86_400`), for the per-holder daily cap.
     DailyUsed(Address, Address, u64),
     PendingUnpause(u64),
+    PendingConfig(u64),
+}
+
+fn validate_config(config: &AssetConfig) {
+    // A 100% spread makes every exit pay nothing, which is a misconfiguration, not a price.
+    assert!(
+        (config.spread_bps as i128) < BPS_DENOMINATOR,
+        "exit-desk: spread must be below 100%"
+    );
+    assert!(
+        config.per_holder_daily_cap > 0,
+        "exit-desk: per_holder_daily_cap must be positive"
+    );
+    assert!(
+        config.desk_inventory_cap > 0,
+        "exit-desk: desk_inventory_cap must be positive"
+    );
+}
+
+/// Whether moving from `current` to `next` could let exits pay out more USDC, or more often:
+/// a different price source, a narrower spread, or a higher cap. Such changes are timelocked.
+fn loosens(current: &AssetConfig, next: &AssetConfig) -> bool {
+    next.price_guard != current.price_guard
+        || next.spread_bps < current.spread_bps
+        || next.per_holder_daily_cap > current.per_holder_daily_cap
+        || next.desk_inventory_cap > current.desk_inventory_cap
+}
+
+fn write_asset_config(env: &Env, asset: &Address, config: &AssetConfig) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetConfig(asset.clone()), config);
 }
 
 fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
@@ -195,6 +237,15 @@ impl ExitDesk {
     /// Admin-only per-asset configuration (PRD §5 Phase 2 "Limits" row: per-holder and per-day
     /// caps, total desk inventory cap tied to facility size). See the module docs for why this is
     /// stored locally instead of read from `Registry`.
+    ///
+    /// Applies immediately only when it cannot make exits pay out more: the first listing of an
+    /// asset, or a change to an already-configured asset that keeps the same `price_guard`, does
+    /// not lower `spread_bps` and does not raise either cap. Anything else (a new `price_guard`, a
+    /// narrower spread, a higher cap) panics here and must go through `queue_configure_asset`,
+    /// which applies it after the 48h timelock. A compromised admin key could otherwise point
+    /// `price_guard` at a contract returning an inflated price and drain the USDC float through
+    /// an accomplice's exit in one transaction; the delay gives operators time to notice and
+    /// pause exits.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -205,29 +256,103 @@ impl ExitDesk {
         desk_inventory_cap: i128,
     ) {
         require_admin_is(&env, &admin);
-        // A 100% spread makes every exit pay nothing, which is a misconfiguration, not a price.
-        assert!(
-            (spread_bps as i128) < BPS_DENOMINATOR,
-            "exit-desk: spread must be below 100%"
-        );
-        assert!(
-            per_holder_daily_cap > 0,
-            "exit-desk: per_holder_daily_cap must be positive"
-        );
-        assert!(
-            desk_inventory_cap > 0,
-            "exit-desk: desk_inventory_cap must be positive"
-        );
+        let config = AssetConfig {
+            price_guard,
+            spread_bps,
+            per_holder_daily_cap,
+            desk_inventory_cap,
+        };
+        validate_config(&config);
 
-        env.storage().instance().set(
-            &DataKey::AssetConfig(asset.clone()),
-            &AssetConfig {
-                price_guard,
-                spread_bps,
-                per_holder_daily_cap,
-                desk_inventory_cap,
+        let current: Option<AssetConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetConfig(asset.clone()));
+        if let Some(current) = current {
+            assert!(
+                !loosens(&current, &config),
+                "exit-desk: change loosens price_guard, spread or caps; use queue_configure_asset"
+            );
+        }
+
+        write_asset_config(&env, &asset, &config);
+    }
+
+    /// Queues a configuration for `asset` that applies after the 48h timelock. This is the only
+    /// path for changes `configure_asset` refuses (a new `price_guard`, a lower spread, a higher
+    /// cap); it accepts tightening changes too. The whole config is replaced on execution.
+    /// Returns the id to pass to `execute_configure_asset` / `cancel_configure_asset`.
+    pub fn queue_configure_asset(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        price_guard: Address,
+        spread_bps: u32,
+        per_holder_daily_cap: i128,
+        desk_inventory_cap: i128,
+    ) -> u64 {
+        require_admin_is(&env, &admin);
+        let config = AssetConfig {
+            price_guard,
+            spread_bps,
+            per_holder_daily_cap,
+            desk_inventory_cap,
+        };
+        validate_config(&config);
+
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingConfig(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingAssetConfig {
+                asset: asset.clone(),
+                config: config.clone(),
+                executes_at,
             },
         );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("cfg_q"), id), (asset, config, executes_at));
+        id
+    }
+
+    /// Applies a queued configuration once its timelock has elapsed. Callable by anyone, like
+    /// `execute_unpause`: the change was already authorised and published when it was queued.
+    pub fn execute_configure_asset(env: Env, id: u64) {
+        let key = DataKey::PendingConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("exit-desk: no such pending config");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "exit-desk: timelock has not elapsed"
+        );
+        write_asset_config(&env, &pending.asset, &pending.config);
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((symbol_short!("cfg_exec"), id), (pending.asset, pending.config));
+    }
+
+    /// Drops a queued configuration before it executes. Admin only.
+    pub fn cancel_configure_asset(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        let key = DataKey::PendingConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("exit-desk: no such pending config");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((symbol_short!("cfg_canc"), id), pending.asset);
+    }
+
+    /// Read-only: the queued configuration for `id`, if it is still pending.
+    pub fn pending_config(env: Env, id: u64) -> Option<PendingAssetConfig> {
+        env.storage().persistent().get(&DataKey::PendingConfig(id))
     }
 
     /// Admin-set once; exit swaps pay out this token. See module docs for why this isn't
