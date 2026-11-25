@@ -15,6 +15,10 @@ in this skeleton pass.
 | `exit-desk` | [RWA → USDC instant exit](exit-desk/README.md) |
 | `repo-dvp` | Bilateral repo, atomic DvP |
 
+Every event these contracts publish (topics, payload order and types, emitter, consumers) is listed
+in [`EVENTS.md`](EVENTS.md). Payload order is a compatibility contract with `services/indexer` and
+`services/ledger`: read that file before you change an event.
+
 ## Differences from PRD section 8
 
 The PRD (`../PRD.md` §8) is the product doc and is untouched; this table is where the code

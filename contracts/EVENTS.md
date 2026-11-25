@@ -1,8 +1,8 @@
 # Contract events reference
 
-This is the reference for every event that `CreditLine` and `PledgeVault` publish, with the exact
-payload order and types. It also lists the events that open feature issues propose, marked
-**planned**.
+This is the reference for every event that `CreditLine`, `PledgeVault`, `RepoDvp` and `ExitDesk`
+publish, with the exact topics, payload order and types. It also lists the events that open feature
+issues propose, marked **planned**.
 
 ## Payload order is a compatibility contract
 
@@ -28,8 +28,21 @@ still pass:
 
 Appending a new field at the **end** of a tuple is safe for the consumers listed here, because they
 read by index and ignore extra fields. Any other change needs the consumer updated in the same PR,
-a row in this file, and a note in [`../CHANGELOG.md`](../CHANGELOG.md). The `#[contractevent]`
-migration (issue #821) must keep the field order shown here or ship with consumer changes.
+a row in this file, and a note in [`../CHANGELOG.md`](../CHANGELOG.md).
+
+### The `#[contractevent]` migration
+
+Every contract here publishes with `env.events().publish`, which soroban-sdk deprecates in favour
+of `#[contractevent]`. Each crate silences the warning with `#![allow(deprecated)]`, and the
+`lib.rs` headers explain why:
+
+> Moving over changes how events are encoded on-chain, so it has to be done together with the
+> off-chain readers (services/indexer, services/ledger) and a redeploy.
+
+By default `#[contractevent]` puts the payload in a map keyed by field name instead of a
+positional tuple (`data_format = "vec"` keeps a vector), so a consumer that reads `data.value[1]` breaks even when the field order stays the same. The
+migration (issue #821 for `PledgeVault`) therefore has to ship together with the indexer and
+consumer changes and a redeploy, and this file has to be updated in the same PR.
 
 ## Conventions
 
@@ -94,12 +107,85 @@ topic names, matches `data.value[0]` against `asset.contract_c`, and parses `dat
 unit delta. If `asset` or `units` moves to another index, every active pledge will show up as a
 reconciliation break, and nothing fails at compile time.
 
+## RepoDvp (`contracts/repo-dvp`)
+
+Per-trade events are keyed by the trade id (`id: u64`). Short names use `symbol_short!`, and the
+longer pause names use `Symbol::new`. Both decode to the same plain string in `chain_event.topic`.
+
+| Topic | Topic arguments | Payload (in order) | Emitted by | When |
+|---|---|---|---|---|
+| `cancel` | `id: u64` | `caller: Address` | `cancel_proposal` (cash lender or cash borrower) | A `Proposed` trade moves to `Cancelled` |
+| `settle` | `id: u64` | `units: i128` (bare value) | `accept_and_settle` (cash borrower) | Leg 1 settled: `units` of RWA pledged, USDC paid out |
+| `unwind` | `id: u64` | `total_due: i128` (bare value) | `unwind` (either party, or keeper) | Leg 2 at or after maturity: borrower repaid principal plus interest, RWA returned |
+| `mcall` | `id: u64` | `margin_call_amount: i128` (bare value) | `call_margin` (keeper) | Position at `MarginCall` or worse. Emitted on every such call, including repeats that only update the amount; the cure deadline does not move |
+| `cured` | `id: u64` | `0: i128` (always zero) | `call_margin` (keeper) | A call was open and the position is back under the margin-call threshold (the price recovered) |
+| `topup` | `id: u64` | `(extra_units: i128, cured: bool)` | `top_up` (cash borrower; not pause-gated) | Borrower added collateral. `cured` is true when this cleared an open call |
+| `default` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_close` (keeper) | Cure deadline passed without a cure: lender takes `lender_units`, the rest goes back to the borrower |
+| `mat_def` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` (cash lender or keeper) | Leg 2 not repaid by `maturity_at + maturity_grace`; same split as `default` |
+| `disable` | `asset: Address` | `()` | `disable_asset` (admin) | `propose` and `accept_and_settle` for `asset` refused; open trades can still unwind, top up and default |
+| `enable` | `asset: Address` | `()` | `enable_asset` (admin) | `asset` re-enabled |
+| `paused` | `scope: PauseScope` | `true: bool` | `pause` (pauser) | Scope paused |
+| `unpause_queued` | `id: u64` (timelock id) | `(scope: PauseScope, executes_at: u64)` | `queue_unpause` (admin) | Unpause queued behind the 48h timelock |
+| `unpause_cancelled` | `id: u64` | `scope: PauseScope` | `cancel_unpause` (admin) | Queued unpause dropped |
+| `unpause_executed` | `id: u64` | `scope: PauseScope` | `execute_unpause` (anyone) | Scope unpaused |
+
+Field notes:
+
+- `default` and `mat_def`: `lender_units = min(ceil(owed / price), units)` at the guarded price
+  with no haircut, and `borrower_units = units - lender_units`. When `borrower_units = 0`, the
+  lender may still bear a shortfall; the event does not report it.
+- `cured` carries a constant `0i128` so the payload is never empty. Treat the topic alone as the
+  signal.
+- `propose`, `set_usdc`, `configure_asset` and `set_cure_grace` publish nothing today (issues #206
+  and #207 propose events for them).
+
+## ExitDesk (`contracts/exit-desk`)
+
+All topics use `symbol_short!`.
+
+| Topic | Topic arguments | Payload (in order) | Emitted by | When |
+|---|---|---|---|---|
+| `exit` | `holder: Address, asset: Address` | `usdc_out: i128` (bare value) | `exit`, `exit_before` (holder) | Atomic swap done: `units` of `asset` in, `usdc_out` USDC paid to `to` |
+| `fund` | `admin_or_keeper: Address` | `amount: i128` (bare value) | `fund` (admin or keeper) | USDC float topped up |
+| `withdraw` | `token: Address` | `amount: i128` (bare value) | `withdraw` (admin) | USDC float or RWA inventory taken out. For an RWA, also reduces `Inventory(token)` |
+| `set_usdc` | `admin: Address` | `usdc: Address` | `set_usdc` (admin) | Payout token set |
+| `disable` | `asset: Address` | `()` | `disable_asset` (admin) | Quotes and exits for `asset` refused |
+| `enable` | `asset: Address` | `()` | `enable_asset` (admin) | `asset` re-enabled |
+| `paused` | `pauser: Address` | `scope: PauseScope` | `pause` (pauser) | Scope paused |
+| `unp_q` | `id: u64` (timelock id) | `(scope: PauseScope, executes_at: u64)` | `queue_unpause` (admin) | Unpause queued behind the 48h timelock |
+| `unp_exec` | `id: u64` | `scope: PauseScope` | `execute_unpause` (anyone) | Scope unpaused |
+| `unp_canc` | `id: u64` | `scope: PauseScope` | `cancel_unpause` (admin) | Queued unpause dropped |
+
+Field notes:
+
+- `exit` reports neither `units`, the price nor the recipient `to`; only the token transfer events
+  in the same transaction carry them (issue #831 proposes adding them).
+- `configure_asset` publishes nothing on `main` (issue #835). PR #1272 (issue #214) adds a
+  timelocked config path with `cfg_q`, `cfg_exec` and `cfg_canc`. Move those rows here when it
+  merges.
+
+### Same topic name, different shape
+
+The indexer keys on the first topic only. Both `disable`/`enable` and `paused` exist in RepoDvp
+and ExitDesk, and `asset_configured` exists in CreditLine (and is proposed for PledgeVault). The
+two `paused` events have **different shapes**:
+
+| Contract | Topic arguments | Payload |
+|---|---|---|
+| RepoDvp | `scope: PauseScope` | `true: bool` |
+| ExitDesk | `pauser: Address` | `scope: PauseScope` |
+
+A consumer must filter on `chain_event.contract` as well as `topic` before it reads the payload.
+
 ## Other consumers
 
 - `services/indexer` (`poller.ts`, `backfill.ts`) stores every event from the configured contracts
   without filtering on topic. It is the source of every `chain_event` row.
 - `services/margin-monitor` and `services/keeper` do not read `chain_event` today. They recompute
   margin state from contract reads and Postgres.
+- `services/ledger` reconciles only the `PledgeVault` topics. RepoDvp and ExitDesk events are
+  stored but not read by any service yet (the reconciler's module doc lists repo trades and exit
+  fills as deferred).
 - `services/api` webhooks (`webhooks/outbox.ts`) come from Postgres rows (`margin_event`,
   `price_snapshot`, `liquidation`, `tx_intent` and similar), not from on-chain events.
 
@@ -121,9 +207,18 @@ contract.
 | PledgeVault | `asset_configured` | per issue (see note) | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` | #178 |
 | PledgeVault | `gateway_set` | none | `gateway: Address` (expected, by analogy with `vault_set`) | `set_gateway` | #178 |
 | PledgeVault | not named yet | `line: u64` | includes `reason: Bytes` | `reject_lien` (new) | #179 |
+| RepoDvp | `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | #206 |
+| RepoDvp | `usdc`, `curegrace`, `cfgasset` | not specified | new values (old values where cheap) | `set_usdc`, `set_cure_grace`, `configure_asset` | #207 |
+| RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |
+| RepoDvp | `cured` (**breaking**: `0i128` becomes a tuple) | `id: u64` | `(exposure: i128, ltv_bps: u32, price: i128)` | `call_margin` | #840 |
+| ExitDesk | `cfgasset` | `asset: Address` | `(price_guard: Address, spread_bps: u32, per_holder_daily_cap: i128, desk_inventory_cap: i128)` | `configure_asset` | #835 |
+| ExitDesk | `exit` (**breaking**: bare value becomes a tuple) | `holder: Address, asset: Address` | `(units: i128, usdc_out: i128, price: i128, to: Address)` | `exit`, `exit_before` | #831 |
 
 Note on #178: the issue text keys `asset_configured` by `line`, but `configure_asset` takes no line.
 `CreditLine`'s `asset_configured` uses `asset: Address` as the key, and the vault event should
 probably do the same.
+
+The **breaking** rows change an existing payload, so they need the coordinated consumer change
+described above.
 
 Also tracked: #821 moves `PledgeVault` events to `#[contractevent]` with a documented schema.
