@@ -7,7 +7,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 
 | Role | Can | Cannot |
 |---|---|---|
-| `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
+| `admin` | configure assets, thresholds, price bands; set the NAV attestor key; withdraw ExitDesk's **own** USDC float and RWA inventory (see [ExitDesk](#exitdesk)); change the parameters listed in [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value), most of them immediately | transfer a borrower's pledged collateral, a lender's committed USDC or a repo party's cash or collateral (see [RepoDvP](#repodvp)) directly: CreditLine, PledgeVault and RepoDvp have no `admin_withdraw`/sweep, and every transfer of those funds needs the owning party's auth or a keeper path; sign for a borrower or lender |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
@@ -33,6 +33,40 @@ matches the real world is the off-chain keeper job's responsibility, not the con
 `poke` (and the `ltv` read) are permissionless — anyone may call them, not only the keeper — so
 their timing is not a keeper-supplied value either. They only make stored state match a fresh
 price, which is why that is safe (see #211).
+
+### Admin-set parameters that change settlement value
+
+PRD invariant 6 says the admin cannot move user funds. That holds, **with these exceptions**: the
+admin can withdraw the ExitDesk's own float and inventory (not holder funds, see
+[ExitDesk](#exitdesk)), and the admin sets the parameters below. None of them transfers funds, but
+each changes how much a settlement pays, in which token, to whom, or when a position can be
+liquidated or defaulted. Unless the table says otherwise, a change takes effect immediately, with
+no timelock, and applies to positions that are already open.
+
+| Contract | Entry point | Parameter | What it changes | Timelock |
+|---|---|---|---|---|
+| CreditLine | `configure_asset` | `price_guard` | the price behind LTV, `draw`, `liquidate` and the price frozen in a `LiquidationRecord` | none |
+| CreditLine | `configure_asset` | `haircut_bps`, `thresholds` | collateral value, LTV and the point where a line can be liquidated (thresholds must be ordered, see below) | none |
+| CreditLine | `configure_asset` | `usdc` | the token every draw, repayment, lender withdrawal, surplus payment and fee claim uses on lines for that asset, existing ones included | none |
+| CreditLine | `set_vault` | vault address | the only contract trusted to report collateral through `sync_from_vault` | none |
+| CreditLine | `set_treasury` | treasury address | who can claim repaid platform fees (`claim_fee`) | none |
+| PledgeVault | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | the price and LTV check `release` applies while a line owes something | none |
+| PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and LTV before `release`, and reports collateral to | none |
+| PledgeVault | `configure_asset` | `custody_mode` | escrow or issuer-lien custody for new pledges; a position that still holds units keeps its mode and refuses pledges in the other one | none |
+| PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
+| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | none (#214) |
+| ExitDesk | `set_usdc` | USDC address | the token exits pay out in | none |
+| RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | none (#215) |
+| RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | none (#215) |
+| RepoDvp | `set_usdc` | USDC address | the cash token for leg 1, leg 2 and the allowances; it can be re-called, and `accept_and_settle` and `unwind` read it at call time, so a change applies to live trades | none; no tracking issue yet |
+| RepoDvp | `set_cure_grace`, `set_maturity_grace` | seconds (at least 60) | how long a borrower has to cure a margin call before `default_close`, and how long an unpaid trade waits past maturity before `default_at_maturity` can act | none |
+| PriceGuard | `configure_asset`, `queue_config` | bands, window, staleness | when a price is `Ok`, `Degraded` or `Halted` | tightening immediate; loosening 48h via `queue_config` |
+| PriceGuard | `remove_source` | a source name | which sources the median uses | none |
+| PriceGuard | `configure_signature_requirement` | NAV signature on/off | whether unsigned NAV is accepted | turning it on immediate; turning it off 48h via `queue_config` |
+| Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
+
+The timelock column should be updated as #214 and #215 land, along with any RepoDvp `set_usdc`
+change. #103 covers the full Registry and PriceGuard timelocked-or-immediate breakdown.
 
 The admin is trusted to choose margin thresholds, but not to choose ones that break the state
 machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
@@ -163,6 +197,11 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 ## RepoDvP
 
+- **Admin `set_usdc` applies to live trades.** The cash token is read from instance storage each
+  time `accept_and_settle` and `unwind` run, not stored on the trade, and `set_usdc` can be called
+  again at any time. If it changes after a trade settles, `unwind` pays leg 2 in the new token,
+  while the leg-2 allowance the borrower granted at settlement is in the old one. See
+  [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value).
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
   `propose` replaces the first one's allowance.
