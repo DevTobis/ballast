@@ -69,7 +69,8 @@ decoded incorrectly or fail to decode after an incompatible upgrade. This applie
 ## Contract Events
 
 Events follow the same convention as `PledgeVault`: one event per state change, with the shape
-`((Symbol, line), payload)`.
+`((Symbol, line), payload)`. See [`../EVENTS.md`](../EVENTS.md) for the cross-contract reference, consumers
+and the payload-order compatibility rule.
 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|
