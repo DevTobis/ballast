@@ -32,6 +32,7 @@ shared-lifetime concern even though the credit-line keys themselves do not conta
 | `Line(u64)` | Persistent | `open`; `write_line` helper used by `fund`, `sync_from_vault`, `sync_collateral`, `draw`, `repay`, `poke`, `liquidate`, `close_liquidated`, and `withdraw_undrawn` | `read_line` helper used by `asset_of`, `sync_*`, `draw`, `repay`, `ltv`, `poke`, `liquidate`, `close_liquidated`, `withdraw_*`, `claimable_interest`, `liquidation_record`, `line`, `debt_of`, `borrower_of`, and `fund` | Per line | Read/write helpers call `ttl::extend_persistent`; permissionless `extend_ttl(line)` also extends it and the line's optional entries | `Line` struct in field order: `lender`, `borrower`, `asset`, `limit`, `funded`, `drawn`, `pledged_units`, `rate_bps`, `cure_s`, `agreement`, `status`, `last_accrual_ts`, `accrued_interest`, `margin_state`, `breach_ledger`, `breach_ltv_bps`, `unhealthy_since`; `status` is `LineStatus`, `margin_state` is `MarginState` |
 | `Claimable(u64)` | Persistent | `repay` and `withdraw_interest`, through `write_claimable` | `read_claimable` through `repay`, `withdraw_interest`, and `claimable_interest` | Per line, only as repayment interest accrues | Read/write helpers extend TTL; `extend_ttl(line)` extends it when present | Plain `i128` |
 | `Liquidation(u64)` | Persistent | `liquidate` and `close_liquidated`, through `write_liquidation` | `close_liquidated` and `liquidation_record`, through `read_liquidation` | Per liquidated line | Read/write helpers extend TTL; `extend_ttl(line)` extends it when present | `LiquidationRecord` struct in field order: `seized_units: i128`, `price: i128`, `debt: i128`, `closed: bool`, `recovered: i128`, `surplus: i128`, `shortfall: i128` |
+| `SurplusOwed(u64)` | Persistent | `close_liquidated` and `claim_surplus`, through `write_surplus_owed` | `read_surplus_owed` through `claim_surplus` and `surplus_owed` | Per closed line with a surplus; the entry is removed once claimed or when the surplus is zero | Read/write helpers extend TTL; `extend_ttl(line)` extends it when present | Plain `i128` |
 
 ### Shared instance and persistent storage
 
@@ -74,7 +75,9 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
+| `repaid` | `(Symbol("repaid"), line: u64)` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
+| `surplus_claimed` | `(Symbol("surplus_claimed"), line: u64)` | `(borrower: Address, lender: Address, amount: i128)` | `claim_surplus` |
 | `liquidation_started` | `(Symbol("liquidation_started"), line: u64)` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` |
 | `interest_withdrawn` | `(Symbol("interest_withdrawn"), line: u64)` | `(lender: Address, amount: i128, claimable_after: i128)` | `withdraw_interest` |
 | `collateral_synced` | `(Symbol("collateral_synced"), line: u64)` | `(asset: Address, units: i128, source: Symbol)` (`vault` / `keeper` / `admin`) | `sync_from_vault`, `sync_collateral` |
@@ -85,6 +88,21 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 `undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
 figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
 publishes nothing.
+
+`repaid` is published after the repayment is applied: `interest_paid` and `principal_paid` sum to
+the amount actually applied (`min(amount, owed)`), and `drawn_after` is the line's remaining
+principal. A reverted repayment publishes nothing.
+
+## Liquidation surplus
+
+`close_liquidated` moves no USDC. When the frozen collateral value exceeds the debt it records the
+difference in `SurplusOwed(line)` (also returned by `surplus_owed(line)`) and closes the line, so a
+lender whose USDC balance is short can still close. The borrower then calls
+`claim_surplus(borrower, line)`, which pulls exactly that amount from the lender with
+`transfer_from` — the lender must first `approve` this contract on the line's USDC token. The
+claim is zeroed before the transfer, so it can only be paid once. Break-even and shortfall closes
+record a zero surplus and nothing is claimable. The keeper job does not call `close_liquidated`
+and needs no change: only the lender closes, and the claim is borrower-driven.
 
 ## Building and testing
 

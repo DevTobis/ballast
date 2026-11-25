@@ -92,11 +92,20 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   link them. The keeper job refuses to liquidate while booked and on-chain pledged units differ
   (`sync_collateral` lag), so the units it seizes equal the units the record uses.
 - **`close_liquidated`** (lender-signed) values the collateral at the *frozen* price with no
-  haircut, pays any surplus from the lender's USDC to the borrower in the same call, records any
-  shortfall, writes unrecovered principal off `funded` and closes the line. The lender cannot
-  choose the price or understate the collateral, but **can choose when to close**; until they do
-  the line stays `Liquidating` and the borrower's surplus is not paid. There is no borrower-side
-  or keeper-side close.
+  haircut, records any surplus or shortfall, writes unrecovered principal off `funded` and closes
+  the line. The lender cannot choose the price or understate the collateral, but **can choose when
+  to close**; until they do the line stays `Liquidating`. There is no borrower-side or keeper-side
+  close.
+- **The surplus is a pull payment (#149).** `close_liquidated` moves no USDC: a positive surplus is
+  booked in `SurplusOwed(line)` and the borrower pulls it with `claim_surplus`, which uses a
+  pre-authorised allowance (`approve` on the USDC token, spender = this contract) and
+  `transfer_from` to move the lender's USDC. This means a lender with an insufficient balance can
+  still close, a lender cannot strand the borrower by not closing to avoid paying, and a short
+  balance only defers the claim instead of blocking the close. The claim is zeroed before the
+  transfer, so it pays out at most once; a break-even or shortfall close records zero and is not
+  claimable. The keeper job is unaffected — it never calls `close_liquidated` (only the lender
+  does) and needs no new key; `surplus_owed(line)` exposes the outstanding amount to the console
+  and operators.
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
