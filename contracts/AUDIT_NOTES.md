@@ -199,3 +199,27 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   moving changes the encoding and needs the indexer and ledger readers updated together.
 - No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
   scripts in `scripts/` exercise them on testnet.
+
+### Missing hardening
+
+Each item below is a gap in the current code, not a finding about exploitability. Remove a bullet
+when its fix lands (#175).
+
+- **`initialize` is open to the first caller.** No contract checks who calls `initialize`, and
+  deploy and `initialize` are separate transactions, so whoever initializes first sets every role;
+  the deploy scripts detect this only by reading `roles` back afterwards. No tracking issue yet.
+- **No storage TTL extension in ExitDesk.** Its instance config, inventory and daily-cap entries
+  are never extended, so they can be archived after the network's minimum TTL and need a restore
+  before the desk works again. The other contracts now extend on use. Tracked in #208.
+- **No upgrade path outside Registry and PriceGuard.** CreditLine, PledgeVault, ExitDesk and
+  RepoDvp have no upgrade entry point, so a fix to any of them means a new deployment and moving
+  live state across. RepoDvp and ExitDesk are tracked in #837; CreditLine and PledgeVault have no
+  tracking issue yet.
+- **No role setter outside Registry and PriceGuard.** CreditLine, PledgeVault, ExitDesk and
+  RepoDvp fix their admin and other roles at `initialize` and expose no rotation, so a lost or
+  compromised role key can only be replaced by redeploying. Registry and PriceGuard rotate roles
+  through #93 and #94. No tracking issue yet for the other four.
+- **CreditLine and PledgeVault pause flags have no writer.** `draw` and `pledge` check flags in
+  their own contract's storage, but `pause::set_paused` is reached only through `Registry::pause`,
+  which writes Registry's storage, so those scopes cannot be set on a deployment. ExitDesk and
+  RepoDvp now have their own `pause` (#30, #32). Tracked in #210.
