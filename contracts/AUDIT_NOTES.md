@@ -160,6 +160,17 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   readable error, not for safety: the swap was already atomic, and a short float used to fail in the
   USDC token's own transfer. `available_usdc` is the same balance as a free read; like a quote, it
   can be out of date by the time an exit lands.
+- **Storage lifetime.** Every entry point extends the instance (asset configs, the USDC address,
+  roles and pause flags) to about 30 days, and every write of an asset's `Inventory` extends that
+  entry to about 30 days. `extend_ttl(asset)` is a permissionless keep-alive for a desk that sees no
+  traffic for longer. Before this nothing was extended, so an idle desk's instance or inventory
+  could be archived and `exit` and `withdraw` fail until someone restored it (#208).
+- **The per-holder daily counter is temporary storage.** `DailyUsed(holder, asset, day)` is only
+  read for the current UTC day, so it lives in temporary storage with about 2 days of ledgers from
+  its last write and then expires. It used to be persistent, which left one entry per holder, asset
+  and day on the ledger for good. The 2 days assume ledgers close in about 5 seconds; if they closed
+  at under half that, an entry written early in a day could expire before the day ended and that
+  holder's cap would reset early.
 
 ## RepoDvP
 
