@@ -18,6 +18,18 @@
 //! another agent, not stable to depend on in this pass). A later integration pass would sync
 //! these from `Registry` instead of duplicating admin input here.
 //!
+//! **`configure_asset` constraints (#135).** `configure_asset` refuses, before anything is stored:
+//! - `haircut_bps > 10_000` (`risk::validate_haircut_bps`: "risk: haircut_bps cannot exceed 10000
+//!   bps (100%)"). Stored, it would make every `draw`, `ltv`, `poke`, `liquidate` and
+//!   `PledgeVault::release` for the asset panic in `risk::collateral_value`.
+//! - thresholds that are not `0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`
+//!   (`MarginThresholds::validate`, messages prefixed `margin:`). A zero `liquidation_bps` would
+//!   arm even a zero-debt line; out-of-order thresholds make `Warning`/`MarginCall` unreachable.
+//!
+//! `price_guard` and `usdc` are `Address` values, which have no zero/null form on Soroban, so
+//! there is no "zero address" to reject; a wrong address surfaces at the first price read or
+//! transfer.
+//!
 //! **Collateral sync.** `PledgeVault` reports a line's units through `sync_from_vault` in the same
 //! transaction as every pledge, release, lien confirmation and liquidation, so `pledged_units`
 //! moves with the vault's balance. (It used to change only when the keeper ran `sync_collateral`,
@@ -1337,6 +1349,82 @@ mod test {
                 liquidation_bps: 9_000,
             },
         );
+    }
+
+    // --- configure_asset validation (#135) ------------------------------------------------
+
+    fn configure_with(h: &Harness, haircut_bps: u32, w: u32, m: u32, l: u32) -> Address {
+        let asset = Address::generate(&h.env);
+        h.credit_line.configure_asset(
+            &h.admin,
+            &asset,
+            &h.price_guard.address,
+            &h.token.address,
+            &haircut_bps,
+            &MarginThresholds {
+                warning_bps: w,
+                margin_call_bps: m,
+                liquidation_bps: l,
+            },
+        );
+        asset
+    }
+
+    #[test]
+    #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
+    fn configure_asset_rejects_a_haircut_above_one_hundred_percent_with_the_shared_message() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 10_001, 7_000, 8_000, 9_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: warning_bps must be greater than zero")]
+    fn configure_asset_rejects_a_zero_warning_threshold() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 500, 0, 8_000, 9_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: margin_call_bps must be greater than zero")]
+    fn configure_asset_rejects_a_zero_margin_call_threshold() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 500, 7_000, 0, 9_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: liquidation_bps must be greater than zero")]
+    fn configure_asset_rejects_a_zero_liquidation_threshold() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 500, 7_000, 8_000, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: margin_call_bps must be below liquidation_bps")]
+    fn configure_asset_rejects_equal_margin_call_and_liquidation_thresholds() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 500, 7_000, 9_000, 9_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: warning_bps must be below margin_call_bps")]
+    fn configure_asset_rejects_inverted_thresholds() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 500, 9_000, 8_000, 7_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "margin: liquidation_bps cannot exceed 10000 bps (100%)")]
+    fn configure_asset_rejects_a_liquidation_threshold_above_one_hundred_percent() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        configure_with(&h, 500, 7_000, 8_000, 10_001);
+    }
+
+    #[test]
+    fn configure_asset_accepts_the_boundary_values() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        // 100% haircut and a 100% liquidation threshold are the largest accepted values.
+        configure_with(&h, 10_000, 1, 2, 10_000);
+        configure_with(&h, 0, 7_000, 8_000, 9_000);
     }
 
     // --- open input bounds ----------------------------------------------------------------
