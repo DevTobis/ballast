@@ -76,15 +76,19 @@ export async function createKeeperContext(): Promise<KeeperContext> {
   };
 }
 
-export async function runSingleJob(
-  name: string,
-  ctx: KeeperContext,
-  options: { dryRun?: boolean } = {},
-): Promise<JobResult> {
-  const { db, creditLineClient, pledgeVaultClient, repoDvpClient, signer, alerter, network, logger } = ctx;
-  if (options.dryRun) {
-    logger.info({ job: name, dryRun: true }, "keeper: dry-run mode enabled");
-  }
+/** Job names accepted by `runSingleJob` and the run-once CLI (`src/cli.ts`). */
+export const KEEPER_JOBS = [
+  "cure-expiry",
+  "repo-unwind",
+  "repo-margin",
+  "interest-accrual",
+  "sync-collateral",
+  "balance",
+] as const;
+
+/** Runs one job once, outside the scheduler. The caller is responsible for the advisory lock. */
+export async function runSingleJob(name: string, ctx: KeeperContext): Promise<JobResult> {
+  const { db, creditLineClient, pledgeVaultClient, repoDvpClient, signer, alerter, network } = ctx;
   switch (name) {
     case "repo-unwind":
       return runRepoUnwindJob(db, repoDvpClient, signer);
@@ -105,9 +109,7 @@ export async function runSingleJob(
       return { processed: 1, skipped: 0, errors: [] };
     }
     default:
-      throw new Error(
-        `Unknown job: "${name}". Valid jobs: cure-expiry, repo-unwind, repo-margin, interest-accrual, sync-collateral, balance`,
-      );
+      throw new Error(`Unknown job: "${name}". Valid jobs: ${KEEPER_JOBS.join(", ")}`);
   }
 }
 

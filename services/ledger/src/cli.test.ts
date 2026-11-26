@@ -5,9 +5,10 @@ import type { ReconciliationReport } from "./reconcile.js";
 import cron from "node-cron";
 
 describe("ledger cli", () => {
-  it("does not start cron schedule upon import", () => {
+  it("does not start the cron schedule when imported", async () => {
+    vi.resetModules();
     const cronSpy = vi.spyOn(cron, "schedule");
-    // Verify no cron task was registered
+    await import("./cli.js");
     expect(cronSpy).not.toHaveBeenCalled();
     cronSpy.mockRestore();
   });

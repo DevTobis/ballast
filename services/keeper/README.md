@@ -51,13 +51,18 @@ pnpm --filter @ballast/service-keeper build && pnpm --filter @ballast/service-ke
 Run a single keeper job immediately and exit (useful for drills, testing, and incident response):
 
 ```bash
-pnpm --filter @ballast/service-keeper run-once <job-name> [--dry-run]
+pnpm --filter @ballast/service-keeper run-once <job-name>
 # or via compiled dist:
-node dist/cli.js run <job-name> [--dry-run]
+node dist/cli.js run <job-name>
 ```
 
 Available jobs: `cure-expiry`, `repo-unwind`, `repo-margin`, `sync-collateral`, `interest-accrual`, `balance`.
-The CLI prints the JSON `JobResult` and exits with code 1 if errors occurred or 0 on success.
+The CLI prints the JSON `JobResult` and exits with code 1 if any row errored or the job crashed, 0 otherwise.
+It takes the same Postgres advisory lock as the scheduled job (`keeper:<job>`, or `keeper:global` with
+`KEEPER_LOCK_SCOPE=global`), so if the running keeper is in the middle of that job it refuses with exit
+code 1 instead of racing it. Other jobs on the live keeper can still run at the same moment and share the
+keeper account's sequence number, so prefer stopping the scheduler (or running during a quiet window)
+for anything but a read-mostly job. There is no `--dry-run`: every job signs and submits transactions.
 
 The repo-root `.env` is loaded automatically. `scripts/dev-setup.sh` writes one and sets the cure-expiry,
 repo-unwind and repo-margin schedules to every minute for local work.

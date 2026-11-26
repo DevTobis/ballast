@@ -1,71 +1,97 @@
-import { describe, it, expect, vi } from "vitest";
-import { parseCliArgs, runCli } from "./cli.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KeeperContext } from "./index.js";
 import type { JobResult } from "./jobs/types.js";
 
-describe("keeper cli", () => {
-  describe("parseCliArgs", () => {
-    it("parses job name with 'run' prefix", () => {
-      const opts = parseCliArgs(["run", "cure-expiry"]);
-      expect(opts).toEqual({ jobName: "cure-expiry", dryRun: false });
-    });
+const runSingleJob = vi.fn<(name: string, ctx: KeeperContext) => Promise<JobResult>>();
+vi.mock("./index.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./index.js")>()),
+  runSingleJob: (name: string, ctx: KeeperContext) => runSingleJob(name, ctx),
+}));
 
-    it("parses job name directly without 'run' prefix", () => {
-      const opts = parseCliArgs(["cure-expiry"]);
-      expect(opts).toEqual({ jobName: "cure-expiry", dryRun: false });
-    });
+const { parseCliArgs, runCli } = await import("./cli.js");
 
-    it("parses --dry-run flag", () => {
-      const opts1 = parseCliArgs(["run", "cure-expiry", "--dry-run"]);
-      expect(opts1).toEqual({ jobName: "cure-expiry", dryRun: true });
+function fakeContext(lockHeld = false) {
+  const unlock = vi.fn().mockResolvedValue(undefined);
+  const release = vi.fn();
+  const acquire = vi.fn().mockResolvedValue(lockHeld ? null : { unlock, release });
+  const endDb = vi.fn().mockResolvedValue(undefined);
+  const endSql = vi.fn().mockResolvedValue(undefined);
+  const ctx = {
+    db: { $client: { end: endDb } },
+    rawSql: { end: endSql },
+    lockProvider: { acquire },
+  } as unknown as KeeperContext;
+  return { ctx, acquire, unlock, release, endDb, endSql };
+}
 
-      const opts2 = parseCliArgs(["--dry-run", "cure-expiry"]);
-      expect(opts2).toEqual({ jobName: "cure-expiry", dryRun: true });
-    });
-
-    it("throws usage error when no job name is provided", () => {
-      expect(() => parseCliArgs([])).toThrow("Usage: keeper-cli [run] <job-name> [--dry-run]");
-      expect(() => parseCliArgs(["run"])).toThrow("Usage: keeper-cli [run] <job-name> [--dry-run]");
-      expect(() => parseCliArgs(["--dry-run"])).toThrow("Usage: keeper-cli [run] <job-name> [--dry-run]");
-    });
+describe("parseCliArgs", () => {
+  it("accepts the job name with or without the 'run' prefix", () => {
+    expect(parseCliArgs(["run", "cure-expiry"])).toEqual({ jobName: "cure-expiry" });
+    expect(parseCliArgs(["sync-collateral"])).toEqual({ jobName: "sync-collateral" });
   });
 
-  describe("runCli", () => {
-    it("runs job successfully and returns 0 exit code on no errors", async () => {
-      const mockResult: JobResult = { processed: 2, skipped: 1, errors: [] };
-      const endDb = vi.fn().mockResolvedValue(undefined);
-      const endSql = vi.fn().mockResolvedValue(undefined);
+  it("rejects a missing, unknown or extra job name with usage text", () => {
+    expect(() => parseCliArgs([])).toThrow("Usage: keeper-cli");
+    expect(() => parseCliArgs(["run"])).toThrow("Usage: keeper-cli");
+    expect(() => parseCliArgs(["run", "nope"])).toThrow('Unknown job "nope"');
+    expect(() => parseCliArgs(["cure-expiry", "balance"])).toThrow("Usage: keeper-cli");
+  });
 
-      const mockCtx = {
-        db: { $client: { end: endDb } },
-        rawSql: { end: endSql },
-        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-        alerter: { fire: vi.fn() },
-        creditLineClient: {},
-        pledgeVaultClient: {},
-        repoDvpClient: {},
-        signer: { publicKey: () => "GABC" },
-        network: { horizonUrl: "http://horizon" },
-      } as unknown as KeeperContext;
+  it("refuses --dry-run, because jobs submit transactions directly", () => {
+    expect(() => parseCliArgs(["run", "cure-expiry", "--dry-run"])).toThrow("--dry-run is not supported");
+    expect(() => parseCliArgs(["cure-expiry", "--force"])).toThrow('Unknown option "--force"');
+  });
+});
 
-      const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+describe("runCli", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    runSingleJob.mockReset();
+  });
 
-      // Mock runSingleJob via vi.mock or inline test context
-      const fakeContextFactory = vi.fn().mockResolvedValue(mockCtx);
+  it("returns 1 on a usage error without building a context", async () => {
+    const factory = vi.fn();
+    expect(await runCli([], factory)).toBe(1);
+    expect(factory).not.toHaveBeenCalled();
+  });
 
-      // Test with unknown job name to check error exit code
-      const exitCodeInvalid = await runCli(["unknown-job"], fakeContextFactory);
-      expect(exitCodeInvalid).toBe(1);
+  it("runs the job under its advisory lock, prints the result and exits 0", async () => {
+    const f = fakeContext();
+    const result: JobResult = { processed: 2, skipped: 1, errors: [] };
+    runSingleJob.mockResolvedValue(result);
 
-      consoleSpy.mockRestore();
-    });
+    expect(await runCli(["run", "cure-expiry"], async () => f.ctx)).toBe(0);
+    expect(f.acquire).toHaveBeenCalledWith("keeper:cure-expiry");
+    expect(runSingleJob).toHaveBeenCalledWith("cure-expiry", f.ctx);
+    expect(console.log).toHaveBeenCalledWith(JSON.stringify(result, null, 2));
+    expect(f.unlock).toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalled();
+    expect(f.endDb).toHaveBeenCalled();
+    expect(f.endSql).toHaveBeenCalled();
+  });
 
-    it("returns exit code 1 on missing arguments", async () => {
-      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const exitCode = await runCli([]);
-      expect(exitCode).toBe(1);
-      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("Usage: keeper-cli"));
-      consoleErrorSpy.mockRestore();
-    });
+  it("exits 1 when any row errored", async () => {
+    const f = fakeContext();
+    runSingleJob.mockResolvedValue({ processed: 1, skipped: 0, errors: [{ id: "7", message: "boom" }] });
+    expect(await runCli(["cure-expiry"], async () => f.ctx)).toBe(1);
+  });
+
+  it("exits 1 when the job crashes, and still releases the lock and pools", async () => {
+    const f = fakeContext();
+    runSingleJob.mockRejectedValue(new Error("rpc down"));
+    expect(await runCli(["cure-expiry"], async () => f.ctx)).toBe(1);
+    expect(f.unlock).toHaveBeenCalled();
+    expect(f.endDb).toHaveBeenCalled();
+  });
+
+  it("refuses to run when the scheduled keeper holds the job's lock", async () => {
+    const f = fakeContext(true);
+    expect(await runCli(["cure-expiry"], async () => f.ctx)).toBe(1);
+    expect(runSingleJob).not.toHaveBeenCalled();
+    expect(f.endDb).toHaveBeenCalled();
   });
 });
