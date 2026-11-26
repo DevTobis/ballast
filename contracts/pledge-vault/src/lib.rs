@@ -732,7 +732,9 @@ mod test {
             Lender,
             Status,
             Asset,
+            LineAsset(u64),
             Synced,
+            SyncedLine,
         }
 
         #[contractimpl]
@@ -793,22 +795,35 @@ mod test {
                 env.storage().instance().set(&DataKey::Asset, &asset);
             }
 
-            pub fn asset_of(env: Env, _line: u64) -> Address {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::Asset)
-                    .expect("mock-credit-line: asset not set")
+            pub fn set_line_asset(env: Env, line: u64, asset: Address) {
+                env.storage().instance().set(&DataKey::LineAsset(line), &asset);
+            }
+
+            pub fn asset_of(env: Env, line: u64) -> Address {
+                if let Some(asset) = env.storage().instance().get(&DataKey::LineAsset(line)) {
+                    asset
+                } else {
+                    env.storage()
+                        .instance()
+                        .get(&DataKey::Asset)
+                        .expect("mock-credit-line: asset not set")
+                }
             }
 
             /// Records the last figure the vault reported, so tests can see that every change to a
             /// position reached the credit line in the same transaction.
-            pub fn sync_from_vault(env: Env, vault: Address, _line: u64, _asset: Address, units: i128) {
+            pub fn sync_from_vault(env: Env, vault: Address, line: u64, _asset: Address, units: i128) {
                 vault.require_auth();
                 env.storage().instance().set(&DataKey::Synced, &units);
+                env.storage().instance().set(&DataKey::SyncedLine, &line);
             }
 
             pub fn synced_units(env: Env) -> i128 {
                 env.storage().instance().get(&DataKey::Synced).unwrap_or(-1)
+            }
+
+            pub fn synced_line(env: Env) -> u64 {
+                env.storage().instance().get(&DataKey::SyncedLine).unwrap_or(0)
             }
         }
     }
@@ -993,6 +1008,63 @@ mod test {
         h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
 
         h.vault.release(&h.borrower, &1, &h.asset, &PRICE_SCALE);
+    }
+
+    // ── #190: release around the Warning threshold, using the issue's numbers ─────────────
+    //
+    // `release` only succeeds when the line stays Healthy (#1116 / #181); Warning is never allowed.
+    // `main` already covers the same boundary under the default thresholds
+    // (`release_leaving_ltv_exactly_at_the_warning_threshold_panics` and its one-bp-under twin).
+    // These tests use the issue's 700 debt / 1,000 pledge figures, so they are a worked example
+    // of #190 rather than new coverage.
+
+    #[test]
+    fn release_passes_at_7990_bps_when_still_healthy() {
+        // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
+        // Releasing 124 leaves 876 collateral units.
+        // Collateral value = 876 * 1.0 = 876 (haircut 0).
+        // LTV bps = 700 * 10_000 / 876 = 7,990 bps.
+        // With warning_bps moved to 8,000, 7,990 bps is still Healthy (< 8,000 bps), so the
+        // release succeeds. It would fail under the default 7,000 warning threshold (see below).
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(124 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 876 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_panics_at_exactly_8000_bps_at_the_warning_threshold() {
+        // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
+        // Releasing 125 leaves 875 collateral units.
+        // Collateral value = 875 * 1.0 = 875 (haircut 0).
+        // LTV bps = 700 * 10_000 / 875 = exactly 8,000 bps.
+        // With `bands(8_000, 8_500, 9_000)`, 8,000 bps is exactly the Warning threshold, so the
+        // line would no longer be Healthy and the release panics.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(125 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_at_7990_bps_panics_under_default_warning_threshold_after_rule_update() {
+        // Under default thresholds (warning_bps: 7_000, margin_call_bps: 8_000, liquidation_bps: 9_000)
+        // and following the rule update in #181 (where release requires MarginState::Healthy),
+        // releasing 124 leaves 876 collateral -> 7,990 bps.
+        // Because 7,990 bps >= 7,000 bps (Warning band), release panics under the updated rule.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(124 * PRICE_SCALE));
     }
 
     #[test]
@@ -2075,6 +2147,92 @@ mod test {
         assert_eq!(confirmed.pending_lien_units, 150 * PRICE_SCALE);
         assert_eq!(confirmed.mode, CustodyMode::IssuerLien);
         assert_eq!(confirmed.lien_ref, Some(lien_ref));
+    }
+
+    #[test]
+    fn position_isolation_per_line_and_asset_and_defaults_for_unknown_keys() {
+        let h = setup(0, 0, PRICE_SCALE);
+
+        // Unknown key returns 0 units
+        assert_eq!(h.vault.position_units(&99, &h.asset), 0);
+        let unknown_asset = Address::generate(&h.env);
+        assert_eq!(h.vault.position_units(&1, &unknown_asset), 0);
+
+        // Register and configure a second asset
+        let token2_id = h.env.register(mock_token::MockToken, ());
+        let token2 = mock_token::MockTokenClient::new(&h.env, &token2_id);
+        h.vault.configure_asset(
+            &h.admin,
+            &token2_id,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &0,
+            &h.thresholds,
+            &CustodyMode::Escrow,
+        );
+
+        // Configure line assets on mock credit line
+        h.credit_line.set_line_asset(&1, &h.asset);
+        h.credit_line.set_line_asset(&2, &token2_id);
+        h.credit_line.set_line_asset(&3, &h.asset);
+        h.credit_line.set_line_asset(&4, &token2_id);
+
+        // Mint balances to borrower
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        token2.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+
+        // Pledge on 4 distinct (line, asset) pairs:
+        // (Line 1, Asset 1): 100
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 1);
+        assert_eq!(h.credit_line.synced_units(), 100 * PRICE_SCALE);
+
+        // (Line 2, Asset 2): 200
+        h.vault.pledge(&h.borrower, &2, &token2_id, &(200 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 2);
+        assert_eq!(h.credit_line.synced_units(), 200 * PRICE_SCALE);
+
+        // (Line 3, Asset 1): 300
+        h.vault.pledge(&h.borrower, &3, &h.asset, &(300 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 3);
+        assert_eq!(h.credit_line.synced_units(), 300 * PRICE_SCALE);
+
+        // (Line 4, Asset 2): 400
+        h.vault.pledge(&h.borrower, &4, &token2_id, &(400 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 4);
+        assert_eq!(h.credit_line.synced_units(), 400 * PRICE_SCALE);
+
+        // Verify initial state across all positions
+        assert_eq!(h.vault.position_units(&1, &h.asset), 100 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 400 * PRICE_SCALE);
+
+        // Release 40 from (Line 1, Asset 1)
+        h.vault.release(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 1);
+        assert_eq!(h.credit_line.synced_units(), 60 * PRICE_SCALE);
+
+        // Verify (Line 1, Asset 1) is reduced to 60 while all other positions are unchanged
+        assert_eq!(h.vault.position_units(&1, &h.asset), 60 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 400 * PRICE_SCALE);
+
+        // Release 50 from (Line 4, Asset 2)
+        h.vault.release(&h.borrower, &4, &token2_id, &(50 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 4);
+        assert_eq!(h.credit_line.synced_units(), 350 * PRICE_SCALE);
+
+        // Verify (Line 4, Asset 2) is reduced to 350 while all other positions remain unchanged
+        assert_eq!(h.vault.position_units(&1, &h.asset), 60 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 350 * PRICE_SCALE);
+
+        // Never-used (line, asset) key remains 0
+        assert_eq!(h.vault.position_units(&99, &h.asset), 0);
+        assert_eq!(h.vault.position_units(&1, &Address::generate(&h.env)), 0);
     }
 
     // TODO: set these flags through a real on-chain pause entry point once pause wiring lands.

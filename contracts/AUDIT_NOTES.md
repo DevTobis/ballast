@@ -8,7 +8,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | Role | Can | Cannot |
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key; withdraw ExitDesk's **own** USDC float and RWA inventory (see [ExitDesk](#exitdesk)); change the parameters listed in [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value), most of them immediately | transfer a borrower's pledged collateral, a lender's committed USDC or a repo party's cash or collateral (see [RepoDvP](#repodvp)) directly: CreditLine, PledgeVault and RepoDvp have no `admin_withdraw`/sweep, and every transfer of those funds needs the owning party's auth or a keeper path; sign for a borrower or lender |
-| `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
+| `pauser` | pause exits on ExitDesk and new repo activity on RepoDvp, each through that contract's own `pause`; set Registry's own flags (not read by any other contract, see #210) | pause repayment, release or withdrawal paths (invariant 5); pause draws or pledges (CreditLine and PledgeVault have no `pause`, #210) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
@@ -54,7 +54,7 @@ no timelock, and applies to positions that are already open.
 | PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and LTV before `release`, and reports collateral to | none |
 | PledgeVault | `configure_asset` | `custody_mode` | escrow or issuer-lien custody for new pledges; a position that still holds units keeps its mode and refuses pledges in the other one | none |
 | PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
-| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
+| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
 | ExitDesk | `set_usdc` | USDC address | the token exits pay out in | none |
 | RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | none (#215) |
 | RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | none (#215) |
@@ -76,6 +76,58 @@ machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
 before #78 and silently removed a state (`Warning` or `MarginCall`). Thresholds stored before that
 change are not re-checked; calling `configure_asset` again is the only way to replace them.
 
+## Admin and operational timelocks (Registry and PriceGuard)
+
+Protocol parameter changes, role rotations, and code upgrades are governed by an explicit 48-hour timelock (`ballast_common::timelock::TIMELOCK_DELAY_SECONDS = 172_800`). However, certain emergency and onboarding operations are intentionally immediate.
+
+The table below catalogs every admin, risk, and pauser entry point in `Registry` and `PriceGuard`, documenting caller permissions, execution delay, whether an immediate delay is intended or an open gap, and the security rationale.
+
+### Registry admin functions
+
+| Function | Caller | Delay | Status | Rationale |
+|---|---|---|---|---|
+| `initialize` | Anyone (first caller) | Immediate | Open gap | One-time bootstrap; later calls panic (`registry: already initialized`). There is **no auth check**, so whoever calls it first sets every role. Deploy and `initialize` must run back to back in the same script, and the script must read `roles` back to confirm (see Missing hardening in `AUDIT_NOTES.md`). |
+| `propose_admin` | Current Admin | Immediate | Intended | Leg 1 of two-step admin transfer; sets pending admin without transferring authority until accepted. |
+| `accept_admin` | Nominated Admin | Immediate | Intended | Leg 2 of two-step admin transfer; completes transfer upon recipient confirmation, preventing loss of admin access from typos. |
+| `queue_role_change` | Admin | 48h timelock | Intended | Enforces 48h advance notice before changing operational role addresses (`Pauser`, `Keeper`, `PricePublisher`, `Risk`). |
+| `execute_role_change` | Anyone | 48h after queue | Intended | Permissionless execution once the 48h timelock has elapsed. |
+| `register_asset` | Admin | Immediate | Intended | Onboarding a new asset does not modify existing risk parameters, haircuts, or active borrower positions; users opt in to new assets. |
+| `queue_param` | Admin | 48h timelock | Intended | Changes one `ParamChange` variant: `HaircutBaseBps`, `HaircutFxBps`, `PriceBandBps`, `DailyMoveBandBps`, `RedemptionLagDays` or `Status`. These are Registry's own asset parameters; the other contracts read their own config, not Registry's. 48h notice gives operators and users time to react. |
+| `cancel_param` | Admin | Immediate | Intended | Safely cancels a pending parameter change before execution if market conditions shift or an error is caught. |
+| `execute_param` | Anyone | 48h after queue | Intended | Applies queued parameter changes once the 48h timelock has elapsed. |
+| `raise_haircut_now` | Risk | Immediate | Intended | Emergency solvency defense: if an RWA depegs or shows market stress, risk can immediately raise haircuts (tighten risk) to protect the protocol. Can only increase, never decrease. |
+| `pause` | Pauser | Immediate | Intended / Open gap (#210) | Immediate by design, so an incident can be stopped at once. But it sets only Registry's own flag: no other contract reads Registry's pause storage, so it does not freeze draws, pledges, exits or repos today. ExitDesk and RepoDvp have their own `pause`; CreditLine and PledgeVault have none (#210). |
+| `queue_unpause` | Admin | 48h timelock | Intended | Resuming protocol operations after an incident requires 48h notice so users can review the post-incident state before normal activity resumes. |
+| `cancel_unpause` | Admin | Immediate | Intended | Cancels a queued unpause if investigation reveals an ongoing vulnerability. |
+| `execute_unpause` | Anyone | 48h after queue | Intended | Unpauses the target scope once the 48h timelock has elapsed. |
+| `queue_upgrade` | Admin | 48h timelock | Intended | In-place WASM bytecode upgrade changes contract logic; 48h delay provides an opt-out window for capital providers. |
+| `cancel_upgrade` | Admin | Immediate | Intended | Safely aborts a proposed contract upgrade during the review delay. |
+| `execute_upgrade` | Anyone | 48h after queue | Intended | Deploys new WASM bytecode once the 48h delay has elapsed. |
+
+### PriceGuard admin functions
+
+| Function | Caller | Delay | Status | Rationale |
+|---|---|---|---|---|
+| `initialize` | Anyone (first caller) | Immediate | Open gap | One-time bootstrap; later calls panic (`price-guard: already initialized`). There is **no auth check**, so whoever calls it first becomes admin. Deploy and `initialize` must run back to back, and the deploy script must read the roles back to confirm. |
+| `propose_admin` | Current Admin | Immediate | Intended | Two-step admin transfer nomination without immediate privilege transfer. |
+| `accept_admin` | Nominated Admin | Immediate | Intended | Finalizes admin role transfer upon explicit recipient confirmation. |
+| `queue_role_change` | Admin | 48h timelock | Intended | 48h delay before changing operational roles (`Pauser`, `Keeper`, `PricePublisher`, `Risk`). |
+| `execute_role_change` | Anyone | 48h after queue | Intended | Permissionless execution after the 48h delay has elapsed. |
+| `queue_upgrade` | Admin | 48h timelock | Intended | In-place bytecode upgrades change pricing and circuit breaker logic; requires 48h notice. |
+| `cancel_upgrade` | Admin | Immediate | Intended | Aborts a proposed contract bytecode upgrade. |
+| `execute_upgrade` | Anyone | 48h after queue | Intended | Applies bytecode upgrade after the 48h delay has elapsed. |
+| `configure_asset` | Admin | Dynamic | Intended | Initial asset onboarding and tightening safety bands (narrower price band, shorter max staleness) take effect immediately to enhance security. Loosening bands requires 48h timelock via `queue_config` to prevent stealth weakening of outlier defenses. |
+| `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. |
+| `configure_signature_requirement` | Admin | Dynamic | Intended | Requiring signatures (`required = true`) strengthens security and takes effect immediately. Turning an existing requirement off (`true` → `false`) relaxes security and must go through the 48h timelock via `queue_config`. Exception: if the flag has never been set, the first call applies immediately even with `required = false` (`contracts/price-guard/src/lib.rs`, `configure_signature_requirement`). |
+| `remove_source` | Admin | Immediate | Intended / Open Gap (#84) | Immediate removal allows admins to drop an exploited, manipulated, or failing oracle source. Open issue [#84](https://github.com/DevTobis/ballast/issues/84) tracks adding an admin allowlist of valid sources. |
+| `queue_config` | Admin | 48h timelock | Intended | Queues loosening configuration changes (`Asset`, `IssuerPubKey`, `SignatureRequirement`) with 48h delay. |
+| `cancel_config` | Admin | Immediate | Intended | Safely cancels an unexecuted queued config change. |
+| `execute_config` | Anyone | 48h after queue | Intended | Applies queued loosening configurations once the 48h delay has elapsed. |
+| `confirm_halt_cleared` | Risk | Immediate | Intended / Open Gap (#807) | Circuit breaker unlatch. When a large price jump trips the circuit breaker, the price locks at `LastGood`. Once human risk operators verify off-chain conditions, unlatching must be immediate to restore trading. Open issue [#807](https://github.com/DevTobis/ballast/issues/807) tracks missing validations when asset is not halted or not configured. |
+
+### Related open gaps in other protocol contracts
+- `ExitDesk.configure_asset`: since #214, a new `price_guard`, a lower spread or a higher cap must go through `queue_configure_asset` (48h); tightening and an asset's first listing stay immediate.
+- `RepoDvP.configure_asset`: Currently immediate for all changes; open issue [#215](https://github.com/DevTobis/ballast/issues/215) tracks placing margin and haircut loosening behind the 48h timelock.
 ## Registry
 
 - **Holds no funds.** Registry stores role addresses, per-asset `AssetConfig`s and timelocked pending
@@ -215,7 +267,9 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
   closes the line. The lender cannot choose the price, understate the collateral, or close while
   collateral remains in the vault, but **can choose when to close**; until they do the line stays
-  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close.
+  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
+  (no principal, interest, fee or funding left) can be closed by its lender or borrower with
+  `close`; `close` refuses a `Liquidating` line, so it cannot bypass `close_liquidated` (#130).
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
@@ -334,6 +388,14 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 ## Known limits
 
+- **Emergency pause wiring across contracts.** There is no central pause: each contract reads
+  pause flags from its own instance storage, and `Registry::pause` writes only Registry's, which no
+  other contract reads. ExitDesk (`pause`, #30) and RepoDvp (`pause`, #32) can each be paused
+  directly, with a timelocked unpause, so an emergency stop means calling `pause` on each of them
+  separately. CreditLine (`Draws`) and PledgeVault (`Pledges`) have no `pause` entry point at all,
+  so those two scopes can never be set on a deployment (#210).
+  - [ ] Follow-up: update this note once CreditLine and PledgeVault get a pause writer or a central
+    pause lands.
 - Real RWAs cannot be held by these contracts unless the issuer allows it (`AUTH_REQUIRED`
   issuers must authorise the vault's trustline). Etherfuse's issuer sets `auth_revocable` and
   `clawback_enabled`, so it can freeze or claw back tokens held in the vault; price that in.
@@ -342,6 +404,22 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
   scripts in `scripts/` exercise them on testnet.
 
+## PRD Invariants Traceability (RepoDvP & ExitDesk)
+
+Traceability matrix mapping core PRD invariants (§8) to unit and integration test coverage across `RepoDvP` and `ExitDesk`.
+
+| Invariant | Description | Contract | Status | Covering Test(s) / Gap Issue |
+|---|---|---|---|---|
+| **2** | No draws/exits/repos on a bad price (must be `Ok`) | `ExitDesk` | Covered | `test::exit_panics_on_degraded_price`<br>`test::exit_panics_on_halted_price` |
+| **2** | No draws/exits/repos on a bad price (must be `Ok`) | `RepoDvP` | NOT COVERED | Gap: `propose` and `accept_and_settle` never read `PriceGuard` (see [#1278](https://github.com/DevTobis/ballast/issues/1278)) |
+| **5** | Pausing cannot move funds; blocks new risk only | `ExitDesk` | Covered | `test::pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work`<br>`test::pauser_can_pause_all_and_exit_panics_while_quote_and_withdraw_work` |
+| **5** | Pausing cannot move funds; blocks new risk only | `RepoDvP` | Covered | `test::sac::pausing_repos_stops_accept_and_settle`<br>`test::sac::pausing_all_stops_accept_and_settle_too`<br>`test::sac::unwind_still_works_while_paused`<br>`test::sac::margin_cure_and_default_paths_still_work_while_paused`<br>`test::sac::default_close_still_works_while_paused` |
+| **6** | Admin cannot move user funds | `ExitDesk` | Partial | By design the admin **can** withdraw the desk's own USDC float and RWA inventory (`test::the_admin_can_take_the_usdc_float_back_out`, `test::withdrawing_rwa_inventory_frees_room_under_the_inventory_cap`); `test::only_the_admin_can_withdraw` shows nobody else can. This exception is documented under [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value) (#209). Holder funds never sit in the desk between calls, since `exit` is atomic. |
+| **6** | Admin cannot move user funds | `RepoDvP` | NOT COVERED | Gap: No admin fund sweep function exists, but no explicit negative unit test asserts immobility of pledged user funds against admin keys (see [#1279](https://github.com/DevTobis/ballast/issues/1279)) |
+| **7** | Repo / swap legs are atomic (both settle or neither) | `ExitDesk` | Covered | `test::exit_happy_path_settles_both_legs`<br>`test::an_exit_refused_for_a_short_float_changes_nothing`<br>`test::exit_panics_when_the_float_is_one_stroop_short_of_the_payout` |
+| **7** | Repo / swap legs are atomic (both settle or neither) | `RepoDvP` | Covered | `test::accept_and_settle_reverts_atomically_on_insufficient_cash` |
+| **8** | Issuer controls stay intact (unauthorized recipient reverts) | `ExitDesk` | NOT COVERED | Gap: In-crate unit tests use mock tokens without Stellar Asset Contract (SAC) `AUTH_REQUIRED` verification (see [#1280](https://github.com/DevTobis/ballast/issues/1280)) |
+| **8** | Issuer controls stay intact (unauthorized recipient reverts) | `RepoDvP` | NOT COVERED | Gap: In-crate unit tests use mock tokens without SAC authorization revocation checks (see [#1280](https://github.com/DevTobis/ballast/issues/1280)) |
 ### Missing hardening
 
 Each item below is a gap in the current code, not a finding about exploitability. Remove a bullet

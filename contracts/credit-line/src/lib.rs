@@ -170,7 +170,9 @@ pub struct AssetConfig {
 pub enum LineStatus {
     Open,
     Liquidating,
-    /// A liquidated line whose outcome has been booked by `close_liquidated`. Terminal.
+    /// Terminal. Reached either from `Liquidating` through `close_liquidated` (the outcome has
+    /// been booked) or from `Open` through `close`, once a line is fully repaid and the lender has
+    /// withdrawn all funding.
     Closed,
 }
 
@@ -941,6 +943,49 @@ impl CreditLine {
             (Symbol::new(&env, "line_closed"), line),
             (record.debt, recovered, surplus, shortfall),
         );
+    }
+
+    /// Closes a fully repaid `Open` line (#130), so it stops accepting draws and funding and the
+    /// keeper and indexer can treat it as finished. Either the lender or the borrower may call it.
+    ///
+    /// Requires `status == Open` (a `Liquidating` line can only be finished by
+    /// `close_liquidated`, which books the recovery and pays the surplus), and nothing left on the
+    /// line: no principal, accrued interest or accrued fee, and no funding (the lender withdraws it
+    /// first with `withdraw_undrawn`). Repaid interest and fees already credited stay claimable
+    /// through `withdraw_interest` / `claim_fee`, and pledged collateral can still be released from
+    /// `PledgeVault`, since the line owes nothing.
+    ///
+    /// Publishes `(Symbol("line_closed_repaid"), line)` with `caller`. The topic differs from
+    /// `close_liquidated`'s `line_closed`, so an indexer can tell a repaid close from a break-even
+    /// liquidation.
+    pub fn close(env: Env, caller: Address, line: u64) {
+        ttl::extend_instance(&env);
+        caller.require_auth();
+
+        let mut state = read_line(&env, line);
+        assert!(
+            caller == state.lender || caller == state.borrower,
+            "credit-line: not this line's lender or borrower"
+        );
+        assert_eq!(
+            state.status,
+            LineStatus::Open,
+            "credit-line: line is not open"
+        );
+        accrue(&mut state, env.ledger().timestamp());
+        assert!(state.drawn == 0, "credit-line: line has outstanding principal");
+        assert!(
+            state.accrued_interest == 0,
+            "credit-line: line has outstanding interest"
+        );
+        assert!(state.accrued_fee == 0, "credit-line: line has outstanding fees");
+        assert!(state.funded == 0, "credit-line: line has undrawn funds");
+
+        state.status = LineStatus::Closed;
+        write_line(&env, line, &state);
+
+        env.events()
+            .publish((Symbol::new(&env, "line_closed_repaid"), line), caller);
     }
 
     /// Takes undrawn USDC back out of the line (reducing the commitment). Repaid principal returns
@@ -3876,5 +3921,185 @@ mod test {
             })
             .count();
         assert_eq!(count, 0, "no drawn event should be emitted on failed draw");
+    }
+
+    // --- close (#130) -----------------------------------------------------------------------
+
+    /// A line with a draw repaid in full and all funding withdrawn: nothing left on it.
+    fn repaid_line(h: &Harness) -> u64 {
+        let id = open_and_fund(h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+        h.credit_line.repay(&h.borrower, &id, &(500 * PRICE_SCALE));
+        h.credit_line
+            .withdraw_undrawn(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        id
+    }
+
+    #[test]
+    fn close_closes_a_fully_repaid_line_and_publishes_line_closed_repaid() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+
+        h.credit_line.close(&h.borrower, &id);
+
+        // Read the events before any other call: each invocation resets the recorded events.
+        let topic0 = ScVal::Symbol(ScSymbol("line_closed_repaid".try_into().unwrap()));
+        let events = h.env.events().all();
+        let ours: std::vec::Vec<_> = events
+            .filter_by_contract(&h.credit_line.address)
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&topic0),
+            })
+            .cloned()
+            .collect();
+        assert_eq!(ours.len(), 1);
+        let expected: soroban_sdk::Val = h.borrower.clone().into_val(&h.env);
+        match &ours[0].body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(1), Some(&ScVal::U64(id)));
+                assert_eq!(v0.data, ScVal::try_from_val(&h.env, &expected).unwrap());
+            }
+        }
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+    }
+
+    #[test]
+    fn the_lender_can_close_too() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.credit_line.close(&h.lender, &id);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: not this line's lender or borrower")]
+    fn a_stranger_cannot_close() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.credit_line.close(&Address::generate(&h.env), &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line is not open")]
+    fn close_twice_panics() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.credit_line.close(&h.lender, &id);
+        h.credit_line.close(&h.lender, &id);
+    }
+
+    /// The review case: a `Liquidating` line repaid and emptied must not be closed by `close`,
+    /// or `close_liquidated` could never book the outcome and pay the surplus.
+    #[test]
+    #[should_panic(expected = "credit-line: line is not open")]
+    fn close_refuses_a_liquidating_line_even_when_nothing_is_owed() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.env.as_contract(&h.credit_line.address, || {
+            let mut line = read_line(&h.env, id);
+            line.status = LineStatus::Liquidating;
+            write_line(&h.env, id, &line);
+        });
+        h.credit_line.close(&h.lender, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line has outstanding principal")]
+    fn close_refuses_outstanding_principal() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+        h.credit_line.close(&h.lender, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line has outstanding interest")]
+    fn close_refuses_outstanding_interest() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.env.as_contract(&h.credit_line.address, || {
+            let mut line = read_line(&h.env, id);
+            line.accrued_interest = 50 * PRICE_SCALE;
+            write_line(&h.env, id, &line);
+        });
+        h.credit_line.close(&h.lender, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line has outstanding fees")]
+    fn close_refuses_outstanding_fees() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.env.as_contract(&h.credit_line.address, || {
+            let mut line = read_line(&h.env, id);
+            line.accrued_fee = 5 * PRICE_SCALE;
+            write_line(&h.env, id, &line);
+        });
+        h.credit_line.close(&h.lender, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line has undrawn funds")]
+    fn close_refuses_undrawn_funds() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 500 * PRICE_SCALE);
+        h.credit_line.close(&h.lender, &id);
+    }
+
+    /// The status check, not an empty balance, is what stops the draw: the panic is the
+    /// "not open" one, which `draw` checks before any amount.
+    #[test]
+    #[should_panic(expected = "credit-line: line is not open")]
+    fn a_closed_line_refuses_draws() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.credit_line.close(&h.lender, &id);
+        h.credit_line
+            .draw(&h.borrower, &id, &(100 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line is closed")]
+    fn a_closed_line_refuses_funding() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = repaid_line(&h);
+        h.credit_line.close(&h.lender, &id);
+        h.token.mint(&h.lender, &(500 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(500 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn repaid_interest_stays_withdrawable_after_close() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+        // One year at 10% on 500 is 50 of interest.
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(50 * PRICE_SCALE));
+        h.credit_line.repay(&h.borrower, &id, &(550 * PRICE_SCALE));
+        h.credit_line
+            .withdraw_undrawn(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.close(&h.lender, &id);
+
+        let before = h.token.balance(&h.lender);
+        h.credit_line
+            .withdraw_interest(&h.lender, &id, &(50 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&h.lender) - before, 50 * PRICE_SCALE);
     }
 }

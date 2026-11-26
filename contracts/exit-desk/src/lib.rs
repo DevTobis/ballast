@@ -73,6 +73,9 @@ pub struct AssetConfig {
     pub price_guard: Address,
     pub spread_bps: u32,
     pub per_holder_daily_cap: i128,
+    /// Units of this asset the desk accepts per UTC day across all holders, so splitting an exit
+    /// over fresh addresses cannot get around `per_holder_daily_cap`.
+    pub desk_daily_cap: i128,
     pub desk_inventory_cap: i128,
 }
 
@@ -119,6 +122,9 @@ enum DataKey {
     /// current day's bucket is ever read, so the entry is left to expire instead of piling up one
     /// persistent entry per holder, asset and day (see [`DAILY_USED_TTL_LEDGERS`]).
     DailyUsed(Address, Address, u64),
+    /// Units exited for `asset` across all holders within a given UTC day bucket, for
+    /// `desk_daily_cap`. Temporary storage with the same lifetime as `DailyUsed`.
+    DeskDailyUsed(Address, u64),
     PendingUnpause(u64),
     PendingConfig(u64),
 }
@@ -134,6 +140,10 @@ fn validate_config(config: &AssetConfig) {
         "exit-desk: per_holder_daily_cap must be positive"
     );
     assert!(
+        config.desk_daily_cap > 0,
+        "exit-desk: desk_daily_cap must be positive"
+    );
+    assert!(
         config.desk_inventory_cap > 0,
         "exit-desk: desk_inventory_cap must be positive"
     );
@@ -145,6 +155,7 @@ fn loosens(current: &AssetConfig, next: &AssetConfig) -> bool {
     next.price_guard != current.price_guard
         || next.spread_bps < current.spread_bps
         || next.per_holder_daily_cap > current.per_holder_daily_cap
+        || next.desk_daily_cap > current.desk_daily_cap
         || next.desk_inventory_cap > current.desk_inventory_cap
 }
 
@@ -270,6 +281,7 @@ impl ExitDesk {
         price_guard: Address,
         spread_bps: u32,
         per_holder_daily_cap: i128,
+        desk_daily_cap: i128,
         desk_inventory_cap: i128,
     ) {
         ttl::extend_instance(&env);
@@ -278,6 +290,7 @@ impl ExitDesk {
             price_guard,
             spread_bps,
             per_holder_daily_cap,
+            desk_daily_cap,
             desk_inventory_cap,
         };
         validate_config(&config);
@@ -307,6 +320,7 @@ impl ExitDesk {
         price_guard: Address,
         spread_bps: u32,
         per_holder_daily_cap: i128,
+        desk_daily_cap: i128,
         desk_inventory_cap: i128,
     ) -> u64 {
         ttl::extend_instance(&env);
@@ -315,6 +329,7 @@ impl ExitDesk {
             price_guard,
             spread_bps,
             per_holder_daily_cap,
+            desk_daily_cap,
             desk_inventory_cap,
         };
         validate_config(&config);
@@ -524,10 +539,22 @@ impl ExitDesk {
         env.storage().temporary().get(&key).unwrap_or(0)
     }
 
+    /// Read-only helper returning the units exited for `asset` across all holders within the
+    /// current UTC day (counted against `desk_daily_cap`).
+    pub fn desk_daily_used(env: Env, asset: Address) -> i128 {
+        ttl::extend_instance(&env);
+        let day_bucket = env.ledger().timestamp() / SECONDS_PER_DAY;
+        env.storage()
+            .temporary()
+            .get(&DataKey::DeskDailyUsed(asset, day_bucket))
+            .unwrap_or(0)
+    }
+
     /// Read-only convenience returning remaining capacity in units for `(holder, asset)`:
     /// `(holder_room, desk_room)` for the current UTC day.
     /// `holder_room` is remaining units under `per_holder_daily_cap`.
-    /// `desk_room` is remaining units under `desk_inventory_cap`.
+    /// `desk_room` is remaining units the desk can take today: the smaller of the room under
+    /// `desk_daily_cap` (all holders, this UTC day) and the room under `desk_inventory_cap`.
     /// Both are bounded below by 0.
     pub fn capacity(env: Env, holder: Address, asset: Address) -> (i128, i128) {
         ttl::extend_instance(&env);
@@ -537,11 +564,15 @@ impl ExitDesk {
         let daily_used: i128 = env.storage().temporary().get(&daily_key).unwrap_or(0);
         let holder_room = (config.per_holder_daily_cap - daily_used).max(0);
 
-        let inventory_key = DataKey::Inventory(asset);
+        let inventory_key = DataKey::Inventory(asset.clone());
         let inventory: i128 = env.storage().persistent().get(&inventory_key).unwrap_or(0);
-        let desk_room = (config.desk_inventory_cap - inventory).max(0);
+        let inventory_room = (config.desk_inventory_cap - inventory).max(0);
 
-        (holder_room, desk_room)
+        let desk_daily_key = DataKey::DeskDailyUsed(asset, day_bucket);
+        let desk_daily_used: i128 = env.storage().temporary().get(&desk_daily_key).unwrap_or(0);
+        let desk_daily_room = (config.desk_daily_cap - desk_daily_used).max(0);
+
+        (holder_room, inventory_room.min(desk_daily_room))
     }
 
     /// Swaps `units` of `asset` from `holder` into USDC paid to `to` (PRD §5 Phase 2
@@ -621,6 +652,15 @@ impl ExitDesk {
             panic!("exit-desk: exceeds per-holder daily cap");
         }
 
+        let desk_daily_key = DataKey::DeskDailyUsed(asset.clone(), day_bucket);
+        let desk_daily_used: i128 = env.storage().temporary().get(&desk_daily_key).unwrap_or(0);
+        let new_desk_daily_used = desk_daily_used
+            .checked_add(units)
+            .expect("exit-desk: overflow in desk daily-used counter");
+        if new_desk_daily_used > config.desk_daily_cap {
+            panic!("exit-desk: exceeds desk daily cap");
+        }
+
         let inventory_key = DataKey::Inventory(asset.clone());
         let inventory: i128 = env.storage().persistent().get(&inventory_key).unwrap_or(0);
         let new_inventory = inventory
@@ -652,6 +692,7 @@ impl ExitDesk {
         );
 
         write_daily_used(&env, &daily_key, new_daily_used);
+        write_daily_used(&env, &desk_daily_key, new_desk_daily_used);
         env.storage()
             .persistent()
             .set(&inventory_key, &new_inventory);
