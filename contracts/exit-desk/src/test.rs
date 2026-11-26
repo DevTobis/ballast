@@ -859,7 +859,7 @@ fn pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work() {
     desk.withdraw(&h.admin, &h.usdc, &(100 * PRICE_SCALE), &treasury);
     assert_eq!(MockTokenClient::new(&h.env, &h.usdc).balance(&treasury), 100 * PRICE_SCALE);
 
-    // exit panics with ballast-common: paused
+    // exit panics with Error::Paused (Error(Contract, #3))
     let holder = Address::generate(&h.env);
     let units = 100 * PRICE_SCALE;
     MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &units);

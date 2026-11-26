@@ -49,10 +49,10 @@ Provides role-based access control and role rotation primitives. A role is enfor
   - Instance: `RolesKey::Roles`, `RolesKey::PendingAdmin`
   - Persistent: `RolesKey::PendingRoleChange(u64)` (extended with timelock TTL)
 - **Panics:**
-  - `read_roles`: `"ballast-common: roles not initialized"` if roles have not been set.
-  - `accept_admin`: `"ballast-common: no pending admin proposal"` if called without an active proposal.
-  - `execute_role_change`: `"ballast-common: no such pending role change"` if the ID does not exist; `"ballast-common: timelock has not elapsed"` if invoked before `executes_at`.
-  - `require_admin_or_keeper`: `"ballast-common: caller is neither admin nor keeper"` if caller is neither stored admin nor keeper.
+  - `read_roles`: `Error::NotInitialized (#1)` if roles have not been set.
+  - `accept_admin`: `Error::NotFound (#5)` if called without an active proposal.
+  - `execute_role_change`: `Error::NotFound (#5)` if the ID does not exist; `Error::TimelockNotElapsed (#4)` if invoked before `executes_at`.
+  - `require_admin_or_keeper`: `Error::Unauthorized (#7)` if caller is neither stored admin nor keeper.
   - Host authorization failure panics on any failed `require_auth()` call.
 - **Consuming Contracts:**
   - `contracts/credit-line`
@@ -108,7 +108,7 @@ Intended to manage a single shared custody adapter address (PRD §6.3) so that `
 - **Storage Keys Used:**
   - Instance: `CustodyDataKey::Custody`
 - **Panics:**
-  - `read_custody`: `"ballast-common: custody not set"` if custody has not been written.
+  - `read_custody`: `Error::NotInitialized (#1)` if custody has not been written.
 - **Consuming Contracts:**
   - *None (currently unused)*
 
@@ -156,7 +156,7 @@ Implements circuit-breaker pause flags to immediately stop new risk (PRD §5, §
 - **Storage Keys Used:**
   - Instance: `PauseDataKey::Paused(PauseScope)`
 - **Panics:**
-  - `require_not_paused`: `"ballast-common: paused"` if the scope or `PauseScope::All` is paused.
+  - `require_not_paused`: `Error::Paused (#3)` if the scope or `PauseScope::All` is paused.
 - **Consuming Contracts:**
   - `contracts/credit-line` (gates `draw`)
   - `contracts/exit-desk` (gates `exit`)
@@ -286,8 +286,8 @@ Provides shared 48-hour timelocked in-place contract upgrade mechanics via Sorob
 - **Storage Keys Used:**
   - Persistent: `UpgradeKey::PendingUpgrade(u64)` (extended with timelock TTL)
 - **Panics:**
-  - `cancel_upgrade`: `"ballast-common: no such pending upgrade"` if ID not found.
-  - `execute_upgrade`: `"ballast-common: no such pending upgrade"` if ID not found; `"ballast-common: timelock has not elapsed"` if invoked before `executes_at`.
+  - `cancel_upgrade`: `Error::NotFound (#5)` if ID not found.
+  - `execute_upgrade`: `Error::NotFound (#5)` if ID not found; `Error::TimelockNotElapsed (#4)` if invoked before `executes_at`.
 - **Consuming Contracts:**
   - `contracts/price-guard`
   - `contracts/registry`

@@ -86,7 +86,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 
 | Function | Caller | Delay | Status | Rationale |
 |---|---|---|---|---|
-| `initialize` | Anyone (first caller) | Immediate | Open gap | One-time bootstrap; later calls panic (`registry: already initialized`). There is **no auth check**, so whoever calls it first sets every role. Deploy and `initialize` must run back to back in the same script, and the script must read `roles` back to confirm (see Missing hardening in `AUDIT_NOTES.md`). |
+| `initialize` | Anyone (first caller) | Immediate | Open gap | One-time bootstrap; later calls fail with `Error::AlreadyInitialized` (`Error(Contract, #2)`). There is **no auth check**, so whoever calls it first sets every role. Deploy and `initialize` must run back to back in the same script, and the script must read `roles` back to confirm (see Missing hardening in `AUDIT_NOTES.md`). |
 | `propose_admin` | Current Admin | Immediate | Intended | Leg 1 of two-step admin transfer; sets pending admin without transferring authority until accepted. |
 | `accept_admin` | Nominated Admin | Immediate | Intended | Leg 2 of two-step admin transfer; completes transfer upon recipient confirmation, preventing loss of admin access from typos. |
 | `queue_role_change` | Admin | 48h timelock | Intended | Enforces 48h advance notice before changing operational role addresses (`Pauser`, `Keeper`, `PricePublisher`, `Risk`). |
@@ -197,7 +197,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 - **Pause helpers read the calling contract's own storage.** `pause::is_paused`
   (`contracts/common/src/pause.rs:69`) and `require_not_paused` (`contracts/common/src/pause.rs:90`)
   operate on the instance storage of whichever contract invokes them; `require_not_paused` panics
-  with `ballast-common: paused` and is meant only for risk-adding entry points, never
+  with `Error::Paused` (`Error(Contract, #3)`) and is meant only for risk-adding entry points, never
   repay/cure/liquidate (invariant 5).
 - **Role checks panic on mismatch.** `access::require_admin` / `require_pauser` / `require_risk`
   (`contracts/common/src/access.rs:73`, `contracts/common/src/access.rs:81`,

@@ -15,9 +15,9 @@ use ballast_common::{
     access::{self, Roles},
     asset::{AssetConfig, ParamChange},
     pause::{self, PauseScope},
-    timelock, ttl, upgrade,
+    timelock, ttl, upgrade, Error,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, Address, BytesN, Env, Symbol};
 
 #[contracttype]
 struct PendingParamChange {
@@ -92,7 +92,7 @@ impl Registry {
     ) {
         ttl::extend_instance(&env);
         if access::has_roles(&env) {
-            panic!("registry: already initialized");
+            panic_with_error!(&env, Error::AlreadyInitialized);
         }
         access::write_roles(
             &env,
@@ -500,6 +500,18 @@ mod test {
     }
 
     #[test]
+    fn reinitialize_fails_with_already_initialized_error() {
+        let (_env, client, admin, risk, _asset) = setup();
+        let res = client.try_initialize(&admin, &admin, &admin, &admin, &risk);
+        assert_eq!(
+            res,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::AlreadyInitialized as u32
+            )))
+        );
+    }
+
+    #[test]
     fn execute_param_requires_the_timelock_to_elapse() {
         let (env, client, admin, _risk, asset) = setup();
 
@@ -604,7 +616,7 @@ mod test {
     // --- initialize guard (issue #111) --------------------------------------------------------
 
     #[test]
-    #[should_panic(expected = "registry: already initialized")]
+    #[should_panic(expected = "Error(Contract, #2)")]
     fn initialize_can_only_run_once() {
         let (env, client, _admin, _risk, _asset) = setup();
         let other = Address::generate(&env);
@@ -630,7 +642,7 @@ mod test {
         })
         .expect("a second initialize must panic");
         assert!(
-            msg.contains("registry: already initialized"),
+            msg.contains("Error(Contract, #2)"),
             "unexpected panic message: {msg}"
         );
 

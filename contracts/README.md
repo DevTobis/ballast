@@ -156,7 +156,7 @@ This is why `Warning` can remain `Open`: status is the lifecycle state, while ma
 | Trigger function | Guard conditions (verbatim panic messages) | Resulting `status` | Resulting `margin_state` | Resulting `breach_ledger` |
 |---|---|---|---|---|
 | `open` | Lender authorization required. `limit > 0`: `credit-line: limit must be positive` | `Open` | `Healthy` | `None` |
-| `draw` | Draws scope not paused: `ballast-common: paused`; borrower authorization; borrower matches line: `credit-line: not this line's borrower`; `amount > 0`: `credit-line: amount must be positive`; status is `Open`: `credit-line: line is not open`; funded-undrawn balance: `credit-line: draw exceeds funded-but-undrawn balance`; line limit: `credit-line: draw exceeds the line's limit`; guarded price status: `credit-line: price status is not Ok`; post-draw margin: `credit-line: draw would push the line past a healthy LTV` | `Open` unchanged | Refreshed to `Healthy` on success (post-draw LTV is guarded to remain healthy) | Unchanged |
+| `draw` | Draws scope not paused: `Error::Paused (#3)`; borrower authorization; borrower matches line: `credit-line: not this line's borrower`; `amount > 0`: `credit-line: amount must be positive`; status is `Open`: `credit-line: line is not open`; funded-undrawn balance: `credit-line: draw exceeds funded-but-undrawn balance`; line limit: `credit-line: draw exceeds the line's limit`; guarded price status: `credit-line: price status is not Ok`; post-draw margin: `credit-line: draw would push the line past a healthy LTV` | `Open` unchanged | Refreshed to `Healthy` on success (post-draw LTV is guarded to remain healthy) | Unchanged |
 | `poke` — arm | No explicit guard; permissionless. Applies only when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is `None` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to `Liquidation` | Set to the current ledger sequence |
 | `poke` — preserve arm | No explicit guard; permissionless. Applies when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is already `Some(...)` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to `Liquidation` | Preserved unchanged |
 | `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to the fresh state: `Healthy`, `Warning`, `MarginCall`, or `Liquidation` (including `Liquidation` with a non-`Ok` price) | Cleared to `None` |
@@ -165,7 +165,7 @@ This is why `Warning` can remain `Open`: status is the lifecycle state, while ma
 | `close_expired` | Caller authorization; status is `Liquidating`: `credit-line: line is not being liquidated`; caller is the borrower or the keeper: `credit-line: caller must be the borrower or the keeper`; `now >= liquidated_at + CLOSE_GRACE_S`: `credit-line: close grace period has not elapsed`; then the same checks and booking as `close_liquidated` (vault position empty: `credit-line: collateral has not left the vault`) | `Closed` | `Healthy` | `None` |
 | `close` | Caller authorization; caller is the line's lender or borrower: `credit-line: not this line's lender or borrower`; status is `Open`: `credit-line: line is not open`; no principal: `credit-line: line has outstanding principal`; no accrued interest: `credit-line: line has outstanding interest`; no accrued fee: `credit-line: line has outstanding fees`; no funding left: `credit-line: line has undrawn funds` | `Closed` | Unchanged | Unchanged |
 | `sync_from_vault` | Configured vault authorization; configured vault check: `credit-line: caller is not the configured vault`; vault not configured: `credit-line: vault not configured`; `units >= 0`: `credit-line: units cannot be negative`; matching line asset: `credit-line: not this line's collateral asset` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
-| `sync_collateral` | Caller authorization and caller is stored admin or keeper: `ballast-common: caller is neither admin nor keeper`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
+| `sync_collateral` | Caller authorization and caller is stored admin or keeper: `Error::Unauthorized (#7)`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 
 `poke` also maintains `unhealthy_since`: it sets the timestamp on the first `MarginCall` or
 `Liquidation` observation, preserves it while the line remains in either state, and clears it in
@@ -371,7 +371,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 
 | Function | Caller | Delay | Status | Rationale |
 |---|---|---|---|---|
-| `initialize` | Anyone (first caller) | Immediate | Open gap | One-time bootstrap; later calls panic (`registry: already initialized`). There is **no auth check**, so whoever calls it first sets every role. Deploy and `initialize` must run back to back in the same script, and the script must read `roles` back to confirm (see Missing hardening in `AUDIT_NOTES.md`). |
+| `initialize` | Anyone (first caller) | Immediate | Open gap | One-time bootstrap; later calls fail with `Error::AlreadyInitialized` (`Error(Contract, #2)`). There is **no auth check**, so whoever calls it first sets every role. Deploy and `initialize` must run back to back in the same script, and the script must read `roles` back to confirm (see Missing hardening in `AUDIT_NOTES.md`). |
 | `propose_admin` | Current Admin | Immediate | Intended | Leg 1 of two-step admin transfer; sets pending admin without transferring authority until accepted. |
 | `accept_admin` | Nominated Admin | Immediate | Intended | Leg 2 of two-step admin transfer; completes transfer upon recipient confirmation, preventing loss of admin access from typos. |
 | `queue_role_change` | Admin | 48h timelock | Intended | Enforces 48h advance notice before changing operational role addresses (`Pauser`, `Keeper`, `PricePublisher`, `Risk`). |
@@ -457,4 +457,21 @@ The upgrade entry points are essential during pre-audit development, testnet dep
 However, once Ballast undergoes external security audit and reaches production maturity, the upgrade capability introduces governance risk if left open indefinitely. The protocol's architectural policy is **freeze-after-audit**:
 - After completing the formal security audit and deployment verification on mainnet, upgrade authority will be permanently renounced or burned (e.g. by setting the contract admin to an unspendable burn address or locking the upgrade mechanism).
 - Freezing post-audit guarantees immutability, ensuring neither compromised admin keys nor rogue governance actions can replace contract code or drain user collateral, fulfilling Ballast's core security commitments.
+
+## Shared contract error codes (`ballast-common::Error`)
+
+Rust string panic messages are stripped in release Wasm builds, rendering trapped invocations as `VM call trapped: UnreachableCodeReached`. Ballast contracts define typed, ABI-stable error codes via `#[contracterror]` in `ballast_common::Error` so that operators, client SDKs, and APIs can determine the exact failure cause.
+
+| Code | Name | Description |
+|---|---|---|
+| `1` | `NotInitialized` | Contract, module, or required state (e.g. roles) has not been initialized. |
+| `2` | `AlreadyInitialized` | Contract or module has already been initialized and cannot be re-initialized. |
+| `3` | `Paused` | The requested entry point or operation is gated by an active pause scope. |
+| `4` | `TimelockNotElapsed` | The 48-hour timelock delay required before execution has not yet elapsed. |
+| `5` | `NotFound` | The requested proposal, pending role change, asset configuration, or record does not exist. |
+| `6` | `InvalidInput` | Provided parameters or arguments are malformed or out of allowed bounds. |
+| `7` | `Unauthorized` | Caller does not possess the requisite role authority for the operation. |
+
+Where `ballast-common` raises them today: `access::read_roles` and `custody::read_custody` (`NotInitialized`); `pause::require_not_paused` (`Paused`); `access::accept_admin`, `access::execute_role_change`, `upgrade::cancel_upgrade` and `upgrade::execute_upgrade` (`NotFound`); `access::execute_role_change` and `upgrade::execute_upgrade` (`TimelockNotElapsed`); `access::require_admin_or_keeper` (`Unauthorized`). Contract-specific checks still panic with prefixed strings (for example `credit-line: ...`) until each contract adopts these codes in a follow-up. A trapped call shows the code as `Error(Contract, #<code>)`, and a `try_` client call returns it as `Err(Ok(Error::from_contract_error(<code>)))`. The codes are part of the ABI: never renumber or reuse one.
+
 

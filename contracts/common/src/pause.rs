@@ -43,7 +43,8 @@
 //! exposes its own `pause` and timelocked unpause (#32), so its `Repos` gate works; `exit-desk`
 //! still has no writer for its flag (see #30).
 
-use soroban_sdk::{contracttype, Env};
+use crate::error::Error;
+use soroban_sdk::{contracttype, panic_with_error, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +90,7 @@ pub fn is_paused(env: &Env, scope: &PauseScope) -> bool {
 /// the full scope map and the entry points that are deliberately left ungated.
 pub fn require_not_paused(env: &Env, scope: &PauseScope) {
     if is_paused(env, scope) {
-        panic!("ballast-common: paused");
+        panic_with_error!(env, Error::Paused);
     }
 }
 
@@ -245,25 +246,26 @@ mod test {
 
         // Draws paused -> gate(Draws) must abort, the others must not.
         client.set(&PauseScope::Draws, &true);
-        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.gate(&PauseScope::Draws);
-        }));
-        assert!(
-            drawn.is_err(),
-            "require_not_paused must panic while Draws is paused"
+        let res_draws = client.try_gate(&PauseScope::Draws);
+        assert_eq!(
+            res_draws,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::Paused as u32
+            )))
         );
+
         for scope in [PauseScope::Pledges, PauseScope::Exits, PauseScope::Repos] {
             client.gate(&scope);
         }
 
         // With All set, even a scope that never stored its own flag is gated.
         client.set(&PauseScope::All, &true);
-        let all = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.gate(&PauseScope::Pledges);
-        }));
-        assert!(
-            all.is_err(),
-            "require_not_paused must panic while All is paused"
+        let res_all = client.try_gate(&PauseScope::Pledges);
+        assert_eq!(
+            res_all,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::Paused as u32
+            )))
         );
     }
 }
