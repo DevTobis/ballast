@@ -10,7 +10,15 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// `units` and `guarded_price` are 7-decimal fixed point (see [`crate::price::PRICE_SCALE`]);
 /// `haircut_bps` is basis points out of 10,000 and is the *total* haircut (base + liquidity +
 /// FX + concentration add-ons, already summed by the caller per PRD §6.4).
+///
+/// Rounding: always down, never up. The value is computed in two steps, each an integer division
+/// that truncates toward zero: `gross = units * guarded_price / PRICE_SCALE`, then
+/// `gross * (10_000 - haircut_bps) / 10_000`. For non-negative inputs each truncation can only
+/// lower the result, so it is never above the exact rational value
+/// `units * guarded_price * (10_000 - haircut_bps) / (PRICE_SCALE * 10_000)`, and collateral is
+/// never over-valued (`CreditLine`, `PledgeVault` and `RepoDvP` all value positions with this).
 pub fn collateral_value(units: i128, guarded_price: i128, haircut_bps: u32) -> i128 {
+    // configure_asset validates this upfront; this assert is defence-in-depth.
     assert!(
         haircut_bps as i128 <= BPS_DENOMINATOR,
         "haircut exceeds 100%"
@@ -77,6 +85,95 @@ mod test {
     fn ltv_bps_zero_collateral_is_max() {
         assert_eq!(ltv_bps(1, 0), u32::MAX);
         assert_eq!(ltv_bps(0, 0), 0);
+    }
+
+    // --- collateral_value haircut boundaries (issue #118) --------------------------------------
+    // The 10_000 bps -> 0 boundary is asserted in
+    // `a_validated_haircut_never_makes_collateral_value_panic` below.
+
+    #[test]
+    fn collateral_value_haircut_zero_returns_gross() {
+        let units = 1_000 * PRICE_SCALE;
+        let price = PRICE_SCALE;
+        let v = collateral_value(units, price, 0);
+        assert_eq!(v, 1_000 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "haircut exceeds 100%")]
+    fn collateral_value_haircut_10_001_panics() {
+        let units = 1_000 * PRICE_SCALE;
+        let price = PRICE_SCALE;
+        collateral_value(units, price, 10_001);
+    }
+
+    // --- collateral_value rounding (issue #119) -----------------------------------------------
+    #[test]
+    fn collateral_value_rounding_with_non_round_inputs() {
+        // Table of (units, price, haircut_bps, expected)
+        // Hand calculations:
+        // Formula: gross = (units * price) / PRICE_SCALE; result = (gross * (10_000 - haircut_bps)) / 10_000
+        // PRICE_SCALE = 10_000_000
+        //
+        // Row 1: zero units
+        // units = 0, price = PRICE_SCALE, haircut = 500
+        // gross = 0 / 10_000_000 = 0; result = 0 * 9500 / 10_000 = 0
+        //
+        // Row 2: zero price
+        // units = 1_000 * PRICE_SCALE, price = 0, haircut = 500
+        // gross = 0 / 10_000_000 = 0; result = 0 * 9500 / 10_000 = 0
+        //
+        // Row 3: minimal unit with price just below 1 scale
+        // units = 1, price = PRICE_SCALE - 1 (9_999_999), haircut = 0
+        // gross = (1 * 9_999_999) / 10_000_000 = 0; result = 0 * 10_000 / 10_000 = 0
+        // Exact rational: 9_999_999 / 10_000_000 = 0.9999999. Result 0 <= exact.
+        //
+        // Row 4: minimal unit with 1 scale and odd haircut (333 bps)
+        // units = 1, price = PRICE_SCALE, haircut = 333
+        // gross = 10_000_000 / 10_000_000 = 1; result = (1 * 9667) / 10_000 = 0
+        // Exact rational: 0.9667. Result 0 <= exact.
+        //
+        // Row 5: 3 units with odd haircut (333 bps)
+        // units = 3, price = PRICE_SCALE, haircut = 333
+        // gross = 30_000_000 / 10_000_000 = 3; result = (3 * 9667) / 10_000 = 29001 / 10_000 = 2
+        // Exact rational: 2.9001. Result 2 <= exact.
+        //
+        // Row 6: 10_000 units with non-round price (PRICE_SCALE - 1) and odd haircut (333 bps)
+        // units = 10_000, price = 9_999_999, haircut = 333
+        // gross = (10_000 * 9_999_999) / 10_000_000 = 99_999_990_000 / 10_000_000 = 9999
+        // result = (9999 * 9667) / 10_000 = 96_660_333 / 10_000 = 9666
+        // Exact rational: (10_000 * 9_999_999 / 10_000_000) * (9667 / 10_000) = 9999.999 * 0.9667 = 9666.9990333
+        // Result 9666 <= 9666.9990333, proving result never exceeds exact rational value.
+        //
+        // Row 7: larger volume with odd haircut
+        // units = 100 * PRICE_SCALE, price = PRICE_SCALE, haircut = 333
+        // gross = 1_000_000_000; result = (1_000_000_000 * 9667) / 10_000 = 966_700_000
+        let test_cases = [
+            (0i128, PRICE_SCALE, 500u32, 0i128),
+            (1_000 * PRICE_SCALE, 0i128, 500u32, 0i128),
+            (1i128, PRICE_SCALE - 1, 0u32, 0i128),
+            (1i128, PRICE_SCALE, 333u32, 0i128),
+            (3i128, PRICE_SCALE, 333u32, 2i128),
+            (10_000i128, PRICE_SCALE - 1, 333u32, 9_666i128),
+            (100 * PRICE_SCALE, PRICE_SCALE, 333u32, 966_700_000i128),
+        ];
+
+        for (units, price, haircut_bps, expected) in test_cases {
+            let result = collateral_value(units, price, haircut_bps);
+            assert_eq!(
+                result, expected,
+                "Mismatch for units={units}, price={price}, haircut={haircut_bps}"
+            );
+
+            // Property assertion: result * PRICE_SCALE * 10_000 <= units * price * (10_000 - haircut)
+            // Proves result never exceeds the exact rational value.
+            let lhs = result * PRICE_SCALE * BPS_DENOMINATOR;
+            let rhs = units * price * (BPS_DENOMINATOR - haircut_bps as i128);
+            assert!(
+                lhs <= rhs,
+                "Result exceeds exact rational value: {lhs} > {rhs} for units={units}, price={price}, haircut={haircut_bps}"
+            );
+        }
     }
 
     #[test]

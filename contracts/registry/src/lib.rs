@@ -601,6 +601,240 @@ mod test {
         assert!(!client.is_paused(&PauseScope::Draws));
     }
 
+    // --- initialize guard (issue #111) --------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "registry: already initialized")]
+    fn initialize_can_only_run_once() {
+        let (env, client, _admin, _risk, _asset) = setup();
+        let other = Address::generate(&env);
+        client.initialize(&other, &other, &other, &other, &other);
+    }
+
+    #[test]
+    fn a_failed_second_initialize_leaves_every_role_unchanged() {
+        let (env, client, admin, risk, _asset) = setup();
+        let original = client.roles();
+        assert_eq!(original.admin, admin);
+        assert_eq!(original.risk, risk);
+
+        // A takeover attempt: a new address for every role.
+        let msg = panic_message(|| {
+            client.initialize(
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &Address::generate(&env),
+                &Address::generate(&env),
+            );
+        })
+        .expect("a second initialize must panic");
+        assert!(
+            msg.contains("registry: already initialized"),
+            "unexpected panic message: {msg}"
+        );
+
+        // Read the stored roles directly as well as through the public getter.
+        let stored = env.as_contract(&client.address, || access::read_roles(&env));
+        assert_eq!(stored, original);
+        assert_eq!(client.roles(), original);
+    }
+
+    // --- execute_param per-variant application and bps bounds (issues #108, #109) -------------
+
+    fn advance_past_timelock(env: &Env) {
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+        });
+    }
+
+    /// Asserts every field of `actual` equals `expected` (`AssetConfig` has no `PartialEq`).
+    fn assert_config_eq(actual: &AssetConfig, expected: &AssetConfig, context: &str) {
+        assert_eq!(actual.issuer, expected.issuer, "{context}: issuer");
+        assert_eq!(actual.contract, expected.contract, "{context}: contract");
+        assert_eq!(actual.standard, expected.standard, "{context}: standard");
+        assert_eq!(
+            actual.yield_type, expected.yield_type,
+            "{context}: yield_type"
+        );
+        assert_eq!(
+            actual.custody_mode, expected.custody_mode,
+            "{context}: custody_mode"
+        );
+        assert_eq!(actual.ccy, expected.ccy, "{context}: ccy");
+        assert_eq!(
+            actual.redemption_lag_days, expected.redemption_lag_days,
+            "{context}: redemption_lag_days"
+        );
+        assert_eq!(
+            actual.haircut_base_bps, expected.haircut_base_bps,
+            "{context}: haircut_base_bps"
+        );
+        assert_eq!(
+            actual.haircut_fx_bps, expected.haircut_fx_bps,
+            "{context}: haircut_fx_bps"
+        );
+        assert_eq!(
+            actual.price_band_bps, expected.price_band_bps,
+            "{context}: price_band_bps"
+        );
+        assert_eq!(
+            actual.daily_move_band_bps, expected.daily_move_band_bps,
+            "{context}: daily_move_band_bps"
+        );
+        assert_eq!(actual.status, expected.status, "{context}: status");
+    }
+
+    #[test]
+    fn execute_param_applies_each_variant_to_its_own_field_only() {
+        // `setup()` registers base 300, fx 0, price band 50, daily move band 100, lag 1, "active".
+        // Every new value below differs from all of those and from each other, so an arm in
+        // `execute_param`'s match that wrote the wrong field would show up as a mismatch.
+        let changes = [
+            ParamChange::HaircutBaseBps(1_200),
+            ParamChange::HaircutFxBps(250),
+            ParamChange::PriceBandBps(75),
+            ParamChange::DailyMoveBandBps(350),
+            ParamChange::RedemptionLagDays(7),
+            ParamChange::Status(symbol_short!("paused")),
+        ];
+        for change in changes {
+            let (env, client, admin, _risk, asset) = setup();
+            let mut expected = client.asset(&asset);
+            match &change {
+                ParamChange::HaircutBaseBps(v) => expected.haircut_base_bps = *v,
+                ParamChange::HaircutFxBps(v) => expected.haircut_fx_bps = *v,
+                ParamChange::PriceBandBps(v) => expected.price_band_bps = *v,
+                ParamChange::DailyMoveBandBps(v) => expected.daily_move_band_bps = *v,
+                ParamChange::RedemptionLagDays(v) => expected.redemption_lag_days = *v,
+                ParamChange::Status(v) => expected.status = v.clone(),
+            }
+
+            let id = client.queue_param(&admin, &asset, &change);
+            advance_past_timelock(&env);
+            client.execute_param(&id);
+
+            assert_config_eq(&client.asset(&asset), &expected, &format!("{change:?}"));
+            assert_eq!(
+                client.pending_param(&id),
+                None,
+                "{change:?}: pending entry removed"
+            );
+        }
+    }
+
+    /// Writes a pending change straight into storage, skipping `queue_param`. `queue_param`
+    /// already refuses a haircut above 100%, so this is the only way to reach `execute_param`'s
+    /// own bound for the two haircut fields, the check that still holds if a queued value is
+    /// invalid by the time it executes.
+    fn seed_pending_param(
+        env: &Env,
+        client: &RegistryClient<'static>,
+        asset: &Address,
+        change: &ParamChange,
+    ) -> u64 {
+        env.as_contract(&client.address, || {
+            let id = timelock::next_id(env);
+            let key = DataKey::PendingParam(id);
+            env.storage().persistent().set(
+                &key,
+                &PendingParamChange {
+                    asset: asset.clone(),
+                    change: change.clone(),
+                    executes_at: timelock::executes_at(env),
+                },
+            );
+            timelock::extend_entry_ttl(env, &key);
+            id
+        })
+    }
+
+    #[test]
+    fn execute_param_bps_bounds_accept_10_000_and_reject_10_001_for_each_field() {
+        let fields: [(fn(u32) -> ParamChange, &str); 4] = [
+            (
+                ParamChange::HaircutBaseBps,
+                "registry: base haircut cannot exceed 100%",
+            ),
+            (
+                ParamChange::HaircutFxBps,
+                "registry: FX haircut cannot exceed 100%",
+            ),
+            (
+                ParamChange::PriceBandBps,
+                "registry: price band must be between 1 and 10000 bps",
+            ),
+            (
+                ParamChange::DailyMoveBandBps,
+                "registry: daily move band must be between 1 and 10000 bps",
+            ),
+        ];
+
+        for (make_change, rejection) in fields {
+            for value in [10_000u32, 10_001] {
+                let (env, client, admin, _risk, _) = setup();
+                // A second asset with no base haircut, so FX at 10_000 keeps the total at 100%.
+                let asset = Address::generate(&env);
+                let mut config = valid_config(&env, &asset);
+                config.haircut_base_bps = 0;
+                client.register_asset(&admin, &asset, &config);
+                let original = client.asset(&asset);
+
+                let change = make_change(value);
+                let context = format!("{change:?}");
+                let is_haircut = matches!(
+                    change,
+                    ParamChange::HaircutBaseBps(_) | ParamChange::HaircutFxBps(_)
+                );
+
+                let id = if value == 10_001 && is_haircut {
+                    // Refused at queue time with the same message ...
+                    let msg = panic_message(|| {
+                        client.queue_param(&admin, &asset, &change);
+                    })
+                    .expect("queue_param must refuse a haircut above 100%");
+                    assert!(
+                        msg.contains(rejection),
+                        "{context}: unexpected panic: {msg}"
+                    );
+                    // ... so put it in the queue directly to test the execute-time check.
+                    seed_pending_param(&env, &client, &asset, &change)
+                } else {
+                    client.queue_param(&admin, &asset, &change)
+                };
+                advance_past_timelock(&env);
+
+                if value == 10_000 {
+                    client.execute_param(&id);
+                    let mut expected = original.clone();
+                    match change {
+                        ParamChange::HaircutBaseBps(v) => expected.haircut_base_bps = v,
+                        ParamChange::HaircutFxBps(v) => expected.haircut_fx_bps = v,
+                        ParamChange::PriceBandBps(v) => expected.price_band_bps = v,
+                        ParamChange::DailyMoveBandBps(v) => expected.daily_move_band_bps = v,
+                        _ => unreachable!(),
+                    }
+                    assert_config_eq(&client.asset(&asset), &expected, &context);
+                    assert_eq!(client.pending_param(&id), None, "{context}: executed");
+                } else {
+                    let msg = panic_message(|| client.execute_param(&id))
+                        .expect("execute_param must refuse 10_001 bps");
+                    assert!(
+                        msg.contains(rejection),
+                        "{context}: unexpected panic: {msg}"
+                    );
+                    // The rejected execute changed nothing and left the change queued.
+                    assert_config_eq(&client.asset(&asset), &original, &context);
+                    let pending = client
+                        .pending_param(&id)
+                        .expect("a rejected execute must leave the pending entry in place");
+                    assert_eq!(pending.asset, asset, "{context}");
+                    assert_eq!(pending.change, change, "{context}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn raise_haircut_now_is_immediate_and_increase_only() {
         let (_env, client, _admin, risk, asset) = setup();

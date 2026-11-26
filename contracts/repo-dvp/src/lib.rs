@@ -89,6 +89,24 @@
 //! - the borrower's outstanding leg-2 sum is extended to outlast the allowance it describes;
 //! - `extend_ttl` is a permissionless keep-alive for one trade, for a trade longer than the
 //!   network's maximum entry TTL (3,110,400 ledgers, about 180 days, on both networks).
+//!
+//! ## Contract Events
+//!
+//! The trade-lifecycle entry points publish events with the shape `((Symbol, id), payload)`, listed
+//! below. `disable`/`enable` (keyed by the asset) and the pause events are in `contracts/EVENTS.md`;
+//! `configure_asset` and the admin setters publish nothing today (#207).
+//!
+//! | Event | Topics | Data | Emitted by | Description |
+//! |---|---|---|---|---|
+//! | `propose` | `(Symbol("propose"), id: u64)` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | Published when a new repo trade proposal is created. |
+//! | `cancel` | `(Symbol("cancel"), id: u64)` | `caller: Address` | `cancel_proposal` | Published when a proposal is cancelled by the lender or borrower. |
+//! | `settle` | `(Symbol("settle"), id: u64)` | `units: i128` | `accept_and_settle` | Published when the borrower accepts and settles leg 1 of the trade. |
+//! | `unwind` | `(Symbol("unwind"), id: u64)` | `total_due: i128` | `unwind` | Published when leg 2 unwinds successfully at or past maturity. |
+//! | `mcall` | `(Symbol("mcall"), id: u64)` | `margin_call_amount: i128` | `call_margin` | Published when a trade's collateral breaches the margin call threshold. |
+//! | `cured` | `(Symbol("cured"), id: u64)` | `0i128` | `call_margin` | Published when an open margin call is cured via price recovery. |
+//! | `topup` | `(Symbol("topup"), id: u64)` | `(units: i128, cured: bool)` | `top_up` | Published when the borrower adds collateral to top up a trade. |
+//! | `default` | `(Symbol("default"), id: u64)` | `(lender_units: i128, borrower_units: i128)` | `default_close` | Published when an uncured margin call is defaulted by the keeper. |
+//! | `mat_def` | `(Symbol("mat_def"), id: u64)` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` | Published when an unpaid trade past maturity grace is defaulted. |
 
 use ballast_common::{
     access::{self, Roles},
@@ -818,9 +836,9 @@ impl RepoDvp {
             .set(&DataKey::LatestProposal(cash_lender.clone()), &id);
         let trade = RepoTrade {
             id,
-            cash_lender,
-            cash_borrower,
-            asset,
+            cash_lender: cash_lender.clone(),
+            cash_borrower: cash_borrower.clone(),
+            asset: asset.clone(),
             units,
             cash_amount,
             rate_bps,
@@ -836,6 +854,17 @@ impl RepoDvp {
             cure_deadline: None,
         };
         write_trade(&env, &trade);
+        env.events().publish(
+            (symbol_short!("propose"), id),
+            (
+                cash_lender,
+                cash_borrower,
+                asset,
+                units,
+                cash_amount,
+                maturity_at,
+            ),
+        );
         id
     }
 

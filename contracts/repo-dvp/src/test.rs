@@ -244,6 +244,54 @@ fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_
     )
 }
 
+#[test]
+fn propose_emits_propose_event() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{IntoVal, TryFromVal};
+
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    let id = RepoDvpClient::new(&h.env, &h.repo).propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &h.rwa,
+        &units,
+        &cash_amount,
+        &500u32,
+        &RepoKind::Intraday,
+        &maturity,
+        &hash(&h, 7),
+    );
+
+    let events = h.env.events().all();
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected event from repo-dvp");
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("propose"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let expected_data: (Address, Address, Address, i128, i128, u64) = (
+        h.cash_lender.clone(),
+        h.cash_borrower.clone(),
+        h.rwa.clone(),
+        units,
+        cash_amount,
+        maturity,
+    );
+    let data_val: soroban_sdk::Val = expected_data.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+        .expect("failed to convert expected data to ScVal");
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "data mismatch");
+        }
+    }
+}
+
 // --- #216: a repo's term has to fit its kind, and its rate has a ceiling -------------------
 
 /// Proposes 100 units against 90 cash with the given kind and rate, maturing `term_seconds`
@@ -897,6 +945,69 @@ fn default_close_clears_pending_margin_call_and_cure_deadline() {
     assert!(!defaulted.pending_margin_call, "pending_margin_call must be false");
     assert_eq!(defaulted.margin_call_amount, 0, "margin_call_amount must be 0");
     assert_eq!(defaulted.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
+fn exact_margin_call_amount_computed_on_margin_call() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{symbol_short, IntoVal, TryFromVal};
+
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    // Initial state: 100 units, 90 cash, 5% haircut, price $1, 0 elapsed interest.
+    // target = 90e7 * 10_000 / 8_000 = 112.5e7
+    // collateral = 100e7 * 1.0 * 0.95 = 95e7
+    // expected margin_call_amount = 112.5e7 - 95e7 = 17.5e7 = 175_000_000
+    repo.call_margin(&h.keeper, &id);
+
+    let events = h.env.events().all();
+    let trade = repo.trade(&id);
+    assert_eq!(trade.margin_call_amount, 175_000_000);
+
+    // Assert mcall event matches margin_call_amount
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected mcall event");
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("mcall"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let data_val: soroban_sdk::Val = 175_000_000i128.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val).unwrap();
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.clone().into(), "mcall topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "mcall data mismatch");
+        }
+    }
+
+    // Variant at a lower price: price drops to $0.80 (8_000_000 stroops).
+    // collateral = 100e7 * 0.8 * 0.95 = 76e7 = 760_000_000
+    // target = 112.5e7 = 1_125_000_000
+    // expected margin_call_amount = 1_125_000_000 - 760_000_000 = 365_000_000
+    set_price(&h, 8_000_000);
+    repo.call_margin(&h.keeper, &id);
+
+    let events2 = h.env.events().all();
+    let trade2 = repo.trade(&id);
+    assert_eq!(trade2.margin_call_amount, 365_000_000);
+
+    let repo_events2 = events2.filter_by_contract(&h.repo);
+    let last2 = repo_events2.events().last().expect("expected updated mcall event");
+    let data_val2: soroban_sdk::Val = 365_000_000i128.into_val(&h.env);
+    let expected_data_xdr2 = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val2).unwrap();
+
+    match &last2.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(
+                body.topics,
+                expected_topics_xdr.into(),
+                "updated mcall topic mismatch"
+            );
+            assert_eq!(body.data, expected_data_xdr2, "updated mcall data mismatch");
+        }
+    }
 }
 
 #[test]
