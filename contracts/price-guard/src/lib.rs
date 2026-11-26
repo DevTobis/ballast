@@ -1313,23 +1313,33 @@ mod test {
         // doesn't panic every call here.
         client.configure_signature_requirement(&admin, &false);
 
-        // Allowlist common test feeds so existing tests continue to pass.
-        let feed_name = feed(&env);
-        client.configure_source(&admin, &asset, &feed_name, &true);
-        let redstone = Symbol::new(&env, "redstone");
-        client.configure_source(&admin, &asset, &redstone, &true);
-        let redemp = Symbol::new(&env, "redemp");
-        client.configure_source(&admin, &asset, &redemp, &true);
-        let band3 = Symbol::new(&env, "band3");
-        client.configure_source(&admin, &asset, &band3, &true);
-        let band4 = Symbol::new(&env, "band4");
-        client.configure_source(&admin, &asset, &band4, &true);
-        for i in 1..=8 {
-            let s = Symbol::new(&env, &std::format!("feed_{}", i));
-            client.configure_source(&admin, &asset, &s, &true);
-        }
+        allowlist_test_sources(&env, &client, &admin, &asset);
 
         (env, client, admin, price_publisher, risk, asset)
+    }
+
+    /// Allowlists (#84) every source name the tests publish under, so tests that are not about
+    /// the allowlist itself can call `publish_source` freely.
+    fn allowlist_test_sources(
+        env: &Env,
+        client: &PriceGuardClient<'static>,
+        admin: &Address,
+        asset: &Address,
+    ) {
+        let mut names = std::vec![
+            std::string::String::from("redston"),
+            "redstone".into(),
+            "redemp".into(),
+            "band3".into(),
+            "band4".into(),
+        ];
+        for i in 1..=8 {
+            names.push(std::format!("feed_{}", i));
+            names.push(std::format!("src{}", i));
+        }
+        for name in names {
+            client.configure_source(admin, asset, &Symbol::new(env, &name), &true);
+        }
     }
 
     fn setup(
@@ -1372,6 +1382,7 @@ mod test {
             &DEFAULT_WINDOW_MOVE_BAND_BPS,
             &max_staleness_s,
         );
+        allowlist_test_sources(&env, &client, &admin, &asset);
 
         (env, client, admin, price_publisher, risk, asset)
     }
