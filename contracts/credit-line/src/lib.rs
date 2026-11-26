@@ -1372,7 +1372,7 @@ mod test {
 
     #[test]
     #[should_panic(expected = "risk: haircut_bps cannot exceed 10000 bps (100%)")]
-    fn configure_asset_rejects_a_haircut_above_one_hundred_percent() {
+    fn configure_asset_rejects_a_haircut_above_one_hundred_percent_with_the_shared_message() {
         let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
         configure_with(&h, 10_001, 7_000, 8_000, 9_000);
     }
