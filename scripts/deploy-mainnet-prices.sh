@@ -366,11 +366,13 @@ for a in json.load(open(sys.argv[1])):
 ' "$ASSETS_FILE")
 
 SAC_LINES=""
+SACS=()
 for row in "${ROWS[@]}"; do
   IFS=$'\t' read -r CODE ISSUER CCY <<<"$row"
   SAC=$(retry stellar contract id asset --asset "$CODE:$ISSUER" --network "$NETWORK")
   log "Registering $CODE ($ISSUER) as $SAC"
   SAC_LINES+="SAC_${CODE}=$SAC"$'\n'
+  SACS+=("$SAC")
 
   if step_done "REGISTER_$CODE"; then log "  $CODE already registered, skipping"; else
     register_asset_checked "$SAC" "{\"issuer\":\"$ISSUER\",\"contract\":\"$SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"$CCY\",\"redemption_lag_days\":1,\"haircut_base_bps\":$HAIRCUT_BASE_BPS,\"haircut_fx_bps\":0,\"price_band_bps\":$PRICE_BAND_BPS,\"daily_move_band_bps\":$DAILY_MOVE_BAND_BPS,\"status\":\"active\"}"
@@ -382,6 +384,8 @@ for row in "${ROWS[@]}"; do
       --admin "$ADMIN" --asset "$SAC" --band_bps "$PRICE_BAND_BPS" --daily_move_band_bps "$DAILY_MOVE_BAND_BPS" \
       --window_seconds "$WINDOW_SECONDS" --window_move_band_bps "$WINDOW_MOVE_BAND_BPS" \
       --max_staleness_s "$MAX_STALENESS_S" >/dev/null
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_source \
+      --admin "$ADMIN" --asset "$SAC" --name redstone --enabled true >/dev/null
     mark_step "GUARD_$CODE"
   fi
 
@@ -393,10 +397,14 @@ for row in "${ROWS[@]}"; do
   fi
 done
 
+# The requirement is per asset and already true when unset. Setting it explicitly before the first
+# publish ends the bring-up window in which it could still be switched off without the 48h timelock.
 log "Requiring NAV signatures"
 if step_done SIGNATURES; then log "  already required, skipping"; else
-  run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
-    --admin "$ADMIN" --required true >/dev/null
+  for SAC in "${SACS[@]}"; do
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_signature_requirement \
+      --admin "$ADMIN" --asset "$SAC" --required true >/dev/null
+  done
   mark_step SIGNATURES
 fi
 

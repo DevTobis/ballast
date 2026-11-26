@@ -64,7 +64,8 @@ Change `API_PORT`, `ISSUER_GATEWAY_PORT` or `PAYOUT_HOP_PORT` in the repo-root `
 3. That the issuer NAV key is registered: `scripts/configure-nav-key.sh testnet`.
 
 A move beyond `daily_move_band_bps` against the last good value puts the guard into a sticky `Halted`
-state that only the `risk` role clears (`confirm_halt_cleared`).
+state that only the `risk` role clears (`confirm_halt_cleared`). Follow
+[`docs/runbooks/price-halt.md`](docs/runbooks/price-halt.md) before clearing it.
 
 ## Requests are refused with a compliance error
 
@@ -163,6 +164,12 @@ Fix:
    stellar contract restore --id <PRICE_GUARD_CONTRACT_ID> --source <OPERATOR_IDENTITY> --network <NETWORK>
    ```
 2. For specific persistent source keys, include the key in a restore footprint transaction or trigger a re-publish once the instance is restored. Regular publishing automatically keeps active keys extended via `extend_ttl`.
+
+## Keeper job errors and transaction failures
+
+Keeper jobs (such as `cure-expiry`, `repo-unwind`, `sync-collateral`) and transaction submissions via `submitSignedTx` report structured errors for conditions like missing lender accounts, on-chain execution traps, submission timeouts, and collateral discrepancies.
+
+For the full error reference table—including causes, whether runs retry, which errors are safe to ignore, and recommended operator actions—see [services/keeper Troubleshooting](services/keeper/README.md#troubleshooting-job-errors).
 
 ## Still stuck
 
