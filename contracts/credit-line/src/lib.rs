@@ -2411,6 +2411,81 @@ mod test {
         assert_eq!(h.credit_line.line(&id).drawn, 300 * PRICE_SCALE);
     }
 
+    /// #167: a partial repayment pays accrued interest before principal. 500 drawn at 10% for a
+    /// year owes 50 of interest. Repaying 30 pays interest only; repaying 40 more pays the last 20
+    /// of interest and then 20 of principal. A waterfall that paid principal first would leave the
+    /// interest untouched after the first repayment.
+    #[test]
+    fn partial_repayments_pay_interest_before_principal() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        // The `repaid` event's (interest, principal, drawn after); read straight after `repay`,
+        // since `events().all()` only holds the latest invocation's events.
+        let repaid_split = |h: &Harness| -> (i128, i128, i128) {
+            let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+            let items = events.events();
+            assert_eq!(items.len(), 1);
+            let body = match &items[0].body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let data: (Address, i128, i128, i128) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            (data.1, data.2, data.3)
+        };
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        assert_eq!(h.credit_line.debt_of(&id), 550 * PRICE_SCALE);
+
+        // The borrower holds the 500 drawn plus 70 to repay with.
+        h.token.mint(&h.borrower, &(70 * PRICE_SCALE));
+        let contract = h.credit_line.address.clone();
+        assert_eq!(h.token.balance(&h.borrower), 570 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&contract), 500 * PRICE_SCALE);
+
+        // Repay 30: all of it goes to interest (50 -> 20); principal untouched.
+        let applied = h.credit_line.repay(&h.borrower, &id, &(30 * PRICE_SCALE));
+        assert_eq!(repaid_split(&h), (30 * PRICE_SCALE, 0, 500 * PRICE_SCALE));
+        assert_eq!(applied, 30 * PRICE_SCALE);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.accrued_interest, 20 * PRICE_SCALE);
+        assert_eq!(line.drawn, 500 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_interest(&id), 30 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 540 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&contract), 530 * PRICE_SCALE);
+
+        // Repay 40: the remaining 20 of interest first, then 20 of principal (500 -> 480).
+        let applied = h.credit_line.repay(&h.borrower, &id, &(40 * PRICE_SCALE));
+        assert_eq!(
+            repaid_split(&h),
+            (20 * PRICE_SCALE, 20 * PRICE_SCALE, 480 * PRICE_SCALE)
+        );
+        assert_eq!(applied, 40 * PRICE_SCALE);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.drawn, 480 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_interest(&id), 50 * PRICE_SCALE);
+        assert_eq!(h.credit_line.debt_of(&id), 480 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 500 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&contract), 570 * PRICE_SCALE);
+
+        // The lender can take out exactly the 50 of interest repaid.
+        h.credit_line.withdraw_interest(&h.lender, &id, &(50 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&h.lender), 50 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&contract), 520 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_interest(&id), 0);
+    }
+
     #[test]
     #[should_panic(expected = "credit-line: nothing owed")]
     fn repay_on_a_cleared_line_is_rejected() {
