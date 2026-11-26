@@ -34,7 +34,12 @@ export async function getJson<T>(
         `${adapterLabel} NAV request failed: GET ${url} -> ${res.status} ${res.statusText}${truncated ? `: ${truncated}` : ""}`,
       );
     }
-    return (await res.json()) as T;
+    try {
+      return (await res.json()) as T;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`${adapterLabel} NAV request failed to parse JSON from GET ${url}: ${message}`);
+    }
   }
 }
 

@@ -35,8 +35,23 @@ describe("PriceGuardClient", () => {
   });
 
   it("configureSignatureRequirement() returns non-empty unsigned XDR", async () => {
-    const xdr = await client.configureSignatureRequirement(source, true);
+    const xdr = await client.configureSignatureRequirement(source, asset, true);
     expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("configureSource() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureSource(source, asset, "redstone", true);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("configureSourceStaleness() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureSourceStaleness(source, asset, "redstone", 1800n);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("sourceStaleness() simulates a read and does not throw", async () => {
+    const result = await client.sourceStaleness(asset, "redstone");
+    expect(result).toBeDefined();
   });
 
   it("publishFeed() returns non-empty unsigned XDR", async () => {
