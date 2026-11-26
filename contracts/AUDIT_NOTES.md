@@ -13,10 +13,6 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
 
-### Permissionless entry points
-
-`CreditLine::poke` and `ltv` (as well as `extend_ttl` and read-only views across contracts) are completely permissionless: anyone may call them without requiring keeper authorization. This is safe because `poke` and `ltv` only ever make stored margin state match a fresh, guarded price from `PriceGuard`, never move user funds, and cannot fabricate a breach.
-
 The keeper is trusted for **timing and completeness**, and for three **values** it supplies (see
 "Keeper-supplied values" below). Every other amount a settlement uses comes from the contract's
 own state or from the PriceGuard. The three supplied values are checked only lightly on-chain;
