@@ -63,7 +63,8 @@ log "Configuring RepoDvp (TUSD cash leg, RWA1 at a 5% haircut)"
 inv --id "$REPO_DVP_CID" --source admin -- set_usdc --admin "$ADMIN" --usdc "$USDC_SAC" >/dev/null
 inv --id "$REPO_DVP_CID" --source admin -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$PRICE_GUARD_CID" \
-  --haircut_bps 500 --thresholds "$THRESHOLDS" >/dev/null
+  --haircut_bps 500 --thresholds "$THRESHOLDS" \
+  --max_cash_per_trade 1000000000000 --max_term_seconds 2592000 >/dev/null
 
 # A repo's cash borrower repays principal plus interest; give the test borrower enough spare TUSD
 # to cover the interest on small test trades.

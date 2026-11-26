@@ -7,13 +7,17 @@ in this skeleton pass.
 
 | Crate | Responsibility |
 |---|---|
-| `common` | Shared roles/timelock/pause/price/risk/margin logic — not itself a deployable contract |
+| `common` | [Shared roles, timelock, pause, price, risk, and margin logic](common/README.md) — not itself a deployable contract |
 | `registry` | [Asset configs, haircut parameters, timelocked param changes](registry/README.md) |
 | `price-guard` | [Median/band/staleness/halt price logic (PRD §6.4)](price-guard/README.md) |
 | `pledge-vault` | [Escrow/lien collateral positions](pledge-vault/README.md) |
-| `credit-line` | [Credit lines, draws, repayments, the margin state machine](credit-line/README.md) |
+| `credit-line` | [Credit lines, draws, repayments, storage layout, and the margin state machine](credit-line/README.md) |
 | `exit-desk` | [RWA → USDC instant exit](exit-desk/README.md) |
 | `repo-dvp` | Bilateral repo, atomic DvP |
+
+Every event these contracts publish (topics, payload order and types, emitter, consumers) is listed
+in [`EVENTS.md`](EVENTS.md). Payload order is a compatibility contract with `services/indexer` and
+`services/ledger`: read that file before you change an event.
 
 ## Differences from PRD section 8
 
@@ -98,11 +102,38 @@ all six contracts against the public Stellar testnet.
 
 ## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
 
-`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
+`PriceGuard.publish_nav` takes an additional `asset_code: Bytes` argument (the asset's ticker,
 e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
 `require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
 issuer key (`configure_issuer_key`, admin-only) over the canonical message
 `"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+
+> [!IMPORTANT]
+> NAV is signed by the **price publisher's** key (`configure_issuer_key` registers it), because
+> issuers publish unsigned data. As documented in [contracts/AUDIT_NOTES.md](AUDIT_NOTES.md), the
+> attestor key is the same key that is authorised to publish. On-chain the signature adds no protection
+> against a compromised publisher: it records who relayed the value. **Do not describe it as issuer attestation.**
+>
+> Full specification, key encoding command, test vectors, and operational guidance are documented in
+> [docs/nav-signing.md](../docs/nav-signing.md).
+
+### Operational summary & key conversion
+To configure an attestor key and enforce signatures on a deployment:
+
+1. Convert the publisher's Stellar address (`G...`) to raw 32-byte hex:
+   ```bash
+   PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PRICE_PUBLISHER")
+   ```
+2. Register the attestor key:
+   ```bash
+   stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
+     --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX"
+   ```
+3. Enable signature verification:
+   ```bash
+   stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
+     --admin "$ADMIN" --required true
+   ```
 
 This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
