@@ -3947,8 +3947,8 @@ mod test {
         let id = repaid_line(&h);
 
         h.credit_line.close(&h.borrower, &id);
-        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
 
+        // Read the events before any other call: each invocation resets the recorded events.
         let topic0 = ScVal::Symbol(ScSymbol("line_closed_repaid".try_into().unwrap()));
         let events = h.env.events().all();
         let ours: std::vec::Vec<_> = events
@@ -3968,6 +3968,7 @@ mod test {
                 assert_eq!(v0.data, ScVal::try_from_val(&h.env, &expected).unwrap());
             }
         }
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
     }
 
     #[test]
