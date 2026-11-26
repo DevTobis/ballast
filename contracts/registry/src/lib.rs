@@ -616,7 +616,7 @@ mod test {
     // --- initialize guard (issue #111) --------------------------------------------------------
 
     #[test]
-    #[should_panic(expected = "registry: already initialized")]
+    #[should_panic(expected = "Error(Contract, #2)")]
     fn initialize_can_only_run_once() {
         let (env, client, _admin, _risk, _asset) = setup();
         let other = Address::generate(&env);
@@ -642,7 +642,7 @@ mod test {
         })
         .expect("a second initialize must panic");
         assert!(
-            msg.contains("registry: already initialized"),
+            msg.contains("Error(Contract, #2)"),
             "unexpected panic message: {msg}"
         );
 
