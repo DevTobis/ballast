@@ -1887,7 +1887,6 @@ mod test {
         // A week of staleness so the 48h wait does not age the readings out: this test is about
         // the rotation preserving them, not about freshness.
         let (env, client, old_publisher, _risk, asset) = setup(50, 10_000, 7 * 24 * 3600);
-        let code = asset_code(&env);
         let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
         let source = feed(&env);
         let t0 = env.ledger().timestamp();
@@ -1978,7 +1977,6 @@ mod test {
                 args: (
                     new_publisher.clone(),
                     asset.clone(),
-                    code.clone(),
                     SCALE,
                     now,
                     zero_sig.clone(),
