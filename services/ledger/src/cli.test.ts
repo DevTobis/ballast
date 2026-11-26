@@ -28,20 +28,15 @@ describe("ledger cli", () => {
       insert: vi.fn(),
     } as unknown as Database;
 
-    // Mock runReconciliation module
-    const reconcileMod = await import("./reconcile.js");
-    const reconcileSpy = vi.spyOn(reconcileMod, "runReconciliation").mockResolvedValue({
-      breaks: 0,
-      report: fakeReport,
-    });
+    const reconcile = vi.fn().mockResolvedValue({ breaks: 0, report: fakeReport });
 
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const result = await runReconcileCli(fakeDb);
+    const result = await runReconcileCli(fakeDb, reconcile);
+    expect(reconcile).toHaveBeenCalledWith(fakeDb);
     expect(result.breaks).toBe(0);
     expect(consoleLogSpy).toHaveBeenCalledWith(JSON.stringify(fakeReport, null, 2));
 
-    reconcileSpy.mockRestore();
     consoleLogSpy.mockRestore();
   });
 
@@ -65,18 +60,16 @@ describe("ledger cli", () => {
       $client: { end: vi.fn().mockResolvedValue(undefined) },
     } as unknown as Database;
 
-    const reconcileMod = await import("./reconcile.js");
-    const reconcileSpy = vi.spyOn(reconcileMod, "runReconciliation").mockResolvedValue({
-      breaks: 1,
-      report: fakeReport,
-    });
+    const reconcile = vi.fn().mockResolvedValue({ breaks: 1, report: fakeReport });
 
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const result = await runReconcileCli(fakeDb);
+    const result = await runReconcileCli(fakeDb, reconcile);
+    expect(reconcile).toHaveBeenCalledWith(fakeDb);
     expect(result.breaks).toBe(1);
+    // A caller-supplied database is left open for the caller to close.
+    expect((fakeDb as unknown as { $client: { end: ReturnType<typeof vi.fn> } }).$client.end).not.toHaveBeenCalled();
 
-    reconcileSpy.mockRestore();
     consoleLogSpy.mockRestore();
   });
 });

@@ -3,11 +3,12 @@ import { runReconciliation, type ReconciliationReport } from "./reconcile.js";
 
 export async function runReconcileCli(
   db?: Database,
+  reconcile: typeof runReconciliation = runReconciliation,
 ): Promise<{ breaks: number; report: ReconciliationReport }> {
   const database = db ?? createDatabase();
   const shouldClose = !db;
   try {
-    const result = await runReconciliation(database);
+    const result = await reconcile(database);
     console.log(JSON.stringify(result.report, null, 2));
     return result;
   } finally {
@@ -20,8 +21,8 @@ export async function runReconcileCli(
 if (
   process.env.VITEST !== "true" &&
   (import.meta.url === `file://${process.argv[1]}` ||
-    process.argv[1]?.endsWith("cli.js") ||
-    process.argv[1]?.endsWith("cli.ts"))
+    process.argv[1]?.endsWith("dist/cli.js") ||
+    process.argv[1]?.endsWith("src/cli.ts"))
 ) {
   runReconcileCli()
     .then(({ breaks }) => {
