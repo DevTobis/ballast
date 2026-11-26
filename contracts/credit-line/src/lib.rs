@@ -2144,7 +2144,7 @@ mod test {
             .expect_err("credit-line: draw should have panicked while Draws is paused")
             .downcast::<String>()
             .expect("panic carries its message");
-        assert!(msg.contains("ballast-common: paused"), "unexpected message: {msg}");
+        assert!(msg.contains("Error(Contract, #3)"), "unexpected message: {msg}");
     }
 
     #[test]
@@ -3606,7 +3606,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ballast-common: paused")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn draw_panics_when_draws_scope_paused() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
@@ -3620,7 +3620,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ballast-common: paused")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn draw_panics_when_all_scope_paused() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
@@ -4937,7 +4937,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ballast-common: caller is neither admin nor keeper")]
+    #[should_panic(expected = "Error(Contract, #7)")]
     fn sync_collateral_rejects_a_stranger() {
         let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);

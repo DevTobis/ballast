@@ -284,7 +284,7 @@ All events are emitted during the transaction that executes the state transition
 | Initialization | `"exit-desk: already initialized"` | Roles have already been set up. |
 | Authorization | `"exit-desk: admin argument mismatch"` | Invoked with admin address differing from stored admin. |
 | Authorization | Auth check failures | `holder.require_auth()` or `require_admin_or_keeper()` failed. |
-| Pause | `"ballast-common: paused"` | Contract is paused under `PauseScope::Exits`. |
+| Pause | `Error::Paused` (`Error(Contract, #3)`) | Contract is paused under `PauseScope::Exits`. |
 | Zero/Negative units | `"exit-desk: units must be positive"` | Requested quote or exit with `units <= 0`. |
 | Zero/Negative amount | `"exit-desk: amount must be positive"` | `fund` or `withdraw` called with `amount <= 0`. |
 | Unconfigured asset | `"exit-desk: asset not configured"` | Asset was not initialized via `configure_asset`. |
@@ -310,5 +310,5 @@ All events are emitted during the transaction that executes the state transition
 `ExitDesk` integrates `ballast_common::pause`:
 
 * The pauser role can pause exits via the common pause mechanism under `PauseScope::Exits`.
-* When paused, all calls to `exit(...)` revert immediately with `"ballast-common: paused"`.
+* When paused, all calls to `exit(...)` revert immediately with `Error::Paused` (`Error(Contract, #3)`).
 * `quote(...)` remains operational for informational reads.

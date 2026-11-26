@@ -225,7 +225,7 @@ Every message below is copied from `src/lib.rs`.
 | `repo-dvp: caller is neither lender nor keeper` | `default_at_maturity` | Third-party default. |
 | `repo-dvp: maturity grace period has not expired yet` | `default_at_maturity` | Before `maturity_at + maturity_grace`. |
 | `repo-dvp: price is not Ok, cannot default` / `repo-dvp: guarded price is not positive` | defaults | Price unusable for a default. |
-| `ballast-common: paused` | `accept_and_settle`, `release_excess` | `Repos` or `All` is paused. |
+| `Error::Paused` (`Error(Contract, #3)`) | `accept_and_settle`, `release_excess` | `Repos` or `All` is paused. |
 | `repo-dvp: overflow ...` | arithmetic | An `i128` overflow guard tripped; values are far outside realistic ranges. |
 
 See [`../AUDIT_NOTES.md`](../AUDIT_NOTES.md#repodvp) for trust assumptions and known limits.
