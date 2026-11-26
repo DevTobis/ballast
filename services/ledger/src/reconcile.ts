@@ -42,7 +42,28 @@ import { decimalStringToScaled } from "@ballast/domain-types";
 
 const alerter = createConsoleAlerter("ledger");
 
-/** Tolerance in raw scaled units (1n = 1e-7 of an asset unit) below which a diff isn't a break. */
+/**
+ * Tolerance in raw scaled units below which a difference between Postgres pledge records and
+ * chain-event-implied units is not treated as a reconciliation break.
+ *
+ * Unit encoding & sources:
+ * - `pgUnits`: parsed from `pledge.units` via `decimalStringToScaled(pledge.units)` (7 decimal places,
+ *   where 1 raw unit = 1e-7 of an asset unit).
+ * - `chainUnits`: parsed directly as `BigInt(unitsField)` from the Soroban contract event tuple
+ *   (an i128 integer scaled to 7 decimals, 1e-7).
+ *
+ * Rationale for tolerance:
+ * Both numbers are exact 7-decimal fixed-point integers (1 unit = 10_000_000 raw units) and the
+ * comparison is pure bigint arithmetic, so there is no rounding. The only way the two can differ
+ * without a real break is a `pledge.units` string written with more than 7 decimals:
+ * `decimalStringToScaled` truncates the extra digits, losing less than 1 raw unit per row. The
+ * `100n` allowance (1e-5 of an asset unit) absorbs that for up to 100 pledge rows on one asset
+ * and is far below any amount that matters.
+ *
+ * Rule for modification:
+ * Do NOT widen this tolerance to suppress reconciliation breaks. Any change to `TOLERANCE_UNITS`
+ * requires an explicit architectural review note and risk sign-off.
+ */
 const TOLERANCE_UNITS = 100n;
 
 const PLEDGE_TOPICS = new Set(["pledged", "released", "liquidated"]);

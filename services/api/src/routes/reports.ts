@@ -14,6 +14,9 @@ const querySchema = z
   })
   .refine((data) => data.date !== undefined || data.from !== undefined, {
     message: "either date or from must be provided",
+  })
+  .refine((data) => data.date === undefined || (data.from === undefined && data.to === undefined), {
+    message: "use either date or from/to, not both",
   });
 
 export const REPORT_CSV_FALLBACK_COLUMNS = [

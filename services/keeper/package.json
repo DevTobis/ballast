@@ -8,6 +8,7 @@
     "build": "tsc -b",
     "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
     "start": "node --env-file-if-exists=../../.env dist/index.js",
+    "run-once": "tsx --env-file-if-exists=../../.env src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "lint": "echo 'no lint configured'"
@@ -19,7 +20,6 @@
     "@ballast/network-config": "workspace:*",
     "@ballast/observability": "workspace:*",
     "@ballast/operator-signing": "workspace:*",
-    "@stellar/stellar-sdk": "^17.2.1",
     "drizzle-orm": "^0.36.0",
     "node-cron": "^3.0.3"
   },

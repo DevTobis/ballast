@@ -152,4 +152,13 @@ describe("GET /v1/reports/daily", () => {
       'attachment; filename="ballast-daily-2026-10-01-to-2026-10-07.csv"',
     );
   });
+
+  it("rejects date combined with from/to instead of silently ignoring the range", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reports/daily?date=2026-10-01&from=2026-10-01&to=2026-10-07",
+      headers: authed,
+    });
+    expect(res.statusCode).toBe(400);
+  });
 });

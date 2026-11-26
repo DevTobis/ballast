@@ -11,6 +11,7 @@ export interface ChainGateway {
   txHash(envelopeXdr: string): string;
   send(signedXdr: string): Promise<string>;
   outcome(hash: string): Promise<TxOutcome>;
+  /** Cheap RPC round trip for `/readyz`. Optional so test fakes need not implement it. */
   getLatestLedger?(): Promise<unknown>;
 }
 
@@ -26,7 +27,8 @@ export function getChainGateway(): ChainGateway {
     send: (signedXdr) => sendSignedTx(config(), signedXdr),
     outcome: (hash) => getTxOutcome(config(), hash),
     getLatestLedger: async () => {
-      const server = new rpc.Server(config().rpcUrl);
+      const { rpcUrl } = config();
+      const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
       return server.getLatestLedger();
     },
   };

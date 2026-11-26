@@ -21,6 +21,7 @@ mod mock_token {
     #[contracttype]
     enum DataKey {
         Balance(Address),
+        Allowance(Address, Address),
     }
 
     #[contractimpl]
@@ -40,17 +41,42 @@ mod mock_token {
 
         pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
             from.require_auth();
-            let to_addr = to.address();
-            let from_key = DataKey::Balance(from);
-            let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
-            assert!(from_bal >= amount, "mock-token: insufficient balance");
-            let to_key = DataKey::Balance(to_addr);
-            let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+            move_balance(&env, &from, &to.address(), amount);
+        }
+
+        pub fn approve(env: Env, from: Address, spender: Address, amount: i128) {
+            from.require_auth();
             env.storage()
                 .instance()
-                .set(&from_key, &(from_bal - amount));
-            env.storage().instance().set(&to_key, &(to_bal + amount));
+                .set(&DataKey::Allowance(from, spender), &amount);
         }
+
+        pub fn transfer_from(
+            env: Env,
+            spender: Address,
+            from: Address,
+            to: Address,
+            amount: i128,
+        ) {
+            spender.require_auth();
+            let key = DataKey::Allowance(from.clone(), spender);
+            let allowance: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(allowance >= amount, "mock-token: insufficient allowance");
+            env.storage().instance().set(&key, &(allowance - amount));
+            move_balance(&env, &from, &to, amount);
+        }
+    }
+
+    fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) {
+        let from_key = DataKey::Balance(from.clone());
+        let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
+        assert!(from_bal >= amount, "mock-token: insufficient balance");
+        let to_key = DataKey::Balance(to.clone());
+        let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&from_key, &(from_bal - amount));
+        env.storage().instance().set(&to_key, &(to_bal + amount));
     }
 }
 
@@ -186,6 +212,7 @@ fn test_real_credit_line_and_pledge_vault_full_lifecycle() {
         &h.borrower,
         &h.rwa_id,
         &limit,
+        &0,
         &0,
         &86_400,
         &agreement,
@@ -351,6 +378,7 @@ fn test_real_credit_line_and_pledge_vault_liquidation_with_surplus() {
         &h.rwa_id,
         &limit,
         &0,
+        &0,
         &86_400,
         &agreement,
     );
@@ -394,17 +422,25 @@ fn test_real_credit_line_and_pledge_vault_liquidation_with_surplus() {
     // Close liquidated:
     // Recovered = 1,000 units * $0.95 = $950.
     // Debt = $900.
-    // Surplus = $50 ($950 - $900), which lender pays to borrower in USDC!
+    // Surplus = $50 ($950 - $900). It is booked, not paid, so the lender needs no balance to
+    // close; the borrower pulls it with claim_surplus against the lender's allowance.
     let borrower_usdc_before = h.usdc.balance(&h.borrower);
-    h.usdc.mint(&h.lender, &(50 * PRICE_SCALE)); // Ensure lender has USDC for surplus payout
     h.credit_line.close_liquidated(&h.lender, &line_id);
+    assert_eq!(h.credit_line.surplus_owed(&line_id), 50 * PRICE_SCALE);
+    assert_eq!(h.usdc.balance(&h.borrower), borrower_usdc_before);
+
+    h.usdc.mint(&h.lender, &(50 * PRICE_SCALE));
+    h.usdc
+        .approve(&h.lender, &h.credit_line.address, &(50 * PRICE_SCALE));
+    h.credit_line.claim_surplus(&h.borrower, &line_id);
 
     let borrower_usdc_after = h.usdc.balance(&h.borrower);
     assert_eq!(
         borrower_usdc_after - borrower_usdc_before,
         50 * PRICE_SCALE,
-        "lender must pay surplus to borrower in USDC upon close_liquidated"
+        "the borrower must be able to pull the surplus after close_liquidated"
     );
+    assert_eq!(h.credit_line.surplus_owed(&line_id), 0);
 
     let record = h.credit_line.liquidation_record(&line_id);
     assert!(record.closed);

@@ -86,4 +86,12 @@ describe("GET /readyz", () => {
     // Ensure rpc credentials are never leaked
     expect(JSON.stringify(body)).not.toContain("secret-rpc-key");
   });
+
+  it("treats a dependency it cannot check as failed, not ok", async () => {
+    const db = createFakeDb(new Map());
+    const app = buildServer({ config, db, contracts: {} as ContractClients, chain: {} as ChainGateway });
+    const res = await app.inject({ method: "GET", url: "/readyz" });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ ok: false, dependencies: { database: "ok", rpc: "failed" } });
+  });
 });
