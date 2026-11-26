@@ -124,6 +124,7 @@ longer pause names use `Symbol::new`. Both decode to the same plain string in `c
 
 | Topic | Topic arguments | Payload (in order) | Emitted by | When |
 |---|---|---|---|---|
+| `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` (cash lender) | A new trade is `Proposed` and the lender's leg-1 allowance is granted |
 | `cancel` | `id: u64` | `caller: Address` | `cancel_proposal` (cash lender or cash borrower) | A `Proposed` trade moves to `Cancelled` |
 | `settle` | `id: u64` | `units: i128` (bare value) | `accept_and_settle` (cash borrower) | Leg 1 settled: `units` of RWA pledged, USDC paid out |
 | `unwind` | `id: u64` | `total_due: i128` (bare value) | `unwind` (either party, or keeper) | Leg 2 at or after maturity: borrower repaid principal plus interest, RWA returned |
@@ -146,8 +147,8 @@ Field notes:
   lender may still bear a shortfall; the event does not report it.
 - `cured` carries a constant `0i128` so the payload is never empty. Treat the topic alone as the
   signal.
-- `propose`, `set_usdc`, `configure_asset` and `set_cure_grace` publish nothing today (issues #206
-  and #207 propose events for them).
+- `set_usdc`, `configure_asset` and `set_cure_grace` publish nothing today (issue #207 proposes
+  events for them).
 
 ## ExitDesk (`contracts/exit-desk`)
 
@@ -216,7 +217,6 @@ contract.
 | CreditLine | `line_opened` | `line: u64` | `(lender: Address, borrower: Address, asset: Address, limit: i128, rate_bps: u32, cure_s: u64)` | `open` | #138 |
 | CreditLine | `line_funded` | `line: u64` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` | #137 |
 | CreditLine | not named yet | `line: u64` | not specified | `reduce_limit` (new) | #813 |
-| RepoDvp | `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | #206 |
 | RepoDvp | `usdc`, `curegrace`, `cfgasset` | not specified | new values (old values where cheap) | `set_usdc`, `set_cure_grace`, `configure_asset` | #207 |
 | RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |
 | RepoDvp | `cured` (**breaking**: `0i128` becomes a tuple) | `id: u64` | `(exposure: i128, ltv_bps: u32, price: i128)` | `call_margin` | #840 |
