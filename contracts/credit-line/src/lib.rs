@@ -61,9 +61,10 @@
 //! the TTL of a dormant credit line before it archives.
 //!
 //! **Events.** Like `PledgeVault`, state changes publish one event with the shape
-//! `((Symbol, line), payload)`: `drawn` from `draw`, `line_closed` from `close_liquidated` and `undrawn_withdrawn` from
-//! `withdraw_undrawn` (which moves the lender's funded exposure and so needs an on-chain trace for
-//! the console and indexer). See `README.md`'s events table for the exact topics and payloads:
+//! `((Symbol, line), payload)`: `drawn` from `draw`, `repaid` from `repay`, `line_closed` from
+//! `close_liquidated` and `undrawn_withdrawn` from `withdraw_undrawn` (which moves the lender's
+//! funded exposure and so needs an on-chain trace for the console and indexer). See `README.md`'s
+//! events table for the exact topics and payloads:
 //! - `drawn`: `((Symbol("drawn"), line: u64), (amount: i128, to: Address, drawn_total: i128, ltv_bps: u32))`
 
 use ballast_common::{
@@ -676,6 +677,11 @@ impl CreditLine {
     /// only that is transferred. It returns the amount applied. A borrower who wants to clear the
     /// line signs a figure at or above the debt and interest accrued before inclusion cannot strand
     /// dust or make the call panic.
+    ///
+    /// Publishes `(Symbol("repaid"), line)` with `(payer, interest_paid, principal_paid,
+    /// drawn_after)`, the split the repayment row in PRD §7 needs. The two paid figures sum to the
+    /// amount applied and `drawn_after` is the remaining principal; a reverted repayment publishes
+    /// nothing.
     pub fn repay(env: Env, payer: Address, line: u64, amount: i128) -> i128 {
         ttl::extend_instance(&env);
         payer.require_auth();
@@ -723,6 +729,14 @@ impl CreditLine {
         );
 
         write_line(&env, line, &state);
+
+        // The interest/principal split is otherwise lost off chain: the indexer stores events
+        // generically, and recomputing the split would need a pre-state it may not have.
+        env.events().publish(
+            (Symbol::new(&env, "repaid"), line),
+            (payer, pay_interest, pay_principal, state.drawn),
+        );
+
         applied
     }
 
@@ -1787,6 +1801,73 @@ mod test {
         assert_eq!(after.drawn, 0);
         assert_eq!(after.accrued_interest, 0);
         assert_eq!(h.credit_line.claimable_interest(&id), 50 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn repay_publishes_repaid_with_the_interest_principal_split() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        // One year at 10% on 500 is 50 of interest; repaying 550 clears both parts.
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(550 * PRICE_SCALE));
+
+        let contract_events = || {
+            h.env
+                .events()
+                .all()
+                .events()
+                .into_iter()
+                .filter(|e| e.type_ == ContractEventType::Contract)
+                .cloned()
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        h.credit_line.repay(&h.borrower, &id, &(550 * PRICE_SCALE));
+
+        let events = contract_events();
+        assert_eq!(events.len(), 1, "exactly one event on a successful repayment");
+        let event = events.last().expect("an event must have been published");
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("repaid".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(id);
+        let val: soroban_sdk::Val = (
+            h.borrower.clone(),
+            50 * PRICE_SCALE,
+            500 * PRICE_SCALE,
+            0i128,
+        )
+            .into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+
+        match &event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // A failed repayment (nothing left to pay) reverts, so it publishes nothing.
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.repay(&h.borrower, &id, &(1 * PRICE_SCALE));
+        }));
+        assert!(again.is_err(), "repaying a cleared line must fail");
+        assert_eq!(
+            contract_events().len(),
+            0,
+            "no event may be emitted by a reverted repay"
+        );
     }
 
     #[test]
