@@ -113,6 +113,10 @@ export class RegistryClient extends BaseContractClient {
     return this.invoke(source, "execute_param", [scU64(id)]);
   }
 
+  cancelParam(source: string, id: bigint): Promise<string> {
+    return this.invoke(source, "cancel_param", [scAddress(source), scU64(id)]);
+  }
+
   raiseHaircutNow(source: string, assetAddress: string, addBps: number): Promise<string> {
     return this.invoke(source, "raise_haircut_now", [
       scAddress(source),
@@ -136,6 +140,10 @@ export class RegistryClient extends BaseContractClient {
 
   executeUnpause(source: string, id: bigint): Promise<string> {
     return this.invoke(source, "execute_unpause", [scU64(id)]);
+  }
+
+  cancelUnpause(source: string, id: bigint): Promise<string> {
+    return this.invoke(source, "cancel_unpause", [scAddress(source), scU64(id)]);
   }
 
   /** Read-only; simulated rather than returned as unsigned XDR since it changes no state. */
