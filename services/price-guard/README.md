@@ -68,10 +68,15 @@ Ballast represents all prices, asset values, and margin ratios as 7-decimal fixe
 - All fixed-point conversions truncate **toward zero**:
   - `decimalStringToScaled`: parses the whole and fractional parts as strings, pads or slices the fractional part to exactly 7 digits (`slice(0, 7)`), discarding excess digits without rounding up.
   - `rescalePrice`: integer-divides feeds with more than 7 decimals (`price / 10n ** (decimals - 7)`), which in integer arithmetic truncates toward zero.
-- **Worst-case error**:
-  - For typical token prices, the truncation error is strictly bounded by 1 raw unit of the feed's precision.
-  - For an 8-decimal feed (e.g. RedStone CETES at ~$0.0657): 1 raw unit of truncation error (at 7 decimals) is `1e-7` / `0.0657` ≈ 0.015 bps.
-  - For a 6-decimal source (e.g. Etherfuse CETES USD cost with 6 decimals): 1 raw unit at 6 decimals is `1e-6` / `0.0657` ≈ 0.15 bps.
+- **Worst-case error**: truncating to 7 decimals loses less than one unit of `PRICE_SCALE`, i.e.
+  under `1e-7` USD per token, whatever the source's own precision. In relative terms that is
+  `1e-7 / price`:
+  - RedStone CETES (8 decimals, ~$0.0657): the dropped 8th digit is worth under `1e-7 / 0.0657`
+    ≈ 1.5e-6, about **0.015 bps**.
+  - A $1.00 asset such as Spiko USTBL: under 0.001 bps.
+  - Etherfuse CETES (6 decimals): nothing is lost converting to 7 decimals (the 7th digit is a
+    padded zero). The limit there is the source itself: one 6th-decimal step is
+    `1e-6 / 0.0657` ≈ **0.15 bps** of resolution.
 
 ### Worked Examples from Recorded Fixtures
 
