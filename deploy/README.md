@@ -11,6 +11,14 @@ docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod up 
 
 Add `--profile lending` for the keeper, margin monitor and ledger once the lending contracts exist.
 
+## Deployment Constraints
+
+### Keeper: Single Instance Only
+- **Constraint**: Run exactly **one** instance of the `keeper` service per operator signing account (`--scale keeper=1`).
+- **Why**: The keeper signs on-chain transactions using a single operator key. Concurrent instances attempting to sign at the same time cause sequence number collisions (`txBadSeq`), redundant gas fees, and race conditions leading to duplicate liquidation bookings.
+- **Restarts**: Deployments must use a **stop-before-start** strategy rather than overlapping rolling updates. The compose file configures `stop_grace_period: 70s` so in-flight keeper jobs can finish before shutdown.
+- **Advisory locks**: Postgres advisory locks (`pg_try_advisory_lock`) are used internally to prevent concurrent job runs if an overlap occurs, but scaling replicas is unsupported. See `services/keeper/README.md`.
+
 ## Before the first start
 
 1. **Run the shadow run first** (`scripts/shadow-run.sh`, or `PRICE_GUARD_PUBLISH=false` here) for a week

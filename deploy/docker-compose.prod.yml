@@ -79,6 +79,7 @@ services:
   keeper:
     <<: *service
     profiles: ["lending"]
+    # Deployment constraint: strictly 1 instance per signing key (do not scale). Stop-before-start on updates.
     # Allow the keeper to finish its in-flight job before Docker sends SIGKILL.
     # Must be greater than KEEPER_SHUTDOWN_GRACE_MS (default 60 s) plus teardown overhead.
     stop_grace_period: 70s
