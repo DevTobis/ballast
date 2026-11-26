@@ -9,3 +9,4 @@ pub mod price;
 pub mod risk;
 pub mod timelock;
 pub mod ttl;
+pub mod upgrade;

@@ -13,7 +13,7 @@ export interface RepoTrade {
   startLedger: number;
   maturityAt: number;
   agreementHash: string;
-  status: "proposed" | "settled" | "unwound" | "defaulted";
+  status: "proposed" | "settled" | "unwound" | "defaulted" | "cancelled";
   leg1Tx: string | null;
   leg2Tx: string | null;
 }

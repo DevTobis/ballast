@@ -31,8 +31,19 @@ pnpm --filter @ballast/service-ledger dev      # tsx watch, loads the repo-root 
 pnpm --filter @ballast/service-ledger build && pnpm --filter @ballast/service-ledger start
 ```
 
-`pnpm dev` at the root starts it with the rest. There is no HTTP port and no run-once command; to see a
-run before 02:00, set `LEDGER_RECONCILIATION_CRON` (e.g. `* * * * *`).
+### Reconcile CLI (run-once)
+
+Run an on-demand reconciliation check immediately without starting the scheduler (useful for CI, drills, and incident investigation):
+
+```bash
+pnpm --filter @ballast/service-ledger reconcile
+# or via compiled dist:
+node dist/cli.js
+```
+
+The command prints the full reconciliation report JSON to stdout and exits with code 1 if `breaks > 0` (or 0 if fully in balance).
+
+`pnpm dev` at the root starts it with the rest. To adjust the nightly schedule, set `LEDGER_RECONCILIATION_CRON` (e.g. `* * * * *`).
 
 ## Environment
 

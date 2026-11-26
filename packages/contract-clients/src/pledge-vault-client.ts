@@ -2,16 +2,31 @@ import type { CustodyMode } from "@ballast/domain-types";
 import { BaseContractClient } from "./base-client.js";
 import { enumToScVal, scAddress, scBytes, scI128, scU64 } from "./scval.js";
 
-const CUSTODY_MODE_VARIANT: Record<CustodyMode, string> = {
+const CUSTODY_MODE_FROM_CHAIN: Record<string, CustodyMode> = {
+  Escrow: "escrow",
+  IssuerLien: "issuer_lien",
+  CustodianLien: "custodian_lien",
+};
+
+const CUSTODY_MODE_TO_CHAIN: Record<CustodyMode, string> = {
   escrow: "Escrow",
   issuer_lien: "IssuerLien",
   custodian_lien: "CustodianLien",
 };
 
+/** Full collateral position returned by `PledgeVault::position(line, asset)`. */
+export interface OnChainPledgePosition {
+  units: bigint;
+  pendingLienUnits: bigint;
+  mode: CustodyMode;
+  lienRef: Uint8Array | null;
+}
+
 export class PledgeVaultClient extends BaseContractClient {
   /**
-   * Admin-only. Configures the asset with its linked credit line and custody mode.
-   * Haircut, thresholds, and PriceGuard are managed solely by CreditLine.
+   * Admin-only. The vault's whole per-asset config: the CreditLine that owns lines against the
+   * asset and the asset's custody mode. Haircut, thresholds and PriceGuard are CreditLine's
+   * (`CreditLine::configure_asset`); the vault keeps no copy of them (#180).
    */
   configureAsset(
     source: string,
@@ -23,7 +38,7 @@ export class PledgeVaultClient extends BaseContractClient {
       scAddress(source),
       scAddress(assetAddress),
       scAddress(creditLineAddress),
-      enumToScVal(CUSTODY_MODE_VARIANT[custodyMode]),
+      enumToScVal(CUSTODY_MODE_TO_CHAIN[custodyMode]),
     ]);
   }
 
@@ -70,6 +85,23 @@ export class PledgeVaultClient extends BaseContractClient {
     return this.read<bigint>("position_units", [scU64(line), scAddress(assetAddress)]);
   }
 
+  /**
+   * Read-only: full collateral position for `(line, asset)` (`PledgeVault::position`).
+   * Unknown keys return a default empty Escrow position (`units: 0n`, `pendingLienUnits: 0n`,
+   * `mode: "escrow"`, `lienRef: null`).
+   */
+  async position(line: bigint, assetAddress: string): Promise<OnChainPledgePosition> {
+    const raw = await this.read<OnChainPledgePosition>("position", [
+      scU64(line),
+      scAddress(assetAddress),
+    ]);
+    return {
+      ...raw,
+      mode: CUSTODY_MODE_FROM_CHAIN[raw.mode as unknown as string] ?? raw.mode,
+      lienRef: raw.lienRef ?? null,
+    };
+  }
+
   recordLien(
     source: string,
     line: bigint,
@@ -83,6 +115,44 @@ export class PledgeVaultClient extends BaseContractClient {
       scAddress(assetAddress),
       scI128(units),
       scBytes(lienRef),
+    ]);
+  }
+
+  /**
+   * Borrower-only: cancels unconfirmed pending lien units (`IssuerLien` / `CustodianLien`).
+   * Never touches confirmed position units or moves tokens.
+   */
+  cancelPending(
+    source: string,
+    line: bigint,
+    assetAddress: string,
+    units: bigint,
+  ): Promise<string> {
+    return this.invoke(source, "cancel_pending", [
+      scAddress(source),
+      scU64(line),
+      scAddress(assetAddress),
+      scI128(units),
+    ]);
+  }
+
+  /**
+   * Gateway-only: rejects unconfirmed pending lien units (`IssuerLien` / `CustodianLien`) with a reason.
+   * Never touches confirmed position units or moves tokens.
+   */
+  rejectLien(
+    source: string,
+    line: bigint,
+    assetAddress: string,
+    units: bigint,
+    reason: Buffer,
+  ): Promise<string> {
+    return this.invoke(source, "reject_lien", [
+      scAddress(source),
+      scU64(line),
+      scAddress(assetAddress),
+      scI128(units),
+      scBytes(reason),
     ]);
   }
 }

@@ -79,6 +79,8 @@ export async function estimateLtvBps(
   db: Database,
   creditLineId: string,
   excludePledgeId?: string,
+  /** The contract's own debt (it includes accrued interest); replaces the Postgres-derived figure. */
+  debtOverride?: bigint,
 ): Promise<number> {
   const pledges = await db
     .select()
@@ -99,7 +101,7 @@ export async function estimateLtvBps(
     );
   }
 
-  const debt = await outstandingDebt(db, creditLineId);
+  const debt = debtOverride ?? (await outstandingDebt(db, creditLineId));
   return computeLtvBps(debt, totalCollateral);
 }
 

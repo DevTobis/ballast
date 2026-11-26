@@ -122,4 +122,56 @@ describe("Fastify ZodError handler", () => {
     expect(body.statusCode).toBe(500);
     expect(body.error).toBe("Internal Server Error");
   });
+
+  it("does not write audit_log row when validation fails on draw, repayment, or exit execute", async () => {
+    const BORROWER_PARTY_ID = "33333333-3333-3333-3333-333333333333";
+    const BORROWER_ACCOUNT = "GBORROWERACCOUNT";
+    const auditRows: unknown[] = [];
+    const db = createFakeDb(
+      new Map<unknown, unknown[]>([
+        [schema.partyAccount, [{ partyId: BORROWER_PARTY_ID, stellarAccount: BORROWER_ACCOUNT, role: "borrower" }]],
+        [
+          schema.creditLine,
+          [{ id: LINE_ID, lenderId: LENDER_PARTY_ID, borrowerId: BORROWER_PARTY_ID, contractLineId: "1", status: "open" }],
+        ],
+        [schema.auditLog, auditRows],
+      ]),
+    );
+    const app = buildServer({
+      config,
+      db,
+      contracts: {
+        creditLine: { draw: vi.fn(), repay: vi.fn() },
+        exitDesk: { exit: vi.fn() },
+      } as unknown as ContractClients,
+      chain: { txHash: () => "hash" } as unknown as ChainGateway,
+    });
+
+    const drawRes = await app.inject({
+      method: "POST",
+      url: `/v1/credit-lines/${LINE_ID}/draws`,
+      headers: { authorization: `Bearer ${tokenFor(BORROWER_ACCOUNT)}` },
+      payload: { amount: "0", to: "GDEST" },
+    });
+    expect(drawRes.statusCode).toBe(400);
+
+    const repayRes = await app.inject({
+      method: "POST",
+      url: `/v1/credit-lines/${LINE_ID}/repayments`,
+      headers: { authorization: `Bearer ${tokenFor(BORROWER_ACCOUNT)}` },
+      payload: { amount: "-5" },
+    });
+    expect(repayRes.statusCode).toBe(400);
+
+    const exitRes = await app.inject({
+      method: "POST",
+      url: `/v1/exit/quotes/some-quote-id/execute`,
+      headers: { authorization: `Bearer ${tokenFor(BORROWER_ACCOUNT)}` },
+      payload: { minUsdcOut: "0x10", to: "GDEST" },
+    });
+    expect(exitRes.statusCode).toBe(400);
+
+    expect(auditRows.length).toBe(0);
+  });
 });
+

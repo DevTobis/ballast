@@ -7,8 +7,22 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
-import { withRpcRetry, type NetworkConfig } from "@ballast/network-config";
+import { isTransientRpcError, withRpcRetry, type NetworkConfig } from "@ballast/network-config";
 import { normalizeContractValue } from "./scval.js";
+
+/**
+ * Thrown when a contract call fails Soroban simulation or is rejected by contract logic (e.g. panic, assertion).
+ * Mapped to HTTP 422 by services/api.
+ */
+export class ContractRejectedError extends Error {
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super(`contract rejected the request: ${detail}`);
+    this.name = "ContractRejectedError";
+    this.detail = detail;
+  }
+}
 
 /**
  * Read-only contract calls (`asset`, `guardedPrice`, `ltv`, `quote`, ...) are simulated, not
@@ -76,8 +90,16 @@ export async function buildUnsignedTx(
 
   // Simulates the invocation and attaches the resulting Soroban resource footprint/fee so the
   // envelope is submittable as-is once signed.
-  const prepared = await withRpcRetry(() => server.prepareTransaction(tx));
-  return prepared.toXDR();
+  try {
+    const prepared = await withRpcRetry(() => server.prepareTransaction(tx));
+    return prepared.toXDR();
+  } catch (err) {
+    if (isTransientRpcError(err)) {
+      throw err;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    throw new ContractRejectedError(message);
+  }
 }
 
 /** @deprecated use {@link buildUnsignedTx} */
@@ -109,7 +131,7 @@ export async function simulateRead<T = unknown>(
   const sim = await withRpcRetry(() => server.simulateTransaction(tx));
 
   if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`contract-clients: simulation of "${method}" failed: ${sim.error}`);
+    throw new ContractRejectedError(`contract-clients: simulation of "${method}" failed: ${sim.error}`);
   }
   if (!sim.result) {
     throw new Error(`contract-clients: simulation of "${method}" returned no result`);

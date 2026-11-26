@@ -38,6 +38,7 @@ export function ExitView() {
       ]);
       setAssets(assets);
       setHistory(positions.exitQuotes);
+      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "failed to load");
     }
@@ -59,6 +60,13 @@ export function ExitView() {
   if (!session) return null;
   const asset = assets.find((a) => a.id === assetId) ?? assets[0];
   const expired = quote !== null && secondsLeft === 0;
+  // The quote is for the asset it was requested for, not whatever the selector shows now.
+  const quotedAsset = quote ? assets.find((a) => a.id === quote.assetId) : undefined;
+  // What the seller actually nets per unit once the spread is taken out of the desk price.
+  const effectiveRate =
+    quote && /^\d+$/.test(quote.usdcOut) && /^\d+$/.test(quote.units) && BigInt(quote.units) > 0n
+      ? formatScaledBigintString(((BigInt(quote.usdcOut) * 10_000_000n) / BigInt(quote.units)).toString())
+      : null;
 
   async function guarded(fn: () => Promise<void>) {
     setBusy(true);
@@ -123,8 +131,10 @@ export function ExitView() {
         {quote && (
           <Panel title={`Quote / ${quote.id.slice(0, 8)}`}>
             <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="You sell">{formatScaledBigintString(quote.units, asset?.code)}</Stat>
+              <Stat label="You sell">{formatScaledBigintString(quote.units, quotedAsset?.code)}</Stat>
               <Stat label="You receive">{formatScaledBigintString(quote.usdcOut, "USDC")}</Stat>
+              <Stat label="Desk price">{formatScaledBigintString(quote.price, "USD")}</Stat>
+              <Stat label="Effective rate">{effectiveRate ? `${effectiveRate} USDC / unit` : "--"}</Stat>
               <Stat label="Spread">{bpsToPercent(quote.spreadBps)}</Stat>
               <Stat label="Valid for">
                 <span className={expired ? "text-accent" : "text-ok"}>{expired ? "EXPIRED" : `${secondsLeft}s`}</span>

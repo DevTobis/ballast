@@ -11,3 +11,14 @@ export function createDatabase(connectionString: string = process.env.DATABASE_U
   const sql = postgres(connectionString);
   return drizzle(sql, { schema });
 }
+
+export function createRawClient(connectionString: string = process.env.DATABASE_URL ?? ""): postgres.Sql {
+  if (!connectionString) {
+    throw new Error("@ballast/db: DATABASE_URL is not set");
+  }
+  return postgres(connectionString);
+}
+
+export type RawSql = postgres.Sql;
+export { postgres };
+

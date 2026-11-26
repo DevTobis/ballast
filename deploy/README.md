@@ -27,6 +27,31 @@ Add `--profile lending` for the keeper, margin monitor and ledger once the lendi
    they never appear in the container's environment.
 4. **DNS** for `API_DOMAIN` and `CONSOLE_DOMAIN` must point at this host and ports 80/443 must be open
    before Caddy starts, or certificate issuance fails.
+5. **Seed the asset table** once the stack is up (see the next section); without it nothing is published.
+
+## Seed the asset table
+
+The price-guard publishes the rows of the `asset` table whose `status` is `active`, and nothing but
+this step fills it. Skip it and the price-guard logs `cycle complete` with `count: 0` forever while the
+public live-price page stays empty. Run it once, after `up` and after step 2 (the on-chain assets
+must already be configured, because the rows go live as soon as they exist):
+
+```
+docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod --profile seed run --rm seed
+```
+
+It reads `scripts/shadow-assets.json` and prints `CODE: seeded (<contract id>)` per asset. It is safe
+to repeat: assets already in the table print `already seeded` and are left alone. Check the result:
+
+```
+docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod exec postgres \
+  psql -U ballast -d ballast -c "select code, status, contract_c from asset order by code"
+```
+
+You should see one `active` row per entry in `scripts/shadow-assets.json` (three today), and each
+`contract_c` should equal the matching `SAC_<CODE>` line in `.env.mainnet-deploy`. Within a cron tick
+(one minute by default) `docker compose ... logs price-guard` shows `price-guard: cycle complete` with
+`count` equal to that number of rows.
 
 ## Verified so far
 

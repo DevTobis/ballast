@@ -3,13 +3,14 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { buildServer } from "./index.js";
 import type { PayoutPolicy } from "./hop.js";
 import type { PayoutSigner } from "./signer.js";
+import { FirstLegRefusedError, FirstLegUnavailableError, type FirstLegVerifier } from "./firstLeg.js";
 
 const TOKEN = "payout-test-token-0123456789abcdef0123456789";
 const ANCHOR = Keypair.random().publicKey();
 const ISSUER = Keypair.random().publicKey();
 const policy: PayoutPolicy = { allowedDestinations: new Set([ANCHOR]), usdcIssuer: ISSUER, maxAmount: 1_000n * 10_000_000n };
 
-function server() {
+function server(verifier: FirstLegVerifier = { verify: async () => {} }) {
   const signAndSubmit = vi.fn(async () => ({ hash: "h", status: "PENDING" }));
   const signer = {
     publicKey: () => Keypair.random().publicKey(),
@@ -19,7 +20,7 @@ function server() {
   } as unknown as PayoutSigner;
   // Any database use would fail loudly: these requests must be turned away before reaching it.
   const db = new Proxy({}, { get: () => () => { throw new Error("database must not be touched"); } }) as never;
-  return { app: buildServer(db, signer, { internalToken: TOKEN, policy }), signAndSubmit };
+  return { app: buildServer(db, signer, { internalToken: TOKEN, policy, verifier }), signAndSubmit };
 }
 
 const body = (over: object = {}) => ({
@@ -52,6 +53,25 @@ describe("payout-hop server", () => {
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().error).toMatch(/approved anchor/);
+    expect(signAndSubmit).not.toHaveBeenCalled();
+  });
+
+  it("answers 422 with the reason when the first leg does not back the payout, without touching the database", async () => {
+    const { app, signAndSubmit } = server({
+      verify: async () => { throw new FirstLegRefusedError("first-leg transaction tx1 was not found on the network"); },
+    });
+    const res = await app.inject({ method: "POST", url: "/internal/payout-hop/forward", headers: { "x-internal-token": TOKEN }, payload: body() });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error).toMatch(/not found/);
+    expect(signAndSubmit).not.toHaveBeenCalled();
+  });
+
+  it("answers 503 when the first leg cannot be checked, without touching the database", async () => {
+    const { app, signAndSubmit } = server({
+      verify: async () => { throw new FirstLegUnavailableError("could not look up the first-leg transaction: timeout"); },
+    });
+    const res = await app.inject({ method: "POST", url: "/internal/payout-hop/forward", headers: { "x-internal-token": TOKEN }, payload: body() });
+    expect(res.statusCode).toBe(503);
     expect(signAndSubmit).not.toHaveBeenCalled();
   });
 });

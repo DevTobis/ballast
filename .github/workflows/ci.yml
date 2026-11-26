@@ -58,3 +58,5 @@ jobs:
         run: scripts/check-no-mocks.sh
       - name: Shell scripts parse
         run: for f in scripts/*.sh; do bash -n "$f"; done
+      - name: Docker build context excludes env files and secrets
+        run: scripts/check-docker-context.sh

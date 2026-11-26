@@ -4,7 +4,7 @@ import { schema, type Database } from "@ballast/db";
 import { classifyMargin, decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-types";
 import type { ChainGateway } from "../chain.js";
 import type { ContractClients } from "../contract-clients.js";
-import { recordIntent } from "../intents.js";
+import { recordIntent, withTransaction } from "../intents.js";
 import {
   createDrawSchema,
   createPledgeSchema,
@@ -39,30 +39,34 @@ export function registerCreditLineRoutes(
       asset: body.asset,
       limit: body.limit,
       rateBps: body.rateBps,
+      feeBps: body.feeBps,
       cureS: body.cureWindowS,
       agreementHash: body.agreementHash,
     });
 
-    const [row] = await db
-      .insert(schema.creditLine)
-      .values({
-        lenderId: body.lenderId,
-        borrowerId: body.borrowerId,
-        loanCcy: body.loanCcy,
-        limitAmount: scaledToDecimalString(body.limit),
-        rateBps: body.rateBps,
-        feeBps: body.feeBps,
-        cureWindowS: body.cureWindowS,
-        status: "pending_open",
-        agreementHash: body.agreementHash.toString("hex"),
-      })
-      .returning();
+    const { row, txHash } = await withTransaction(db, async (trx) => {
+      const [row] = await trx
+        .insert(schema.creditLine)
+        .values({
+          lenderId: body.lenderId,
+          borrowerId: body.borrowerId,
+          loanCcy: body.loanCcy,
+          limitAmount: scaledToDecimalString(body.limit),
+          rateBps: body.rateBps,
+          feeBps: body.feeBps,
+          cureWindowS: body.cureWindowS,
+          status: "pending_open",
+          agreementHash: body.agreementHash.toString("hex"),
+        })
+        .returning();
 
-    const txHash = await recordIntent(db, chain, {
-      xdr,
-      kind: "credit_line.open",
-      refId: row.id,
-      partyId: request.partyId,
+      const txHash = await recordIntent(trx, chain, {
+        xdr,
+        kind: "credit_line.open",
+        refId: row.id,
+        partyId: request.partyId,
+      });
+      return { row, txHash };
     });
 
     return reply.code(201).send({ xdr, txHash, creditLineId: row.id });
@@ -279,22 +283,25 @@ export function registerCreditLineRoutes(
       body.units,
     );
 
-    const [row] = await db
-      .insert(schema.pledge)
-      .values({
-        creditLineId: line.id,
-        assetId: asset.id,
-        units: scaledToDecimalString(body.units),
-        custodyMode: body.custodyMode,
-        status: "pending",
-      })
-      .returning();
+    const { row, txHash } = await withTransaction(db, async (trx) => {
+      const [row] = await trx
+        .insert(schema.pledge)
+        .values({
+          creditLineId: line.id,
+          assetId: asset.id,
+          units: scaledToDecimalString(body.units),
+          custodyMode: body.custodyMode,
+          status: "pending",
+        })
+        .returning();
 
-    const txHash = await recordIntent(db, chain, {
-      xdr,
-      kind: "pledge.create",
-      refId: row.id,
-      partyId: request.partyId,
+      const txHash = await recordIntent(trx, chain, {
+        xdr,
+        kind: "pledge.create",
+        refId: row.id,
+        partyId: request.partyId,
+      });
+      return { row, txHash };
     });
 
     return reply.code(201).send({ xdr, txHash, pledgeId: row.id });
@@ -329,11 +336,27 @@ export function registerCreditLineRoutes(
         return reply.code(409).send({ error: `pledge is ${pledge.status}, not active` });
       }
 
-      const postReleaseLtvBps = await estimateLtvBps(db, line.id, pledge.id);
-      if (postReleaseLtvBps >= MARGIN_THRESHOLDS.marginCallBps) {
+      // The Postgres ledger knows principal but not accrued interest, so on its own it understates
+      // the debt and lets through a release the contract then rejects. Prefer the contract's own
+      // figure and fall back to the estimate only when the read fails.
+      let onChainDebt: bigint | undefined;
+      try {
+        onChainDebt = BigInt((await contracts.creditLine.ltv(BigInt(line.contractLineId))).debt);
+      } catch (err) {
+        request.log.warn(
+          { err, creditLineId: line.id },
+          "release: on-chain debt read failed, using the Postgres estimate",
+        );
+      }
+      const debtSource = onChainDebt === undefined ? "estimate" : "on-chain";
+
+      const postReleaseLtvBps = await estimateLtvBps(db, line.id, pledge.id, onChainDebt);
+      // Same bar as the contract (PledgeVault.release) and CreditLine.draw: the line must stay Healthy.
+      if (postReleaseLtvBps >= MARGIN_THRESHOLDS.warningBps) {
         return reply.code(409).send({
           error: "release would breach the healthy LTV threshold",
           projectedLtvBps: postReleaseLtvBps,
+          debtSource,
         });
       }
 
@@ -347,15 +370,17 @@ export function registerCreditLineRoutes(
         decimalStringToScaled(pledge.units),
       );
 
-      await db.update(schema.pledge).set({ status: "pending_release" }).where(eq(schema.pledge.id, pledge.id));
-      const txHash = await recordIntent(db, chain, {
-        xdr,
-        kind: "pledge.release",
-        refId: pledge.id,
-        partyId: request.partyId,
+      const txHash = await withTransaction(db, async (trx) => {
+        await trx.update(schema.pledge).set({ status: "pending_release" }).where(eq(schema.pledge.id, pledge.id));
+        return recordIntent(trx, chain, {
+          xdr,
+          kind: "pledge.release",
+          refId: pledge.id,
+          partyId: request.partyId,
+        });
       });
 
-      return { xdr, txHash, pledgeId: pledge.id, projectedLtvBps: postReleaseLtvBps };
+      return { xdr, txHash, pledgeId: pledge.id, projectedLtvBps: postReleaseLtvBps, debtSource };
     },
   );
 
@@ -394,6 +419,16 @@ export function registerCreditLineRoutes(
     return reply.code(201).send({ xdr, txHash });
   });
 
+  /**
+   * POST /v1/credit-lines/:id/repayments
+   *
+   * Note on semantics:
+   * On-chain `CreditLine::repay` treats `amount` as a cap rather than an exact
+   * amount, applying `min(amount, owed)` (interest first, then principal) and
+   * transferring only what was applied. This allows borrowers to specify a higher
+   * cap to fully clear the line without stranding dust or panicking when interest
+   * accrues between transaction creation and inclusion.
+   */
   app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/repayments", async (request, reply) => {
     const body = createRepaymentSchema.parse(request.body);
     let line;

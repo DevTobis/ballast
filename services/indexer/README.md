@@ -7,7 +7,7 @@ pledge events in its nightly reconciliation.
 
 ## What it talks to
 
-- **Stellar RPC** (`getLatestLedger`, `getEvents`), through `@stellar/stellar-sdk`.
+- **Stellar RPC** (`getHealth`, `getLatestLedger`, `getEvents`), through `@stellar/stellar-sdk`.
 - **Postgres**: reads `max(chain_event.ledger)` and inserts into `chain_event`.
 - **Contracts watched**: every id `loadNetworkConfig()` returns, i.e. `REGISTRY`, `PRICE_GUARD`,
   `PLEDGE_VAULT`, `CREDIT_LINE`, `EXIT_DESK`, `REPO_DVP` and `USDC_SAC` `_CONTRACT_ID`. Unset ids are
@@ -22,6 +22,12 @@ before the cycle ends. Rows carry the RPC event id, which has a unique index, so
 inserts nothing twice. `data` holds `{ topics, value }` decoded with `scValToNative`, with bigints
 stored as strings. RPC calls are retried 4 times with exponential backoff.
 
+If the resume cursor is older than the RPC retention window (`getHealth().oldestLedger`), `pollOnce`
+clamps `startLedger` to that oldest ledger and reports the skipped range as `skippedFrom`/`skippedTo`.
+`runIndexerCycle` fires an `event_gap_skipped` alert for it and the poll loop logs the range at warn
+level. Those events are gone, but the cursor advances instead of retrying the same rejected request
+forever.
+
 If the chain tip is more than `INDEXER_LAG_ALERT_SECONDS / 5` ledgers ahead of what has been scanned,
 it fires an `rpc_lag_high` alert (logged, and posted to `ALERT_WEBHOOK_URL` if set). Because lag is
 computed from the scanned ledger cursor rather than event rows, quiet periods on chain emit no false lag
@@ -33,6 +39,18 @@ alerts. A failed cycle is logged and retried on the next tick. It stops after th
 pnpm --filter @ballast/service-indexer dev      # tsx watch, loads the repo-root .env
 pnpm --filter @ballast/service-indexer build && pnpm --filter @ballast/service-indexer start
 ```
+
+### Backfill CLI
+
+Validate and plan a historical ledger backfill range:
+
+```bash
+pnpm --filter @ballast/service-indexer backfill --from <start> --to <end> [--source rpc|lake]
+```
+
+- `--from`: positive integer start ledger.
+- `--to`: positive integer end ledger (`to >= from`).
+- `--source`: `rpc` (default) or `lake`. `--source lake` clearly reports not implemented.
 
 `pnpm dev` at the root starts it with the other services. Migrations must already be applied
 (`pnpm db:migrate`).
@@ -61,12 +79,15 @@ The two `INDEXER_*` variables are not listed in `.env.example`.
 
 `pnpm --filter @ballast/service-indexer test` (vitest, no network or database; both are faked).
 Covers cold start at `latest - 1000`, the 5-contract filter split, warm start at `max(ledger) + 1`
-with one row per event, cursor resumption without database queries, quiet-chain lag immunity,
-lag alert firing on stalled scans, and `withRetry` success and exhaustion.
+with one row per event, cursor resumption without database queries, clamping a cursor older than the
+RPC retention window against a fake RPC that rejects out-of-range start ledgers, quiet-chain lag
+immunity, lag and event-gap alert firing, and `withRetry` success and exhaustion.
 
 ## Known limits
 
-- Stellar RPC keeps about 7 days of events. `backfillFromDataLake` is not implemented and nothing calls
-  it, so an outage longer than that, or a fresh database on an old deployment, leaves a permanent gap.
+- Stellar RPC keeps about 7 days of events. A longer outage used to wedge the indexer on a rejected
+  `startLedger`; it now clamps to the oldest retained ledger and fires `event_gap_skipped`, but the
+  events in the skipped range are still lost. `backfillFromDataLake` is not implemented and nothing
+  calls it, so a fresh database on an old deployment has the same gap.
 - Cold start reads only the last 1000 ledgers (roughly 80 minutes).
 - Nothing else consumes `chain_event` for live decisions yet; `services/margin-monitor` still polls.

@@ -9,6 +9,14 @@ Ballast is pre-audit, testnet-only software and has no tagged releases yet; entr
 - Contributor documentation: `ARCHITECTURE.md`, `TROUBLESHOOTING.md`, issue and PR templates,
   `CODEOWNERS`, a label set, per-service and per-package READMEs.
 
+### Changed
+- **Breaking (`pledge-vault` ABI, #180):** `PledgeVault::configure_asset` now takes only
+  `admin, asset, credit_line, custody_mode`; its `price_guard`, `haircut_bps` and `thresholds`
+  arguments are gone, and `asset_configured` carries `(credit_line, custody_mode)`. `release`
+  checks post-release health with the new `CreditLine::ltv_after(line, new_units)`, so CreditLine's
+  risk config is the only one. `scripts/deploy.sh` and `scripts/redeploy-price-guard.sh` are
+  updated; an existing deployment needs PledgeVault redeployed (stored `AssetConfig` changed shape).
+
 ## 2026-10-09
 
 ### Fixed

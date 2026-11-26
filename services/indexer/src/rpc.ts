@@ -28,6 +28,14 @@ export interface GetEventsResult {
   latestLedger: number;
 }
 
+export interface GetHealthResult {
+  latestLedger: number;
+  /** Oldest ledger this RPC still retains events for; `getEvents` rejects a smaller `startLedger`. */
+  oldestLedger: number;
+  /** How many ledgers of history the RPC keeps, so callers can reason about the next clamp. */
+  ledgerRetentionWindow: number;
+}
+
 export interface RpcClient {
   getEvents(args: {
     startLedger: number;
@@ -37,6 +45,7 @@ export interface RpcClient {
     cursor?: string;
   }): Promise<GetEventsResult>;
   getLatestLedger(): Promise<{ sequence: number }>;
+  getHealth(): Promise<GetHealthResult>;
 }
 
 /**
@@ -62,9 +71,9 @@ export async function withRetry<T>(
 }
 
 /**
- * Wraps `rpc.Server` (the SDK's Soroban RPC client, exposing the JSON-RPC `getEvents` and
- * `getLatestLedger` methods per https://developers.stellar.org/docs/data/rpc). Only the subset
- * this service needs is surfaced through `RpcClient`.
+ * Wraps `rpc.Server` (the SDK's Soroban RPC client, exposing the JSON-RPC `getEvents`,
+ * `getLatestLedger` and `getHealth` methods per https://developers.stellar.org/docs/data/rpc).
+ * Only the subset this service needs is surfaced through `RpcClient`.
  */
 export function createRpcClient(rpcUrl: string): RpcClient {
   const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
@@ -98,6 +107,15 @@ export function createRpcClient(rpcUrl: string): RpcClient {
     async getLatestLedger() {
       const result = await withRetry(() => server.getLatestLedger());
       return { sequence: result.sequence };
+    },
+
+    async getHealth() {
+      const result = await withRetry(() => server.getHealth());
+      return {
+        latestLedger: result.latestLedger,
+        oldestLedger: result.oldestLedger,
+        ledgerRetentionWindow: result.ledgerRetentionWindow,
+      };
     },
   };
 }

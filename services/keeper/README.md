@@ -21,7 +21,18 @@ but does not call that service.
 
 Jobs run one at a time through a shared queue, because they share one account and its sequence number.
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
-Liquidation and margin steps are written to be safe to repeat after a crash.
+Liquidation and margin steps are written to be safe to repeat after a crash (see [../../TROUBLESHOOTING.md](../../TROUBLESHOOTING.md#liquidation-runs-get-stuck-or-stop-half-finished) for operator recovery steps).
+
+## Replica Behaviour and Advisory Locking
+
+All keeper jobs sign with a single operator account and need sequential transaction sequence numbers. To prevent duplicate submissions, race conditions, or `tx_bad_seq` errors across multiple replicas (e.g. `--scale keeper=2` or during rolling restarts):
+
+- Each tick acquires a session-level Postgres advisory lock (`pg_try_advisory_lock`) on a dedicated connection.
+- If another keeper instance holds the lock, the tick is logged and skipped.
+- When the job finishes, the lock is released. If an instance crashes or disconnects, Postgres automatically releases the advisory lock.
+- `KEEPER_LOCK_SCOPE`: controls locking granularity:
+  - `job` (default): lock key is `hashtext('keeper:' || name)`, allowing different jobs to run while locking out duplicates of the same job.
+  - `global`: lock key is `hashtext('keeper:global')`, ensuring strict single-job execution across the entire cluster.
 
 ### Storage TTL Maintenance
 
@@ -34,6 +45,24 @@ pnpm dev                                    # from the repo root, with every oth
 pnpm --filter @ballast/service-keeper dev   # this service only (tsx watch)
 pnpm --filter @ballast/service-keeper build && pnpm --filter @ballast/service-keeper start
 ```
+
+### Run-once job CLI
+
+Run a single keeper job immediately and exit (useful for drills, testing, and incident response):
+
+```bash
+pnpm --filter @ballast/service-keeper run-once <job-name>
+# or via compiled dist:
+node dist/cli.js run <job-name>
+```
+
+Available jobs: `cure-expiry`, `repo-unwind`, `repo-margin`, `sync-collateral`, `interest-accrual`, `balance`.
+The CLI prints the JSON `JobResult` and exits with code 1 if any row errored or the job crashed, 0 otherwise.
+It takes the same Postgres advisory lock as the scheduled job (`keeper:<job>`, or `keeper:global` with
+`KEEPER_LOCK_SCOPE=global`), so if the running keeper is in the middle of that job it refuses with exit
+code 1 instead of racing it. Other jobs on the live keeper can still run at the same moment and share the
+keeper account's sequence number, so prefer stopping the scheduler (or running during a quiet window)
+for anything but a read-mostly job. There is no `--dry-run`: every job signs and submits transactions.
 
 The repo-root `.env` is loaded automatically. `scripts/dev-setup.sh` writes one and sets the cure-expiry,
 repo-unwind and repo-margin schedules to every minute for local work.
@@ -50,12 +79,42 @@ repo-unwind and repo-margin schedules to every minute for local work.
 - `KEEPER_SYNC_COLLATERAL_CRON`, `KEEPER_CURE_EXPIRY_CRON`, `KEEPER_REPO_UNWIND_CRON`,
   `KEEPER_REPO_MARGIN_CRON`, `KEEPER_INTEREST_ACCRUAL_CRON`, `KEEPER_BALANCE_CRON`: cron overrides.
 - `ALERT_WEBHOOK_URL`, `ALERT_COOLDOWN_S`, `OPERATOR_MIN_XLM`: low-balance alert delivery and threshold.
+- `KEEPER_JOB_TIMEOUT_MS` (default `600000`, 10 minutes): a job still running after this long is abandoned, an error is logged and a `keeper_job_timeout` alert fires, so a stalled RPC or Vault connection cannot hold up every later job (liquidation included). The abandoned promise is ignored if it settles later. A non-numeric or non-positive value falls back to the default. A tick whose previous run of the same job is still queued or running is skipped and logged (`skipped, previous run still in progress`) rather than queued again.
+- `KEEPER_SHUTDOWN_GRACE_MS` (default `60000`): milliseconds to wait for the in-flight job to finish after SIGTERM/SIGINT before closing the DB and exiting. The `stop_grace_period` in `deploy/docker-compose.prod.yml` is set to 70 s to comfortably exceed this default.
 
 ## Source map
 
-- `src/index.ts`: wiring, cron registration, the serial job queue, balance check.
+- `src/index.ts`: wiring, cron registration, the serial job queue, balance check, graceful shutdown.
+- `src/cli.ts`: run-once CLI runner for operator drills and incident response.
 - `src/jobs/syncCollateral.ts`, `cureExpiry.ts`, `interestAccrual.ts`, `repoMargin.ts`, `repoUnwind.ts`: one file per job.
 - `src/jobs/types.ts`: the shared `JobResult` shape.
+
+## Troubleshooting Job Errors
+
+When keeper jobs or operator transactions fail, errors originate either in the specific job logic or in `submitSignedTx` (`packages/operator-signing/src/submit.ts`).
+
+| Error Message | Meaning | Retries Next Run? | Safe to Ignore? | Action |
+|---|---|---|---|---|
+| `no stellar account on file for lender <id>` | The lender record exists in Postgres but has no entry in `party_account` with a Stellar public key. Collateral seizure cannot proceed without a destination address. | Yes | **No** | Register the lender's Stellar account in `party_account` or complete lender onboarding/KYB. |
+| `submitSignedTx: send failed: ...` | Stellar RPC rejected transaction submission at the boundary (e.g. `tx_bad_seq`, `tx_insufficient_balance`, or network error). | Yes | **Yes**, if transient (network blip or sequence conflict); **No** if insufficient XLM balance. | Check operator XLM balance (`checkOperatorBalance`); fund account if needed. Verify RPC connectivity. |
+| `submitSignedTx: transaction <hash> failed on-chain` | The transaction was included in a ledger but Soroban execution failed/trapped (e.g. contract condition violated, such as credit line already closed or health restored). | Yes | **Yes**, typically indicates state moved before submission. | Inspect transaction hash on Stellar Expert / Horizon for exact error code; check if the position cured or was resolved by a borrower. |
+| `submitSignedTx: transaction <hash> did not finalize after 30 attempts` | The transaction was submitted to the network, but polling `getTransaction` timed out (~30s) without confirming SUCCESS or FAILED. | Yes | **Ambiguous** — do NOT immediately resubmit manually. | Query Horizon/RPC for `<hash>` to determine whether it eventually landed. The next scheduled keeper run will safely re-evaluate on-chain state before resubmitting. |
+| `no seized units recoverable for line <id>` | `PledgeVault.liquidate` returned 0 seized units (e.g. units were already seized in a prior run or collateral balance was 0). | No (once line status is updated) | **Yes**, if a prior run already moved collateral. | Verify the credit line's on-chain vault position. |
+| *Vault / credit-line disagreement* (silent skip in `cureExpiry.ts:118`) | In `cure-expiry`, if the units held by `PledgeVault` differ from `CreditLine`'s recorded `pledgedUnits`, the row is skipped silently without throwing an error. | Yes | **Yes** | No manual action required. `sync-collateral` runs every minute and automatically repairs discrepancies between `PledgeVault` and `CreditLine`. |
+
+## Graceful shutdown
+
+On `SIGTERM` or `SIGINT` the keeper:
+
+1. Sets a flag so no new job is enqueued on the next cron tick.
+2. Calls `.stop()` on every `ScheduledTask`, preventing further ticks.
+3. Awaits the current `queue` promise (i.e. the in-flight job) for up to `KEEPER_SHUTDOWN_GRACE_MS` (default 60 s). If the job finishes within the grace period it logs success; if it times out it logs a warning and continues.
+4. Calls `db.end()` to drain and close the Postgres pool.
+5. Logs `"keeper: shutdown complete"` and exits with code 0.
+
+A **second** `SIGTERM`/`SIGINT` before shutdown completes causes an immediate `process.exit(1)` (Docker or the OS is insisting — we get out of the way).
+
+The compose file sets `stop_grace_period: 70s` on the `keeper` service so Docker waits long enough before sending `SIGKILL`.
 
 ## Tests
 

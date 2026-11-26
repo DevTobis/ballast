@@ -128,11 +128,23 @@ retry stellar contract invoke --id "${CID[registry]}" --source admin --network "
   --config "{\"issuer\":\"$RWA_ISSUER\",\"contract\":\"$RWA_SAC\",\"standard\":\"ClassicSac\",\"yield_type\":\"Accumulating\",\"custody_mode\":\"Escrow\",\"ccy\":\"USD\",\"redemption_lag_days\":1,\"haircut_base_bps\":500,\"haircut_fx_bps\":0,\"price_band_bps\":50,\"daily_move_band_bps\":100,\"status\":\"active\"}" \
   >/dev/null
 
-log "Configuring PriceGuard for RWA1 (50bps band, 100bps daily move, 6h staleness - RedStone's USTRY feed updates every 1-2h)"
+# 13h: RedStone's USTRY feed updates about every 12h and PriceGuard needs two fresh sources, so a
+# shorter window leaves the guard Degraded for part of every day. It can only be loosened later
+# through the timelocked queue_config; override PRICE_MAX_STALENESS_S only to tighten it.
+PRICE_MAX_STALENESS_S=${PRICE_MAX_STALENESS_S:-46800}
+log "Configuring PriceGuard for RWA1 (50bps band, 100bps daily move, ${PRICE_MAX_STALENESS_S}s staleness - RedStone's USTRY feed was seen updating every 12h, so under ~13h the guard is Degraded part of each day)"
 retry stellar contract invoke --id "${CID[price-guard]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --band_bps 50 --daily_move_band_bps 100 \
-  --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s 21600 >/dev/null
+  --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s "$PRICE_MAX_STALENESS_S" >/dev/null
 
+# One name per feed (#84): `redstone` is the name services/price-guard publishes the RedStone feed
+# under. The issuer NAV needs no entry; `issuer` is reserved for publish_nav.
+log "Allowlisting price sources for RWA1 in PriceGuard"
+retry stellar contract invoke --id "${CID[price-guard]}" --source admin --network "$NETWORK" -- configure_source \
+  --admin "$ADMIN" --asset "$RWA_SAC" --name redstone --enabled true >/dev/null
+
+# The vault takes only its CreditLine and the custody mode: `release` checks health with
+# CreditLine::ltv_after, so haircut, thresholds and PriceGuard are set once, on CreditLine (#180).
 log "Configuring PledgeVault for RWA1 (escrow mode)"
 retry stellar contract invoke --id "${CID[pledge-vault]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --credit_line "${CID[credit-line]}" \
