@@ -84,6 +84,13 @@ export async function recomputeLine(
 
     if (view.state === "MarginCall" || view.state === "Liquidation") {
       alerter.fire("margin_call", { creditLineId: line.id, state: view.state, ltvBps: view.ltvBps });
+    } else if (fromState === "MarginCall" || fromState === "Liquidation") {
+      alerter.fire("margin_recovered", {
+        creditLineId: line.id,
+        fromState,
+        toState: view.state,
+        ltvBps: view.ltvBps,
+      });
     }
   }
 

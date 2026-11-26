@@ -335,6 +335,64 @@ describe("webhook routes", () => {
     expect(JSON.stringify(listed.json())).not.toMatch(/secret/i);
   });
 
+  it("leaves exactly 10 active subscriptions when 15 creates are sent concurrently", async () => {
+    const subs: Array<Record<string, unknown>> = [];
+    const chain = (rows: unknown[]) => {
+      const p = Promise.resolve(rows) as Promise<unknown[]> & Record<string, unknown>;
+      p.where = () => chain(rows);
+      p.limit = () => chain(rows);
+      return p;
+    };
+    const db = {
+      select: () => ({
+        from: (t: unknown) =>
+          t === schema.partyAccount
+            ? chain([{ partyId: PARTY, stellarAccount: ACCOUNT, role: "borrower" }])
+            : t === schema.webhookSubscription
+              ? chain(subs)
+              : chain([]),
+      }),
+      insert: (table: unknown) => ({
+        values: (v: Record<string, unknown>) => {
+          const row = { id: `sub-${subs.length + 1}`, active: true, createdAt: new Date(), ...v };
+          if (table === schema.webhookSubscription) {
+            subs.push(row);
+          }
+          return {
+            returning: async () => [row],
+          };
+        },
+      }),
+      transaction: async (fn: (tx: any) => any) => fn(db),
+      execute: async () => [{ "?column?": 1 }],
+    } as unknown as Database;
+
+    const app = buildServer({ config, contracts: {} as ContractClients, db });
+
+    const requests = Array.from({ length: 15 }, (_, i) =>
+      app.inject({
+        method: "POST",
+        url: "/v1/webhooks/subscriptions",
+        headers: authed,
+        payload: {
+          url: `https://93.184.216.34/hook-${i}`,
+          events: ["margin.call_issued"],
+        },
+      }),
+    );
+
+    const responses = await Promise.all(requests);
+    const successes = responses.filter((r) => r.statusCode === 201);
+    const conflicts = responses.filter((r) => r.statusCode === 409);
+
+    expect(successes).toHaveLength(10);
+    expect(conflicts).toHaveLength(5);
+    expect(subs).toHaveLength(10);
+    for (const c of conflicts) {
+      expect(c.json()).toEqual({ error: "at most 10 active subscriptions per party" });
+    }
+  });
+
   it("answers 404 when redelivering another party's delivery", async () => {
     const theirs = { id: "sub-x", partyId: "someone-else", url: "https://93.184.216.34/h", events: [], secretCiphertext: "x", active: true, createdAt: new Date() };
     // The fake db ignores WHERE, so only the handler's own ownership check can produce the 404.
@@ -344,6 +402,102 @@ describe("webhook routes", () => {
     ]);
     const redeliver = await app.inject({ method: "POST", url: "/v1/webhooks/deliveries/d-x/redeliver", headers: authed });
     expect(redeliver.statusCode).toBe(404);
+  });
+
+  it("patches subscription url and events without changing or exposing secret", async () => {
+    const sub = {
+      id: "sub-patch",
+      partyId: PARTY,
+      url: "https://93.184.216.34/old",
+      events: ["margin.call_issued"],
+      secretCiphertext: "secret-ciphertext",
+      active: true,
+      createdAt: new Date(),
+    };
+    const app = server(config, [[schema.webhookSubscription, [sub]]]);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/sub-patch",
+      headers: authed,
+      payload: { url: "https://93.184.216.34/new", events: ["margin.cured"] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const json = res.json();
+    expect(json.id).toBe("sub-patch");
+    expect(json.url).toBe("https://93.184.216.34/new");
+    expect(json.events).toEqual(["margin.cured"]);
+    expect(json.active).toBe(true);
+    expect(json).not.toHaveProperty("secret");
+    expect(json).not.toHaveProperty("secretCiphertext");
+
+    // Unsafe URL is rejected with 400
+    const unsafeRes = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/sub-patch",
+      headers: authed,
+      payload: { url: "https://127.0.0.1/unsafe" },
+    });
+    expect(unsafeRes.statusCode).toBe(400);
+
+    // Patch on non-existent or other party's subscription returns 404
+    const otherRes = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/other-id",
+      headers: authed,
+      payload: { url: "https://93.184.216.34/new" },
+    });
+    expect(otherRes.statusCode).toBe(404);
+  });
+
+  it("answers 409 when redelivering for a deactivated subscription", async () => {
+    const inactive = { id: "sub-1", partyId: PARTY, url: "https://93.184.216.34/h", events: [], secretCiphertext: "x", active: false, createdAt: new Date() };
+    const app = server(config, [
+      [schema.webhookSubscription, [inactive]],
+      [schema.webhookDelivery, [{ id: "d-1", subscriptionId: "sub-1", status: "dead" }]],
+    ]);
+    const res = await app.inject({ method: "POST", url: "/v1/webhooks/deliveries/d-1/redeliver", headers: authed });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: "subscription is inactive" });
+  });
+
+  it("produces one 202 and one 409 on concurrent redelivers", async () => {
+    const sub = { id: "sub-1", partyId: PARTY, url: "https://93.184.216.34/h", events: [], secretCiphertext: "x", active: true, createdAt: new Date() };
+    let updatedCount = 0;
+    const fakeDb = createFakeDb(
+      new Map<unknown, unknown[]>([
+        [schema.partyAccount, [{ partyId: PARTY, stellarAccount: ACCOUNT, role: "borrower" }]],
+        [schema.webhookSubscription, [sub]],
+        [schema.webhookDelivery, [{ id: "d-1", subscriptionId: "sub-1", status: "dead" }]],
+      ]),
+    );
+    // Custom update to simulate atomic conditional update where only the first concurrent call updates the row
+    fakeDb.update = (() => {
+      const query: any = {
+        where: () => query,
+        returning: async () => {
+          if (updatedCount === 0) {
+            updatedCount++;
+            return [{ id: "d-1" }];
+          }
+          return [];
+        },
+      };
+      return { set: () => query };
+    }) as any;
+
+    const app = buildServer({ config, db: fakeDb, contracts: {} as ContractClients });
+    const [res1, res2] = await Promise.all([
+      app.inject({ method: "POST", url: "/v1/webhooks/deliveries/d-1/redeliver", headers: authed }),
+      app.inject({ method: "POST", url: "/v1/webhooks/deliveries/d-1/redeliver", headers: authed }),
+    ]);
+
+    const statuses = [res1.statusCode, res2.statusCode].sort();
+    expect(statuses).toEqual([202, 409]);
+    const results = [res1.json(), res2.json()];
+    expect(results).toContainEqual({ id: "d-1", status: "pending" });
+    expect(results).toContainEqual({ error: "delivery is not dead" });
   });
 });
 

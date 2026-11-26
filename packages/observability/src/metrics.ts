@@ -29,6 +29,7 @@ export type AlertKind =
   | "price_degraded"
   | "price_halted"
   | "margin_call"
+  | "margin_recovered"
   | "keeper_balance_low"
   | "operator_balance_low"
   | "reconciliation_break"

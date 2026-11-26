@@ -12,6 +12,7 @@ import { DELIVERABLE_WEBHOOK_EVENTS } from "@ballast/domain-types";
 import type { ApiConfig } from "../config.js";
 import { encryptSecret, isValidSecretKey } from "../webhooks/secretBox.js";
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "../webhooks/ssrf.js";
+import { withPartyAdvisoryLock } from "../party-lock.js";
 
 const MAX_SUBSCRIPTIONS_PER_PARTY = 10;
 
@@ -19,6 +20,15 @@ const createSchema = z.object({
   url: z.string().min(1).max(2048),
   events: z.array(z.enum(DELIVERABLE_WEBHOOK_EVENTS)).min(1),
 });
+
+const patchSchema = z
+  .object({
+    url: z.string().min(1).max(2048).optional(),
+    events: z.array(z.enum(DELIVERABLE_WEBHOOK_EVENTS)).min(1).optional(),
+  })
+  .refine((data) => data.url !== undefined || data.events !== undefined, {
+    message: "at least one of url or events must be provided",
+  });
 
 export function registerWebhookRoutes(app: FastifyInstance, db: Database, config: ApiConfig): void {
   const allowHttp = process.env.NODE_ENV !== "production";
@@ -39,26 +49,33 @@ export function registerWebhookRoutes(app: FastifyInstance, db: Database, config
       throw err;
     }
 
-    const mine = await db
-      .select()
-      .from(schema.webhookSubscription)
-      .where(eq(schema.webhookSubscription.partyId, request.partyId));
-    if (mine.filter((s) => s.active).length >= MAX_SUBSCRIPTIONS_PER_PARTY) {
-      return reply.code(409).send({ error: `at most ${MAX_SUBSCRIPTIONS_PER_PARTY} active subscriptions per party` });
-    }
+    const result = await withPartyAdvisoryLock(db, request.partyId, async (tx) => {
+      const mine = await tx
+        .select()
+        .from(schema.webhookSubscription)
+        .where(eq(schema.webhookSubscription.partyId, request.partyId));
+      if (mine.filter((s) => s.active).length >= MAX_SUBSCRIPTIONS_PER_PARTY) {
+        return {
+          status: 409,
+          body: { error: `at most ${MAX_SUBSCRIPTIONS_PER_PARTY} active subscriptions per party` },
+        };
+      }
 
-    const secret = randomBytes(32).toString("hex");
-    const [row] = await db
-      .insert(schema.webhookSubscription)
-      .values({
-        partyId: request.partyId,
-        url: parsed.data.url,
-        events: [...new Set(parsed.data.events)],
-        secretCiphertext: encryptSecret(secret, config.webhookSecretKey),
-      })
-      .returning();
+      const secret = randomBytes(32).toString("hex");
+      const [row] = await tx
+        .insert(schema.webhookSubscription)
+        .values({
+          partyId: request.partyId,
+          url: parsed.data.url,
+          events: [...new Set(parsed.data.events)],
+          secretCiphertext: encryptSecret(secret, config.webhookSecretKey),
+        })
+        .returning();
 
-    return reply.code(201).send({ id: row.id, url: row.url, events: row.events, secret });
+      return { status: 201, body: { id: row.id, url: row.url, events: row.events, secret } };
+    });
+
+    return reply.code(result.status).send(result.body);
   });
 
   app.get("/v1/webhooks/subscriptions", async (request) => {
@@ -91,6 +108,51 @@ export function registerWebhookRoutes(app: FastifyInstance, db: Database, config
       .set({ active: false })
       .where(eq(schema.webhookSubscription.id, sub.id));
     return reply.code(204).send();
+  });
+
+  app.patch<{ Params: { id: string } }>("/v1/webhooks/subscriptions/:id", async (request, reply) => {
+    const [sub] = await db
+      .select()
+      .from(schema.webhookSubscription)
+      .where(
+        and(
+          eq(schema.webhookSubscription.id, request.params.id),
+          eq(schema.webhookSubscription.partyId, request.partyId),
+        ),
+      )
+      .limit(1);
+    if (!sub || !sub.active || sub.partyId !== request.partyId || sub.id !== request.params.id) {
+      return reply.code(404).send({ error: "subscription not found" });
+    }
+
+    const parsed = patchSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+
+    if (parsed.data.url !== undefined) {
+      try {
+        await assertSafeWebhookUrl(parsed.data.url, { allowHttp });
+      } catch (err) {
+        if (err instanceof UnsafeWebhookUrlError) return reply.code(400).send({ error: err.message });
+        throw err;
+      }
+    }
+
+    const updates: Partial<{ url: string; events: string[] }> = {};
+    if (parsed.data.url !== undefined) updates.url = parsed.data.url;
+    if (parsed.data.events !== undefined) updates.events = [...new Set(parsed.data.events)];
+
+    await db
+      .update(schema.webhookSubscription)
+      .set(updates)
+      .where(eq(schema.webhookSubscription.id, sub.id));
+
+    return reply.code(200).send({
+      id: sub.id,
+      url: updates.url ?? sub.url,
+      events: updates.events ?? sub.events,
+      active: sub.active,
+      createdAt: sub.createdAt,
+    });
   });
 
   app.get<{ Params: { id: string } }>("/v1/webhooks/subscriptions/:id/deliveries", async (request, reply) => {
@@ -142,11 +204,16 @@ export function registerWebhookRoutes(app: FastifyInstance, db: Database, config
     if (!delivery || !sub || sub.partyId !== request.partyId) {
       return reply.code(404).send({ error: "delivery not found" });
     }
+    if (!sub.active) return reply.code(409).send({ error: "subscription is inactive" });
     if (delivery.status !== "dead") return reply.code(409).send({ error: `delivery is ${delivery.status}` });
-    await db
+    const updated = await db
       .update(schema.webhookDelivery)
       .set({ status: "pending", attempts: 0, nextAttemptAt: new Date(), lastError: null })
-      .where(eq(schema.webhookDelivery.id, delivery.id));
+      .where(and(eq(schema.webhookDelivery.id, delivery.id), eq(schema.webhookDelivery.status, "dead")))
+      .returning({ id: schema.webhookDelivery.id });
+    if (updated.length === 0) {
+      return reply.code(409).send({ error: "delivery is not dead" });
+    }
     return reply.code(202).send({ id: delivery.id, status: "pending" });
   });
 }
