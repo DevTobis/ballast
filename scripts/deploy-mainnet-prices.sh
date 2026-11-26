@@ -384,8 +384,6 @@ for row in "${ROWS[@]}"; do
       --max_staleness_s "$MAX_STALENESS_S" >/dev/null
     run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_source \
       --admin "$ADMIN" --asset "$SAC" --name redstone --enabled true >/dev/null
-    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_source \
-      --admin "$ADMIN" --asset "$SAC" --name redston --enabled true >/dev/null
     mark_step "GUARD_$CODE"
   fi
 

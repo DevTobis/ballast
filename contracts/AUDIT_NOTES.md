@@ -62,6 +62,7 @@ no timelock, and applies to positions that are already open.
 | RepoDvp | `set_cure_grace`, `set_maturity_grace` | seconds (at least 60) | how long a borrower has to cure a margin call before `default_close`, and how long an unpaid trade waits past maturity before `default_at_maturity` can act | none |
 | PriceGuard | `configure_asset`, `queue_config` | bands, window, staleness | when a price is `Ok`, `Degraded` or `Halted` | tightening immediate; loosening 48h via `queue_config` |
 | PriceGuard | `remove_source` | a source name | which sources the median uses | none |
+| PriceGuard | `configure_source` | a source name and `enabled` | which names `publish_source` accepts and the median counts (the allowlist, #84); `issuer` is reserved for `publish_nav` | none |
 | PriceGuard | `configure_signature_requirement` | NAV signature on/off | whether unsigned NAV is accepted | turning it on immediate; turning it off 48h via `queue_config` |
 | Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
 
