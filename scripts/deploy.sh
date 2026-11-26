@@ -137,6 +137,12 @@ retry stellar contract invoke --id "${CID[price-guard]}" --source admin --networ
   --admin "$ADMIN" --asset "$RWA_SAC" --band_bps 50 --daily_move_band_bps 100 \
   --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s "$PRICE_MAX_STALENESS_S" >/dev/null
 
+# One name per feed (#84): `redstone` is the name services/price-guard publishes the RedStone feed
+# under. The issuer NAV needs no entry; `issuer` is reserved for publish_nav.
+log "Allowlisting price sources for RWA1 in PriceGuard"
+retry stellar contract invoke --id "${CID[price-guard]}" --source admin --network "$NETWORK" -- configure_source \
+  --admin "$ADMIN" --asset "$RWA_SAC" --name redstone --enabled true >/dev/null
+
 log "Configuring PledgeVault for RWA1 (5% haircut, escrow mode)"
 retry stellar contract invoke --id "${CID[pledge-vault]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "${CID[price-guard]}" --credit_line "${CID[credit-line]}" \

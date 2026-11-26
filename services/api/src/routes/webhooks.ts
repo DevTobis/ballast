@@ -142,11 +142,16 @@ export function registerWebhookRoutes(app: FastifyInstance, db: Database, config
     if (!delivery || !sub || sub.partyId !== request.partyId) {
       return reply.code(404).send({ error: "delivery not found" });
     }
+    if (!sub.active) return reply.code(409).send({ error: "subscription is inactive" });
     if (delivery.status !== "dead") return reply.code(409).send({ error: `delivery is ${delivery.status}` });
-    await db
+    const updated = await db
       .update(schema.webhookDelivery)
       .set({ status: "pending", attempts: 0, nextAttemptAt: new Date(), lastError: null })
-      .where(eq(schema.webhookDelivery.id, delivery.id));
+      .where(and(eq(schema.webhookDelivery.id, delivery.id), eq(schema.webhookDelivery.status, "dead")))
+      .returning({ id: schema.webhookDelivery.id });
+    if (updated.length === 0) {
+      return reply.code(409).send({ error: "delivery is not dead" });
+    }
     return reply.code(202).send({ id: delivery.id, status: "pending" });
   });
 }

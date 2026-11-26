@@ -27,13 +27,19 @@
  * already `Liquidating` on-chain next time and carries on from the vault.
  *
  * Operator recovery runbook: see `TROUBLESHOOTING.md` ("Liquidation runs get stuck or stop half-finished").
+ *
+ * Counts as: processed = the line was liquidated (`CreditLine.liquidate` and/or
+ * `PledgeVault.liquidate` submitted and the rows booked). skipped = no unhealthy event or no
+ * on-chain id; cured, only at MarginCall or no Ok price; breach just armed by a `poke` (a
+ * transaction was sent, but liquidation needs a later ledger); still inside the cure window; or
+ * vault and credit line disagree on units (sync-collateral repairs it). error = the line threw.
  */
 import { and, desc, eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
 import { decimalStringToScaled, scaledToDecimalString } from "@ballast/domain-types";
-import { loadNetworkConfig } from "@ballast/network-config";
 import type { CreditLineClient, PledgeVaultClient } from "@ballast/contract-clients";
-import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
+import type { KmsSigner } from "@ballast/operator-signing";
+import { signAndSubmit, type NetworkSubmissionConfig } from "./submit.js";
 import { emptyResult, type JobResult } from "./types.js";
 
 const UNHEALTHY = new Set(["MarginCall", "Liquidation"]);
@@ -41,18 +47,13 @@ const UNHEALTHY = new Set(["MarginCall", "Liquidation"]);
 /** How far back to look for the start of the current unhealthy stretch. */
 const EVENT_LOOKBACK = 50;
 
-async function signAndSubmit(signer: KmsSigner, unsignedXdr: string): Promise<string> {
-  const network = loadNetworkConfig();
-  const signedXdr = await signer.sign(unsignedXdr);
-  const submitted = await submitSignedTx(network.rpcUrl, network.networkPassphrase, signedXdr);
-  return submitted.hash;
-}
-
 export async function runCureExpiryJob(
   db: Database,
   creditLineClient: CreditLineClient,
   pledgeVaultClient: PledgeVaultClient,
   signer: KmsSigner,
+  /** RPC URL and passphrase from the keeper's startup config; omitted, the environment is read. */
+  network?: NetworkSubmissionConfig,
 ): Promise<JobResult> {
   const result = emptyResult();
   const keeper = signer.publicKey();
@@ -87,7 +88,7 @@ export async function runCureExpiryJob(
         }
 
         if (onChain.breachLedger == null) {
-          await signAndSubmit(signer, await creditLineClient.poke(contractLine, keeper));
+          await signAndSubmit(signer, await creditLineClient.poke(contractLine, keeper), network);
           result.skipped++; // armed now; liquidation needs a later ledger, i.e. a later run
           continue;
         }
@@ -125,7 +126,7 @@ export async function runCureExpiryJob(
       const txHashes: string[] = [];
       if (!alreadyLiquidating) {
         txHashes.push(
-          await signAndSubmit(signer, await creditLineClient.liquidate(keeper, contractLine, "transfer")),
+          await signAndSubmit(signer, await creditLineClient.liquidate(keeper, contractLine, "transfer"), network),
         );
       }
 
@@ -141,6 +142,7 @@ export async function runCureExpiryJob(
               held,
               lenderAccount.stellarAccount,
             ),
+            network,
           ),
         );
       }
