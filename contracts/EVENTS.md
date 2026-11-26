@@ -89,6 +89,8 @@ Field notes:
 |---|---|---|---|---|
 | `pledged` | `line: u64` | `(asset: Address, units: i128)` | `pledge` (borrower) | indexer; **ledger reconciler** (`+units`) |
 | `lien_recorded` | `line: u64` | `(asset: Address, units: i128, lien_ref: Bytes)` | `record_lien` (gateway) | indexer (stored only) |
+| `lien_rejected` | `line: u64` | `(asset: Address, units: i128, reason: Bytes)` | `reject_lien` (gateway) | indexer (stored only) |
+| `pending_cancelled` | `line: u64` | `(asset: Address, units: i128)` | `cancel_pending` (borrower) | indexer (stored only) |
 | `released` | `line: u64` | `(asset: Address, units: i128)` | `release` (borrower) | indexer; **ledger reconciler** (`-units`) |
 | `liquidated` | `line: u64` | `(asset: Address, units: i128, to: Address)` | `liquidate` (keeper) | indexer; **ledger reconciler** (`-units`); off-chain custodian/issuer delivery in lien modes (see the crate README) |
 
@@ -99,6 +101,9 @@ Field notes:
   `units`, but `pledged` is still published with the requested amount. The confirmation shows up
   later as one or more `lien_recorded` events. The reconciler currently counts `pledged` units
   straight away in every mode.
+- `lien_rejected` (gateway) and `pending_cancelled` (borrower) take back pending units that a
+  `pledged` event already announced. The reconciler does not subtract them yet, so a rejected or
+  cancelled lien shows up as a reconciliation break until it does.
 - `lien_ref` is the gateway's opaque reference. `position.lien_ref` keeps only the latest one
   (issue #824), so earlier tranche references can only be recovered from these events.
 - `pledge` and `record_lien` also call `CreditLine::sync_from_vault`. As a result, the same
@@ -210,7 +215,6 @@ contract.
 | CreditLine | not named yet | `line: u64` | not specified | `reduce_limit` (new) | #813 |
 | PledgeVault | `asset_configured` | per issue (see note) | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` | #178 |
 | PledgeVault | `gateway_set` | none | `gateway: Address` (expected, by analogy with `vault_set`) | `set_gateway` | #178 |
-| PledgeVault | not named yet | `line: u64` | includes `reason: Bytes` | `reject_lien` (new) | #179 |
 | RepoDvp | `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | #206 |
 | RepoDvp | `usdc`, `curegrace`, `cfgasset` | not specified | new values (old values where cheap) | `set_usdc`, `set_cure_grace`, `configure_asset` | #207 |
 | RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |

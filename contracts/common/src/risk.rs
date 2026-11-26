@@ -18,6 +18,7 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// `units * guarded_price * (10_000 - haircut_bps) / (PRICE_SCALE * 10_000)`, and collateral is
 /// never over-valued (`CreditLine`, `PledgeVault` and `RepoDvP` all value positions with this).
 pub fn collateral_value(units: i128, guarded_price: i128, haircut_bps: u32) -> i128 {
+    // configure_asset validates this upfront; this assert is defence-in-depth.
     assert!(
         haircut_bps as i128 <= BPS_DENOMINATOR,
         "haircut exceeds 100%"
