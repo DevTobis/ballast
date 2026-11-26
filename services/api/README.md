@@ -138,7 +138,7 @@ When a party is held or screening cannot proceed, the API returns:
 | `403` | `party not found` | The authenticated caller or the screened counterparty ID does not exist in the database. | Register or verify the party ID. |
 | `403` | `compliance hold: KYB is <status>` | The party's KYB verification is not `approved` (e.g. `pending`, `rejected`, `suspended`). | Contact platform operator. Operators update status via `pnpm --filter @ballast/db compliance kyb <partyId> approved <provider> <ref>`. |
 | `403` | `compliance hold: sanctions screening needs review` | The party's legal name or Stellar account matched an entry on the OFAC SDN list and has not been cleared. | Contact platform operator. Operators review matches and clear false positives via `pnpm --filter @ballast/db compliance clear <partyId> <reviewer> "<reason>"`. |
-| `503` | `upstream sanctions screener unavailable: <detail>` | The sanctions screener failed to load or download the OFAC SDN list, or the cached list is older than 7 days. Fails closed. | Wait for SDN list sync or check upstream network connectivity. |
+| `503` | `sanctions list unavailable: <detail>` | The OFAC SDN list could not be loaded and there is no last good copy recent enough to keep screening against. Fails closed. | Wait for SDN list sync or check upstream network connectivity. |
 
 ### Screening cache TTL and false-positive resolution
 
@@ -181,7 +181,7 @@ Possible statuses: `open`, `expired`, `filled`.
 | Status | Type | Transition Trigger | Permitted Operations & Route Guards |
 | --- | --- | --- | --- |
 | `open` | Initial | Created by `POST /v1/exit/quotes` with on-chain price and payout calculated from ExitDesk contract. | Can be executed via `POST /v1/exit/quotes/:id/execute` before `expiresAt`. If `expiresAt < now`, execution transitions quote to `expired` and returns `409 quote expired`. Disallows duplicate in-flight executes: returns `409 an execute for this quote is already pending`. |
-| `expired` | Terminal | Set by `POST /v1/exit/quotes/:id/execute` when called after `expiresAt`, or by quote pruning. | Terminal state. Cannot be executed (`409 quote is expired` or `409 quote expired`). |
+| `expired` | Terminal | Set by `POST /v1/exit/quotes/:id/execute` when it is called after `expiresAt` (`routes/exit.ts`). Nothing else expires a quote, so an unexecuted quote stays `open` in the table after `expiresAt`. | Terminal state. Cannot be executed (`409 quote is expired` or `409 quote expired`). |
 | `filled` | Terminal | Set by `applySuccess` in `intents.ts` upon `exit.execute` transaction settling on-chain (`exit_fill` recorded). | Terminal state. Cannot be re-executed (`409 quote is filled`). |
 
 ### Repo Trade (`repo_trade`)
@@ -193,7 +193,7 @@ Possible statuses: `proposed`, `settled`, `unwound`, `defaulted`, `failed`.
 | `proposed` | Initial | Created by `POST /v1/repo/proposals` by the cash lender while proposal transaction is prepared. | Can be accepted by the cash borrower via `POST /v1/repo/proposals/:id/accept` once `contractTradeId` has settled on-chain. If proposal tx has not settled: `409 repo proposal has not settled on-chain yet`. Unwind or top-up returns `409 trade is proposed, not settled`. |
 | `settled` | Active | Set by `applySuccess` in `intents.ts` upon `repo.accept` (leg 1) settling on-chain (`startLedger` and `leg1Tx` recorded). | Active trade. Permitted operations: `POST /v1/repo/trades/:id/top-ups` (cure margin call) and `POST /v1/repo/trades/:id/unwind` (at or after maturity). Cannot accept again (`409 trade is settled`). |
 | `unwound` | Terminal | Set by `applySuccess` in `intents.ts` upon `repo.unwind` (leg 2) settling on-chain (`leg2Tx` recorded). | Terminal state. Collateral and cash returned. Further unwinds or top-ups return `409 trade is unwound, not settled`. |
-| `defaulted` | Terminal | Set by `services/keeper/src/jobs/repoMargin.ts` when a repo margin call expires without sufficient top-up. | Terminal state. Collateral retained by lender. No further operations permitted (`409 trade is defaulted, not settled`). |
+| `defaulted` | Terminal | Set by the keeper: `repoMargin.ts` after it calls `default_close` once a margin call's cure deadline passes, and `repoMargin.ts` / `repoUnwind.ts` when they find the trade already `Defaulted` on-chain (for example after `default_at_maturity`). | Terminal state. Collateral retained by lender. No further operations permitted (`409 trade is defaulted, not settled`). |
 | `failed` | Terminal | Set by `applyFailure` in `intents.ts` if `repo.propose` transaction fails on-chain. | Terminal state. No operations permitted. |
 
 ### Transaction Intent (`tx_intent`)
@@ -205,7 +205,7 @@ Possible statuses: `pending`, `settled`, `failed`, `expired`.
 | `pending` | Initial | Created by `recordIntent` in `intents.ts` when unsigned transaction envelope XDR is generated. | Awaits signature and submission. `POST /v1/tx/submit` accepts only `pending` intents; duplicate submissions or unknown intents are rejected. `POST /v1/tx/:hash/settle` polls status. |
 | `settled` | Terminal | Set by `applySuccess` in `intents.ts` when transaction inclusion in a ledger is confirmed by Stellar RPC (`settledAt` and `ledger` recorded). | Successfully closed transaction. Books updated. |
 | `failed` | Terminal | Set by `applyFailure` in `intents.ts` when transaction simulation or execution fails on-chain (`error` recorded). | Optimistic row updates rolled back. |
-| `expired` | Terminal | Set by intent sweep worker when transaction is not submitted within valid ledger sequence window. | Intent timed out without inclusion. |
+| `expired` | Terminal | Set by `sweepPendingIntents` (`intents.ts`, run on an interval from `index.ts`) when RPC still has no record of the transaction `INTENT_EXPIRY_MS` (the unsigned-tx timeout plus 120 s) after the intent was created; `applyFailure` then rolls the optimistic rows back in the same database transaction. | Intent timed out without inclusion. |
 
 ## Amount and unit conventions
 
