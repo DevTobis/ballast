@@ -90,7 +90,7 @@ The credit line has two independent dimensions:
 - `LineStatus`: `Open`, `Liquidating`, or `Closed`
 - `MarginState`: `Healthy`, `Warning`, `MarginCall`, or `Liquidation`
 
-Status and margin state are orthogonal: an `Open` line can be `Warning`, `MarginCall`, or `Liquidation`; only `liquidate` changes `Open` to `Liquidating`, and only `close_liquidated` changes `Liquidating` to `Closed`.
+Status and margin state are orthogonal: an `Open` line can be `Warning`, `MarginCall`, or `Liquidation`; only `liquidate` changes `Open` to `Liquidating`. A line reaches `Closed` in one of two ways: `close_liquidated` from `Liquidating`, or `close` from `Open` once the line is fully repaid and the lender has withdrawn all funding (#130).
 
 ```mermaid
 stateDiagram-v2
@@ -124,6 +124,7 @@ stateDiagram-v2
 
     Open --> Liquidating: liquidate / breach armed and later-ledger Ok liquidation
     Liquidating --> Closed: close_liquidated / lender auth; Liquidating status; vault position empty
+    Open --> Closed: close / lender or borrower auth; Open status; nothing owed; funded == 0
     Closed --> [*]
 
     note right of Open
@@ -160,6 +161,7 @@ This is why `Warning` can remain `Open`: status is the lifecycle state, while ma
 | `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to the fresh state: `Healthy`, `Warning`, `MarginCall`, or `Liquidation` (including `Liquidation` with a non-`Ok` price) | Cleared to `None` |
 | `liquidate` | Keeper authorization; breach exists: `credit-line: no confirmed breach flagged; call poke(line) first`; current ledger sequence is greater than `breach_ledger`: `credit-line: liquidation needs a later ledger than the flagged breach`; status is `Open`: `credit-line: line is not open`; fresh guarded price status: `credit-line: price status is not Ok`; fresh state: `credit-line: breach is no longer confirmed` | `Liquidating` | `Liquidation` | Preserved unchanged |
 | `close_liquidated` | Lender authorization; lender matches line: `credit-line: not this line's lender`; status is `Liquidating`: `credit-line: line is not being liquidated`; the vault position is empty (`PledgeVault::position_units == 0`): `credit-line: collateral has not left the vault`, or with no vault configured, zero seized and pledged units: `credit-line: vault not configured` | `Closed` | `Healthy` | Cleared to `None` |
+| `close` | Caller authorization; caller is the line's lender or borrower: `credit-line: not this line's lender or borrower`; status is `Open`: `credit-line: line is not open`; no principal: `credit-line: line has outstanding principal`; no accrued interest: `credit-line: line has outstanding interest`; no accrued fee: `credit-line: line has outstanding fees`; no funding left: `credit-line: line has undrawn funds` | `Closed` | Unchanged | Unchanged |
 | `sync_from_vault` | Configured vault authorization; configured vault check: `credit-line: caller is not the configured vault`; vault not configured: `credit-line: vault not configured`; `units >= 0`: `credit-line: units cannot be negative`; matching line asset: `credit-line: not this line's collateral asset` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 | `sync_collateral` | Caller authorization and caller is stored admin or keeper: `ballast-common: caller is neither admin nor keeper`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 
