@@ -900,6 +900,69 @@ fn default_close_clears_pending_margin_call_and_cure_deadline() {
 }
 
 #[test]
+fn exact_margin_call_amount_computed_on_margin_call() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{symbol_short, IntoVal, TryFromVal};
+
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    // Initial state: 100 units, 90 cash, 5% haircut, price $1, 0 elapsed interest.
+    // target = 90e7 * 10_000 / 8_000 = 112.5e7
+    // collateral = 100e7 * 1.0 * 0.95 = 95e7
+    // expected margin_call_amount = 112.5e7 - 95e7 = 17.5e7 = 175_000_000
+    repo.call_margin(&h.keeper, &id);
+
+    let events = h.env.events().all();
+    let trade = repo.trade(&id);
+    assert_eq!(trade.margin_call_amount, 175_000_000);
+
+    // Assert mcall event matches margin_call_amount
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected mcall event");
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("mcall"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let data_val: soroban_sdk::Val = 175_000_000i128.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val).unwrap();
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.clone().into(), "mcall topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "mcall data mismatch");
+        }
+    }
+
+    // Variant at a lower price: price drops to $0.80 (8_000_000 stroops).
+    // collateral = 100e7 * 0.8 * 0.95 = 76e7 = 760_000_000
+    // target = 112.5e7 = 1_125_000_000
+    // expected margin_call_amount = 1_125_000_000 - 760_000_000 = 365_000_000
+    set_price(&h, 8_000_000);
+    repo.call_margin(&h.keeper, &id);
+
+    let events2 = h.env.events().all();
+    let trade2 = repo.trade(&id);
+    assert_eq!(trade2.margin_call_amount, 365_000_000);
+
+    let repo_events2 = events2.filter_by_contract(&h.repo);
+    let last2 = repo_events2.events().last().expect("expected updated mcall event");
+    let data_val2: soroban_sdk::Val = 365_000_000i128.into_val(&h.env);
+    let expected_data_xdr2 = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val2).unwrap();
+
+    match &last2.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(
+                body.topics,
+                expected_topics_xdr.into(),
+                "updated mcall topic mismatch"
+            );
+            assert_eq!(body.data, expected_data_xdr2, "updated mcall data mismatch");
+        }
+    }
+}
+
+#[test]
 fn margin_view_reports_the_position_without_changing_it() {
     let h = setup();
     let id = settled_under_margin(&h);

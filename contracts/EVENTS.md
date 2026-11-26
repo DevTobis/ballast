@@ -92,6 +92,8 @@ Field notes:
 | `lien_recorded` | `line: u64` | `(asset: Address, units: i128, lien_ref: Bytes)` | `record_lien` (gateway) | indexer (stored only) |
 | `lien_rejected` | `line: u64` | `(asset: Address, units: i128, reason: Bytes)` | `reject_lien` (gateway) | indexer (stored only) |
 | `pending_cancelled` | `line: u64` | `(asset: Address, units: i128)` | `cancel_pending` (borrower) | indexer (stored only) |
+| `asset_configured` | `asset: Address` | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` (admin) | indexer (stored only) |
+| `gateway_set` | none (topic is the 1-tuple `(Symbol,)`) | `gateway: Address` (bare value, not a tuple) | `set_gateway` (admin) | indexer (stored only) |
 | `released` | `line: u64` | `(asset: Address, units: i128)` | `release` (borrower) | indexer; **ledger reconciler** (`-units`) |
 | `liquidated` | `line: u64` | `(asset: Address, units: i128, to: Address)` | `liquidate` (keeper) | indexer; **ledger reconciler** (`-units`); off-chain custodian/issuer delivery in lien modes (see the crate README) |
 
@@ -174,12 +176,12 @@ Field notes:
 - `configure_asset` itself publishes nothing (issue #835). The timelocked path from #214
   (`queue_configure_asset` / `execute_configure_asset` / `cancel_configure_asset`) publishes
   `cfg_q`, `cfg_exec` and `cfg_canc`; `AssetConfig` is ExitDesk's own struct
-  `{ price_guard, spread_bps, per_holder_daily_cap, desk_inventory_cap }`.
+  `{ price_guard, spread_bps, per_holder_daily_cap, desk_daily_cap, desk_inventory_cap }`.
 
 ### Same topic name, different shape
 
 The indexer keys on the first topic only. Both `disable`/`enable` and `paused` exist in RepoDvp
-and ExitDesk, and `asset_configured` exists in CreditLine (and is proposed for PledgeVault). The
+and ExitDesk, and `asset_configured` exists in both CreditLine and PledgeVault with different payloads. The
 two `paused` events have **different shapes**:
 
 | Contract | Topic arguments | Payload |
@@ -214,18 +216,12 @@ contract.
 | CreditLine | `line_opened` | `line: u64` | `(lender: Address, borrower: Address, asset: Address, limit: i128, rate_bps: u32, cure_s: u64)` | `open` | #138 |
 | CreditLine | `line_funded` | `line: u64` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` | #137 |
 | CreditLine | not named yet | `line: u64` | not specified | `reduce_limit` (new) | #813 |
-| PledgeVault | `asset_configured` | per issue (see note) | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` | #178 |
-| PledgeVault | `gateway_set` | none | `gateway: Address` (expected, by analogy with `vault_set`) | `set_gateway` | #178 |
 | RepoDvp | `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | #206 |
 | RepoDvp | `usdc`, `curegrace`, `cfgasset` | not specified | new values (old values where cheap) | `set_usdc`, `set_cure_grace`, `configure_asset` | #207 |
 | RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |
 | RepoDvp | `cured` (**breaking**: `0i128` becomes a tuple) | `id: u64` | `(exposure: i128, ltv_bps: u32, price: i128)` | `call_margin` | #840 |
-| ExitDesk | `cfgasset` | `asset: Address` | `(price_guard: Address, spread_bps: u32, per_holder_daily_cap: i128, desk_inventory_cap: i128)` | `configure_asset` | #835 |
+| ExitDesk | `cfgasset` | `asset: Address` | `(price_guard: Address, spread_bps: u32, per_holder_daily_cap: i128, desk_daily_cap: i128, desk_inventory_cap: i128)` | `configure_asset` | #835 |
 | ExitDesk | `exit` (**breaking**: bare value becomes a tuple) | `holder: Address, asset: Address` | `(units: i128, usdc_out: i128, price: i128, to: Address)` | `exit`, `exit_before` | #831 |
-
-Note on #178: the issue text keys `asset_configured` by `line`, but `configure_asset` takes no line.
-`CreditLine`'s `asset_configured` uses `asset: Address` as the key, and the vault event should
-probably do the same.
 
 The **breaking** rows change an existing payload, so they need the coordinated consumer change
 described above.
