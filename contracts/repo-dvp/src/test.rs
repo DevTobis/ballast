@@ -193,6 +193,8 @@ fn setup() -> Harness {
             margin_call_bps: 8_000,
             liquidation_bps: 9_500,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
     MockPriceGuardClient::new(&env, &price_guard).set_price(
         &rwa,
@@ -242,6 +244,54 @@ fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_
         &maturity_at,
         &hash(h, 7),
     )
+}
+
+#[test]
+fn propose_emits_propose_event() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{IntoVal, TryFromVal};
+
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    let id = RepoDvpClient::new(&h.env, &h.repo).propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &h.rwa,
+        &units,
+        &cash_amount,
+        &500u32,
+        &RepoKind::Intraday,
+        &maturity,
+        &hash(&h, 7),
+    );
+
+    let events = h.env.events().all();
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected event from repo-dvp");
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("propose"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let expected_data: (Address, Address, Address, i128, i128, u64) = (
+        h.cash_lender.clone(),
+        h.cash_borrower.clone(),
+        h.rwa.clone(),
+        units,
+        cash_amount,
+        maturity,
+    );
+    let data_val: soroban_sdk::Val = expected_data.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+        .expect("failed to convert expected data to ScVal");
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "data mismatch");
+        }
+    }
 }
 
 // --- #216: a repo's term has to fit its kind, and its rate has a ceiling -------------------
@@ -850,6 +900,119 @@ fn default_before_the_cure_window_ends_is_refused() {
 }
 
 #[test]
+fn unwind_clears_pending_margin_call_and_cure_deadline() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    repo.call_margin(&h.keeper, &id);
+    let trade = repo.trade(&id);
+    assert!(trade.pending_margin_call);
+    assert!(trade.margin_call_amount > 0);
+    assert!(trade.cure_deadline.is_some());
+
+    // Advance to maturity and source repayment cash
+    let maturity = trade.maturity_at;
+    let settled_at = trade.settled_at.unwrap();
+    let due = total_due(&trade, settled_at);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &due);
+    h.env.ledger().set_timestamp(maturity);
+
+    repo.unwind(&h.cash_borrower, &id);
+
+    let unwound = repo.trade(&id);
+    assert_eq!(unwound.status, RepoStatus::Unwound);
+    assert!(!unwound.pending_margin_call, "pending_margin_call must be false");
+    assert_eq!(unwound.margin_call_amount, 0, "margin_call_amount must be 0");
+    assert_eq!(unwound.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
+fn default_close_clears_pending_margin_call_and_cure_deadline() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    repo.call_margin(&h.keeper, &id);
+    let trade = repo.trade(&id);
+    assert!(trade.pending_margin_call);
+    assert!(trade.margin_call_amount > 0);
+    let deadline = trade.cure_deadline.expect("cure deadline should be set");
+
+    h.env.ledger().set_timestamp(deadline);
+    repo.default_close(&h.keeper, &id);
+
+    let defaulted = repo.trade(&id);
+    assert_eq!(defaulted.status, RepoStatus::Defaulted);
+    assert!(!defaulted.pending_margin_call, "pending_margin_call must be false");
+    assert_eq!(defaulted.margin_call_amount, 0, "margin_call_amount must be 0");
+    assert_eq!(defaulted.cure_deadline, None, "cure_deadline must be None");
+}
+
+#[test]
+fn exact_margin_call_amount_computed_on_margin_call() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{symbol_short, IntoVal, TryFromVal};
+
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+    // Initial state: 100 units, 90 cash, 5% haircut, price $1, 0 elapsed interest.
+    // target = 90e7 * 10_000 / 8_000 = 112.5e7
+    // collateral = 100e7 * 1.0 * 0.95 = 95e7
+    // expected margin_call_amount = 112.5e7 - 95e7 = 17.5e7 = 175_000_000
+    repo.call_margin(&h.keeper, &id);
+
+    let events = h.env.events().all();
+    let trade = repo.trade(&id);
+    assert_eq!(trade.margin_call_amount, 175_000_000);
+
+    // Assert mcall event matches margin_call_amount
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected mcall event");
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("mcall"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let data_val: soroban_sdk::Val = 175_000_000i128.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val).unwrap();
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.clone().into(), "mcall topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "mcall data mismatch");
+        }
+    }
+
+    // Variant at a lower price: price drops to $0.80 (8_000_000 stroops).
+    // collateral = 100e7 * 0.8 * 0.95 = 76e7 = 760_000_000
+    // target = 112.5e7 = 1_125_000_000
+    // expected margin_call_amount = 1_125_000_000 - 760_000_000 = 365_000_000
+    set_price(&h, 8_000_000);
+    repo.call_margin(&h.keeper, &id);
+
+    let events2 = h.env.events().all();
+    let trade2 = repo.trade(&id);
+    assert_eq!(trade2.margin_call_amount, 365_000_000);
+
+    let repo_events2 = events2.filter_by_contract(&h.repo);
+    let last2 = repo_events2.events().last().expect("expected updated mcall event");
+    let data_val2: soroban_sdk::Val = 365_000_000i128.into_val(&h.env);
+    let expected_data_xdr2 = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val2).unwrap();
+
+    match &last2.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(
+                body.topics,
+                expected_topics_xdr.into(),
+                "updated mcall topic mismatch"
+            );
+            assert_eq!(body.data, expected_data_xdr2, "updated mcall data mismatch");
+        }
+    }
+}
+
+#[test]
 fn margin_view_reports_the_position_without_changing_it() {
     let h = setup();
     let id = settled_under_margin(&h);
@@ -865,6 +1028,41 @@ fn margin_view_reports_the_position_without_changing_it() {
         &h.rwa, &PRICE_SCALE, &PriceStatus::Degraded, &h.env.ledger().timestamp(),
     );
     assert!(!repo.margin_view(&id).price_ok);
+}
+
+#[test]
+fn margin_exposure_stops_accruing_after_maturity_matching_unwind_total_due() {
+    let h = setup();
+    let id = settled_under_margin(&h);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let trade = repo.trade(&id);
+    let settled_at = trade.settled_at.unwrap();
+    let maturity_at = trade.maturity_at;
+
+    // Advance to maturity: exposure must equal total_due at maturity
+    h.env.ledger().set_timestamp(maturity_at);
+    let view_at_maturity = repo.margin_view(&id);
+    let expected_due = total_due(&trade, settled_at);
+    assert_eq!(view_at_maturity.exposure, expected_due);
+
+    // Advance 7 days past maturity: exposure must not grow further and still match expected_due
+    h.env.ledger().set_timestamp(maturity_at + 7 * 86_400);
+    let view_post_maturity = repo.margin_view(&id);
+    assert_eq!(view_post_maturity.exposure, expected_due);
+
+    // Call margin past maturity: verify margin_call_amount is sized from expected_due
+    repo.call_margin(&h.keeper, &id);
+    let trade_called = repo.trade(&id);
+    assert!(trade_called.pending_margin_call);
+
+    // Advance past cure deadline and default_close: lender units are sized using exposure which equals expected_due
+    let deadline = trade_called.cure_deadline.unwrap();
+    h.env.ledger().set_timestamp(deadline + 10);
+    repo.default_close(&h.keeper, &id);
+
+    // At $1.00 price, lender_units = ceil(exposure / price) = expected_due
+    let lender_units = rwa_balance(&h, &h.cash_lender);
+    assert_eq!(lender_units, expected_due);
 }
 
 #[test]
@@ -1148,13 +1346,16 @@ fn configure_asset_accepts_valid_thresholds() {
             margin_call_bps: 8_000,
             liquidation_bps: 9_000,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
 
-    // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
-    let new_asset_2 = Address::generate(&h.env);
+    // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling. A fresh
+    // asset, because raising an existing asset's thresholds is a loosening change (#215).
+    let other_asset = Address::generate(&h.env);
     repo.configure_asset(
         &h.admin,
-        &new_asset_2,
+        &other_asset,
         &h.price_guard,
         &500u32,
         &MarginThresholds {
@@ -1162,6 +1363,8 @@ fn configure_asset_accepts_valid_thresholds() {
             margin_call_bps: 9_999,
             liquidation_bps: 10_000,
         },
+        &1_000_000_000_000i128,
+        &(30 * 24 * 3_600u64),
     );
 }
 
@@ -1183,6 +1386,8 @@ fn configure_asset_rejects_equal_thresholds() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res1.is_err(), "warning == margin_call must be rejected");
@@ -1199,6 +1404,8 @@ fn configure_asset_rejects_equal_thresholds() {
                 margin_call_bps: 9_000,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "margin_call == liquidation must be rejected");
@@ -1221,6 +1428,8 @@ fn configure_asset_rejects_zero_thresholds() {
                 margin_call_bps: 0,
                 liquidation_bps: 0,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res.is_err(), "zero thresholds must be rejected");
@@ -1237,6 +1446,8 @@ fn configure_asset_rejects_zero_thresholds() {
                 margin_call_bps: 0,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "zero margin_call_bps must be rejected");
@@ -1260,6 +1471,8 @@ fn configure_asset_rejects_out_of_order_thresholds() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_500,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res1.is_err(), "warning > margin_call must be rejected");
@@ -1276,6 +1489,8 @@ fn configure_asset_rejects_out_of_order_thresholds() {
                 margin_call_bps: 9_500,
                 liquidation_bps: 9_000,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res2.is_err(), "margin_call > liquidation must be rejected");
@@ -1298,216 +1513,162 @@ fn configure_asset_rejects_liquidation_exceeding_10000() {
                 margin_call_bps: 8_000,
                 liquidation_bps: 10_001,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
     assert!(res.is_err(), "liquidation > 10000 must be rejected");
 }
 
 #[test]
-fn first_time_configure_asset_is_immediate() {
+fn configure_asset_validates_positive_limits() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
     let new_asset = Address::generate(&h.env);
+    let thresholds = MarginThresholds {
+        warning_bps: 7_000,
+        margin_call_bps: 8_000,
+        liquidation_bps: 9_000,
+    };
 
-    repo.configure_asset(
-        &h.admin,
-        &new_asset,
-        &h.price_guard,
-        &600u32,
-        &MarginThresholds {
-            warning_bps: 6_000,
-            margin_call_bps: 7_000,
-            liquidation_bps: 8_000,
-        },
-    );
-
-    let config = repo.asset_config(&new_asset);
-    assert_eq!(config.haircut_bps, 600);
-    assert_eq!(config.price_guard, h.price_guard);
-    assert_eq!(config.thresholds.warning_bps, 6_000);
-    assert_eq!(config.thresholds.margin_call_bps, 7_000);
-    assert_eq!(config.thresholds.liquidation_bps, 8_000);
-}
-
-#[test]
-fn loosening_asset_config_requires_timelock() {
-    let h = setup();
-    let repo = RepoDvpClient::new(&h.env, &h.repo);
-
-    // Initial setup has haircut 500, warning 7000, margin_call 8000, liquidation 9000
-
-    // 1. Lowering haircut is loosening -> panics
+    // max_cash_per_trade == 0
     let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
         repo.configure_asset(
             &h.admin,
-            &h.rwa,
+            &new_asset,
             &h.price_guard,
-            &400u32, // lower haircut
-            &MarginThresholds {
-                warning_bps: 7_000,
-                margin_call_bps: 8_000,
-                liquidation_bps: 9_000,
-            },
+            &500u32,
+            &thresholds,
+            &0i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
-    assert!(res1.is_err(), "lowering haircut directly must panic");
+    assert!(res1.is_err(), "zero max_cash_per_trade must be rejected");
 
-    // 2. Raising threshold is loosening -> panics
+    // max_cash_per_trade < 0
     let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
         repo.configure_asset(
             &h.admin,
-            &h.rwa,
+            &new_asset,
             &h.price_guard,
             &500u32,
-            &MarginThresholds {
-                warning_bps: 7_500, // raised warning threshold
-                margin_call_bps: 8_000,
-                liquidation_bps: 9_000,
-            },
+            &thresholds,
+            &-100i128,
+            &(30 * 24 * 3_600u64),
         );
     }));
-    assert!(res2.is_err(), "raising threshold directly must panic");
+    assert!(res2.is_err(), "negative max_cash_per_trade must be rejected");
 
-    // 3. Changing price guard is loosening -> panics
-    let new_guard = Address::generate(&h.env);
+    // max_term_seconds == 0
     let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
         repo.configure_asset(
             &h.admin,
-            &h.rwa,
-            &new_guard,
+            &new_asset,
+            &h.price_guard,
             &500u32,
-            &MarginThresholds {
-                warning_bps: 7_000,
-                margin_call_bps: 8_000,
-                liquidation_bps: 9_000,
-            },
+            &thresholds,
+            &1_000_000_000_000i128,
+            &0u64,
         );
     }));
-    assert!(res3.is_err(), "changing price guard directly must panic");
+    assert!(res3.is_err(), "zero max_term_seconds must be rejected");
 }
 
 #[test]
-fn queue_and_execute_asset_config_with_timelock() {
+fn propose_and_settle_enforces_per_asset_risk_limits() {
     let h = setup();
     let repo = RepoDvpClient::new(&h.env, &h.repo);
+    let capped_asset = h.rwa.clone();
 
-    let looser_thresholds = MarginThresholds {
-        warning_bps: 7_500,
-        margin_call_bps: 8_500,
-        liquidation_bps: 9_500,
-    };
+    // Max cash 50 USDC, max term 2 hours (7200 seconds)
+    let max_cash = 50 * PRICE_SCALE;
+    let max_term = 7_200u64;
 
-    let id = repo.queue_asset_config(
+    repo.configure_asset(
         &h.admin,
-        &h.rwa,
+        &capped_asset,
         &h.price_guard,
-        &400u32,
-        &looser_thresholds,
-    );
-
-    // Pending config readable
-    let pending = repo.pending_asset_config(&id).expect("pending config must exist");
-    assert_eq!(pending.asset, h.rwa);
-    assert_eq!(pending.haircut_bps, 400);
-
-    // Cannot execute before 48h
-    let early_res = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.execute_asset_config(&id);
-    }));
-    assert!(early_res.is_err(), "executing before timelock must fail");
-
-    // Advance ledger timestamp by 48h
-    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
-
-    // Execute succeeds
-    repo.execute_asset_config(&id);
-
-    let config = repo.asset_config(&h.rwa);
-    assert_eq!(config.haircut_bps, 400);
-    assert_eq!(config.thresholds.warning_bps, 7_500);
-    assert_eq!(config.thresholds.margin_call_bps, 8_500);
-    assert_eq!(config.thresholds.liquidation_bps, 9_500);
-
-    // Second execution panics
-    let duplicate_res = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.execute_asset_config(&id);
-    }));
-    assert!(duplicate_res.is_err(), "second execute must fail");
-}
-
-#[test]
-fn cancel_asset_config() {
-    let h = setup();
-    let repo = RepoDvpClient::new(&h.env, &h.repo);
-
-    let id = repo.queue_asset_config(
-        &h.admin,
-        &h.rwa,
-        &h.price_guard,
-        &400u32,
+        &500u32,
         &MarginThresholds {
-            warning_bps: 7_500,
-            margin_call_bps: 8_500,
-            liquidation_bps: 9_500,
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
         },
+        &max_cash,
+        &max_term,
     );
 
-    // Stranger cannot cancel
-    let stranger = Address::generate(&h.env);
-    let stranger_res = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.cancel_asset_config(&stranger, &id);
-    }));
-    assert!(stranger_res.is_err(), "stranger cannot cancel");
+    let units = 100 * PRICE_SCALE;
+    let valid_maturity = h.env.ledger().timestamp() + 3_600; // 1h (within 2h)
 
-    // Admin cancels
-    repo.cancel_asset_config(&h.admin, &id);
-    assert!(repo.pending_asset_config(&id).is_none());
-
-    // Execute panics after timelock
-    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
-    let exec_res = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.execute_asset_config(&id);
-    }));
-    assert!(exec_res.is_err(), "executing cancelled config must fail");
-}
-
-#[test]
-fn tighten_asset_config_immediate_risk_path() {
-    let h = setup();
-    let repo = RepoDvpClient::new(&h.env, &h.repo);
-
-    let tighter_thresholds = MarginThresholds {
-        warning_bps: 6_000,
-        margin_call_bps: 7_000,
-        liquidation_bps: 8_000,
-    };
-
-    // Risk role tightens immediately (higher haircut: 600 vs 500, tighter thresholds)
-    repo.tighten_asset_config(&h.risk, &h.rwa, &600u32, &tighter_thresholds);
-
-    let config = repo.asset_config(&h.rwa);
-    assert_eq!(config.haircut_bps, 600);
-    assert_eq!(config.thresholds.warning_bps, 6_000);
-    assert_eq!(config.thresholds.margin_call_bps, 7_000);
-    assert_eq!(config.thresholds.liquidation_bps, 8_000);
-
-    // Risk role cannot loosen on tightening path
-    let loosen_res = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.tighten_asset_config(
-            &h.risk,
-            &h.rwa,
-            &500u32, // lowering haircut
-            &tighter_thresholds,
+    // 1. Propose exceeds max_cash_per_trade (51 cash > 50 max_cash) -> rejected
+    let res1 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &capped_asset,
+            &units,
+            &(max_cash + 1),
+            &500u32,
+            &RepoKind::Intraday,
+            &valid_maturity,
+            &hash(&h, 7),
         );
     }));
-    assert!(loosen_res.is_err(), "tighten path rejects loosening haircut");
+    assert!(res1.is_err(), "propose exceeding max_cash must be rejected");
 
-    // Non-risk caller is rejected
-    let stranger = Address::generate(&h.env);
-    let stranger_res = panic::catch_unwind(AssertUnwindSafe(|| {
-        repo.tighten_asset_config(&stranger, &h.rwa, &700u32, &tighter_thresholds);
+    // 2. Propose exceeds max_term_seconds (7201 seconds > 7200 max_term) -> rejected
+    let over_term_maturity = h.env.ledger().timestamp() + max_term + 1;
+    let res2 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.propose(
+            &h.cash_lender,
+            &h.cash_borrower,
+            &capped_asset,
+            &units,
+            &max_cash,
+            &500u32,
+            &RepoKind::Intraday,
+            &over_term_maturity,
+            &hash(&h, 7),
+        );
     }));
-    assert!(stranger_res.is_err(), "stranger cannot call tighten_asset_config");
+    assert!(res2.is_err(), "propose exceeding max_term must be rejected");
+
+    // 3. Propose within limits -> succeeds
+    let id = repo.propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &capped_asset,
+        &units,
+        &max_cash,
+        &500u32,
+        &RepoKind::Intraday,
+        &valid_maturity,
+        &hash(&h, 7),
+    );
+    assert_eq!(repo.trade(&id).status, RepoStatus::Proposed);
+
+    // 4. If limits are lowered after proposal, accept_and_settle rejects oversized trade
+    repo.configure_asset(
+        &h.admin,
+        &capped_asset,
+        &h.price_guard,
+        &500u32,
+        &MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        },
+        &(max_cash - 10 * PRICE_SCALE), // limit lowered to 40
+        &max_term,
+    );
+    MockTokenClient::new(&h.env, &capped_asset).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &max_cash);
+
+    let res3 = panic::catch_unwind(AssertUnwindSafe(|| {
+        repo.accept_and_settle(&h.cash_borrower, &id);
+    }));
+    assert!(res3.is_err(), "settle exceeding lowered max_cash must be rejected");
 }
 
 #[test]
@@ -1649,6 +1810,8 @@ mod sac {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_500,
             },
+            &1_000_000_000_000i128,
+            &(30 * 24 * 3_600u64),
         );
         MockPriceGuardClient::new(&env, &price_guard).set_price(
             &rwa,
@@ -2419,9 +2582,16 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.set_usdc(&h.admin, &h.usdc));
         extends_the_instance(&h, |repo| repo.set_cure_grace(&h.admin, &3_600));
         extends_the_instance(&h, |repo| repo.set_maturity_grace(&h.admin, &3_600));
-        let new_asset = Address::generate(&h.env);
         extends_the_instance(&h, |repo| {
-            repo.configure_asset(&h.admin, &new_asset, &h.price_guard, &500, &thresholds)
+            repo.configure_asset(
+                &h.admin,
+                &h.rwa,
+                &h.price_guard,
+                &500,
+                &thresholds,
+                &1_000_000_000_000i128,
+                &(30 * 24 * 3_600u64),
+            )
         });
         extends_the_instance(&h, |repo| repo.disable_asset(&h.admin, &h.rwa));
         extends_the_instance(&h, |repo| repo.enable_asset(&h.admin, &h.rwa));
@@ -2502,5 +2672,502 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.call_margin(&h.keeper, &id));
         let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
         assert!(!trade.pending_margin_call);
+    }
+
+    #[test]
+    fn admin_entry_points_emit_events() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+        // 1. set_usdc emits (usdc,) event
+        let alt_usdc = Address::generate(&h.env);
+        repo.set_usdc(&h.admin, &alt_usdc);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("usdc"));
+            let data: (Option<Address>, Address) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, Some(h.usdc.clone()));
+            assert_eq!(data.1, alt_usdc);
+        }
+
+        // 2. set_cure_grace emits (curegrace,) event
+        let new_grace = 3_600u64;
+        repo.set_cure_grace(&h.admin, &new_grace);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("curegrace"));
+            let data: (u64, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, MARGIN_CURE_GRACE_SECONDS);
+            assert_eq!(data.1, new_grace);
+        }
+
+        // 3. configure_asset emits (cfgasset, asset) event
+        let new_asset = Address::generate(&h.env);
+        let new_guard = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 6_000,
+            margin_call_bps: 7_500,
+            liquidation_bps: 9_000,
+        };
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &new_guard,
+            &400,
+            &thresholds,
+            &(1_000 * PRICE_SCALE),
+            &(30 * 24 * 60 * 60),
+        );
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            let topic1 = Address::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("cfgasset"));
+            assert_eq!(topic1, new_asset);
+            let data: (Address, u32, MarginThresholds, i128, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, new_guard);
+            assert_eq!(data.1, 400);
+            assert_eq!(data.2.warning_bps, thresholds.warning_bps);
+            assert_eq!(data.2.margin_call_bps, thresholds.margin_call_bps);
+            assert_eq!(data.2.liquidation_bps, thresholds.liquidation_bps);
+            assert_eq!(data.3, 1_000 * PRICE_SCALE);
+            assert_eq!(data.4, 30 * 24 * 60 * 60);
+        }
+
+        // 4. set_maturity_grace emits (matgrace,) event with (old, new)
+        repo.set_maturity_grace(&h.admin, &7_200);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("matgrace"));
+            let data: (u64, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, DEFAULT_MATURITY_GRACE_SECONDS);
+            assert_eq!(data.1, 7_200);
+        }
+    }
+}
+
+/// Contract event assertions serving as the formal contract between RepoDvp and off-chain
+/// consumers (services/indexer and services/ledger) as specified in AUDIT_NOTES.md.
+///
+/// Event schemas emitted by `RepoDvp`:
+/// - `unwind`: `topics: [Symbol("unwind"), u64(trade_id)]`, `data: i128(total_due)`
+///   Emitted when a repo is successfully unwound by repaying cash leg 2.
+/// - `mcall`: `topics: [Symbol("mcall"), u64(trade_id)]`, `data: i128(margin_call_amount)`
+///   Emitted when a margin call is opened or updated on an undercollateralized repo.
+/// - `cured`: `topics: [Symbol("cured"), u64(trade_id)]`, `data: i128(0)`
+///   Emitted when a previously pending margin call is cleared due to collateral price recovery.
+/// - `topup`: `topics: [Symbol("topup"), u64(trade_id)]`, `data: (i128(extra_units), bool(cured))`
+///   Emitted when a borrower deposits additional collateral units into escrow, indicating whether
+///   the position was cured in the same transaction.
+/// - `default`: `topics: [Symbol("default"), u64(trade_id)]`, `data: (i128(lender_units), i128(borrower_units))`
+///   Emitted when an expired margin call is defaulted via `default_close`, transferring collateral
+///   to the lender up to exposure and returning surplus to the borrower.
+/// - `mat_def`: `topics: [Symbol("mat_def"), u64(trade_id)]`, `data: (i128(lender_units), i128(borrower_units))`
+///   Emitted when an un-repaid trade is defaulted past maturity grace via `default_at_maturity`.
+mod indexer_events {
+    use super::*;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal, TryFromVal, Val, Vec};
+
+    fn settled_trade(h: &Harness, term_seconds: u64) -> u64 {
+        let units = 100 * PRICE_SCALE;
+        let cash_amount = 50 * PRICE_SCALE;
+        let maturity = h.env.ledger().timestamp() + term_seconds;
+        let id = propose(h, units, cash_amount, 500, maturity);
+        MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+        RepoDvpClient::new(&h.env, &h.repo).accept_and_settle(&h.cash_borrower, &id);
+        id
+    }
+
+    fn assert_event<D: IntoVal<Env, Val>>(
+        h: &Harness,
+        events: &soroban_sdk::testutils::ContractEvents,
+        expected_topic0: Symbol,
+        expected_id: u64,
+        expected_data: D,
+    ) {
+        let filtered = events.filter_by_contract(&h.repo);
+        let last = filtered
+            .events()
+            .last()
+            .expect("expected an event emitted by repo-dvp");
+        let expected_topics: Vec<Val> = (expected_topic0, expected_id).into_val(&h.env);
+        let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+        let data_val: Val = expected_data.into_val(&h.env);
+        let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+            .expect("failed to convert expected data to ScVal");
+        match &last.body {
+            soroban_sdk::xdr::ContractEventBody::V0(body) => {
+                assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+                assert_eq!(body.data, expected_data_xdr, "data mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn unwind_emits_unwind_event_with_total_due() {
+        let h = setup();
+        let id = settled_trade(&h, 3_600);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let settled_at = trade.settled_at.unwrap();
+        h.env.ledger().set_timestamp(settled_at + 3_600);
+
+        let expected_total_due = total_due(&trade, settled_at);
+        MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_borrower, &expected_total_due);
+        RepoDvpClient::new(&h.env, &h.repo).unwind(&h.cash_borrower, &id);
+        let events = h.env.events().all();
+
+        assert_event(&h, &events, symbol_short!("unwind"), id, expected_total_due);
+    }
+
+    #[test]
+    fn call_margin_emits_mcall_event_with_margin_call_amount() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let trade = repo.trade(&id);
+        assert!(trade.pending_margin_call);
+        assert!(trade.margin_call_amount > 0);
+
+        assert_event(&h, &events, symbol_short!("mcall"), id, trade.margin_call_amount);
+    }
+
+    #[test]
+    fn call_margin_emits_cured_event_when_price_recovers() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Price doubles, restoring healthy LTV
+        set_price(&h, 2 * PRICE_SCALE);
+        repo.call_margin(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let trade = repo.trade(&id);
+        assert!(!trade.pending_margin_call);
+
+        assert_event(&h, &events, symbol_short!("cured"), id, 0i128);
+    }
+
+    #[test]
+    fn top_up_emits_topup_event_with_units_and_cured_flag() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Top up insufficient to cure (1 unit: still under margin call)
+        let small_extra = 1 * PRICE_SCALE;
+        repo.top_up(&h.cash_borrower, &id, &small_extra);
+        let events1 = h.env.events().all();
+        assert_event(&h, &events1, symbol_short!("topup"), id, (small_extra, false));
+        assert!(repo.trade(&id).pending_margin_call);
+
+        // Top up sufficient to cure (100 units: doubles collateral, cures call)
+        let cure_extra = 100 * PRICE_SCALE;
+        repo.top_up(&h.cash_borrower, &id, &cure_extra);
+        let events2 = h.env.events().all();
+        assert_event(&h, &events2, symbol_short!("topup"), id, (cure_extra, true));
+        assert!(!repo.trade(&id).pending_margin_call);
+    }
+
+    #[test]
+    fn default_close_emits_default_event_with_unit_distribution() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let borrower_before = rwa_balance(&h, &h.cash_borrower);
+
+        repo.call_margin(&h.keeper, &id);
+        let deadline = repo.trade(&id).cure_deadline.expect("cure deadline set");
+        h.env.ledger().set_timestamp(deadline);
+
+        repo.default_close(&h.keeper, &id);
+        let events = h.env.events().all();
+
+        let lender_units = rwa_balance(&h, &h.cash_lender);
+        let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
+        assert!(lender_units > 0);
+        assert_eq!(repo.trade(&id).status, RepoStatus::Defaulted);
+
+        assert_event(&h, &events, symbol_short!("default"), id, (lender_units, borrower_units));
+    }
+
+    #[test]
+    fn default_at_maturity_emits_mat_def_event_with_unit_distribution() {
+        let h = setup();
+        let id = settled_trade(&h, 3_600);
+        let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
+        let maturity = trade.maturity_at;
+        let grace = RepoDvpClient::new(&h.env, &h.repo).maturity_grace_seconds();
+        h.env.ledger().set_timestamp(maturity + grace);
+
+        let borrower_before = rwa_balance(&h, &h.cash_borrower);
+        RepoDvpClient::new(&h.env, &h.repo).default_at_maturity(&h.cash_lender, &id);
+        let events = h.env.events().all();
+
+        let lender_units = rwa_balance(&h, &h.cash_lender);
+        let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
+
+        assert_event(&h, &events, symbol_short!("mat_def"), id, (lender_units, borrower_units));
+    }
+}
+
+// --- #215: loosening an asset config is timelocked; tightening is immediate -----------------
+
+mod config_timelock {
+    use super::*;
+
+    const MAX_CASH: i128 = 1_000_000_000_000;
+    const MAX_TERM: u64 = 30 * 24 * 3_600;
+
+    fn bands(w: u32, m: u32, l: u32) -> MarginThresholds {
+        MarginThresholds {
+            warning_bps: w,
+            margin_call_bps: m,
+            liquidation_bps: l,
+        }
+    }
+
+    fn reconfigure(h: &Harness, guard: &Address, haircut: u32, t: MarginThresholds, cash: i128, term: u64) {
+        RepoDvpClient::new(&h.env, &h.repo).configure_asset(
+            &h.admin, &h.rwa, guard, &haircut, &t, &cash, &term,
+        );
+    }
+
+    fn queue(h: &Harness, guard: &Address, haircut: u32, t: MarginThresholds, cash: i128, term: u64) -> u64 {
+        RepoDvpClient::new(&h.env, &h.repo).queue_asset_config(
+            &h.admin, &h.rwa, guard, &haircut, &t, &cash, &term,
+        )
+    }
+
+    fn advance(h: &Harness, seconds: u64) {
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + seconds);
+    }
+
+    #[test]
+    fn first_listing_and_tightening_apply_immediately() {
+        let h = setup();
+        // setup() listed the asset at 5% / 7000-8000-9500. A higher haircut, lower bands and lower
+        // caps all tighten, so they apply at once.
+        reconfigure(&h, &h.price_guard, 800, bands(6_000, 7_000, 9_000), MAX_CASH / 2, MAX_TERM / 2);
+        let cfg = RepoDvpClient::new(&h.env, &h.repo).asset_config(&h.rwa);
+        assert_eq!(cfg.haircut_bps, 800);
+        assert_eq!(cfg.thresholds.liquidation_bps, 9_000);
+        assert_eq!(cfg.max_cash_per_trade, MAX_CASH / 2);
+        // Re-running with identical values (as configure-desks.sh does) is accepted.
+        reconfigure(&h, &h.price_guard, 800, bands(6_000, 7_000, 9_000), MAX_CASH / 2, MAX_TERM / 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_new_price_guard_is_refused() {
+        let h = setup();
+        let other = Address::generate(&h.env);
+        reconfigure(&h, &other, 500, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_lower_haircut_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 400, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_higher_threshold_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 500, bands(7_000, 8_500, 9_500), MAX_CASH, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_higher_cash_cap_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 500, bands(7_000, 8_000, 9_500), MAX_CASH + 1, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_longer_term_cap_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 500, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM + 1);
+    }
+
+    #[test]
+    fn a_queued_loosening_applies_only_after_48h() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let new_guard = env_guard(&h);
+        let id = queue(&h, &new_guard, 300, bands(7_500, 8_500, 9_600), MAX_CASH * 2, MAX_TERM);
+        let pending = repo.pending_asset_config(&id).expect("queued");
+        assert_eq!(pending.executes_at, h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
+
+        advance(&h, timelock::TIMELOCK_DELAY_SECONDS - 1);
+        assert!(repo.try_execute_asset_config(&id).is_err(), "too early");
+        assert_eq!(repo.asset_config(&h.rwa).price_guard, h.price_guard);
+
+        advance(&h, 1);
+        repo.execute_asset_config(&id);
+        let cfg = repo.asset_config(&h.rwa);
+        assert_eq!(cfg.price_guard, new_guard);
+        assert_eq!(cfg.haircut_bps, 300);
+        assert_eq!(cfg.thresholds.margin_call_bps, 8_500);
+        assert_eq!(cfg.max_cash_per_trade, MAX_CASH * 2);
+        assert!(repo.pending_asset_config(&id).is_none());
+        assert!(repo.try_execute_asset_config(&id).is_err(), "single use");
+    }
+
+    fn env_guard(h: &Harness) -> Address {
+        Address::generate(&h.env)
+    }
+
+    #[test]
+    fn a_cancelled_change_never_applies() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let id = queue(&h, &h.price_guard, 300, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+        repo.cancel_asset_config(&h.admin, &id);
+        advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+        assert!(repo.try_execute_asset_config(&id).is_err());
+        assert_eq!(repo.asset_config(&h.rwa).haircut_bps, 500);
+    }
+
+    #[test]
+    fn queue_validates_and_needs_an_existing_asset() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let bad = repo.try_queue_asset_config(
+            &h.admin, &h.rwa, &h.price_guard, &500, &bands(8_000, 8_000, 9_000), &MAX_CASH, &MAX_TERM,
+        );
+        assert!(bad.is_err(), "unordered thresholds refused at queue time");
+        let unknown = Address::generate(&h.env);
+        let missing = repo.try_queue_asset_config(
+            &h.admin, &unknown, &h.price_guard, &500, &bands(7_000, 8_000, 9_000), &MAX_CASH, &MAX_TERM,
+        );
+        assert!(missing.is_err(), "first listing goes through configure_asset");
+    }
+
+    #[test]
+    fn non_admins_cannot_queue_or_cancel() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let stranger = Address::generate(&h.env);
+        assert!(repo
+            .try_queue_asset_config(
+                &stranger, &h.rwa, &h.price_guard, &300, &bands(7_000, 8_000, 9_500), &MAX_CASH, &MAX_TERM,
+            )
+            .is_err());
+        let id = queue(&h, &h.price_guard, 300, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+        assert!(repo.try_cancel_asset_config(&stranger, &id).is_err());
+    }
+
+    #[test]
+    fn risk_tightens_immediately_and_keeps_guard_and_caps() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.tighten_asset_config(&h.risk, &h.rwa, &900, &bands(6_000, 7_000, 8_000));
+        let cfg = repo.asset_config(&h.rwa);
+        assert_eq!(cfg.haircut_bps, 900);
+        assert_eq!(cfg.thresholds.warning_bps, 6_000);
+        assert_eq!(cfg.price_guard, h.price_guard);
+        assert_eq!(cfg.max_cash_per_trade, MAX_CASH);
+        assert_eq!(cfg.max_term_seconds, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot loosen")]
+    fn risk_cannot_loosen() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).tighten_asset_config(
+            &h.risk,
+            &h.rwa,
+            &400,
+            &bands(7_000, 8_000, 9_500),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "risk argument mismatch")]
+    fn only_the_risk_role_uses_the_fast_path() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).tighten_asset_config(
+            &h.admin,
+            &h.rwa,
+            &900,
+            &bands(6_000, 7_000, 8_000),
+        );
     }
 }
