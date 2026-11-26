@@ -61,6 +61,8 @@ consumer changes and a redeploy, and this file has to be updated in the same PR.
 | `asset_configured` | `asset: Address` | `(price_guard: Address, usdc: Address, haircut_bps: u32, thresholds: MarginThresholds)` | `configure_asset` (admin) | indexer (stored only) |
 | `vault_set` | none (topic is the 1-tuple `(Symbol,)`) | `vault: Address` (bare value, not a tuple) | `set_vault` (admin) | indexer (stored only) |
 | `collateral_synced` | `line: u64` | `(asset: Address, units: i128, source: Symbol)` | `sync_from_vault` (`source = "vault"`), `sync_collateral` (`source = "keeper"` or `"admin"`) | indexer (stored only) |
+| `drawn` | `line: u64` | `(amount: i128, to: Address, drawn_total: i128, ltv_bps: u32)` | `draw` (borrower) | indexer (stored only) |
+| `repaid` | `line: u64` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` (any payer) | indexer (stored only) |
 | `margin_state_changed` | `line: u64` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke`, only when the state changes | indexer (stored only) |
 | `liquidation_started` | `line: u64` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` (keeper) | indexer (stored only) |
 | `line_closed` | `line: u64` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` (lender) | indexer (stored only) |
@@ -79,7 +81,7 @@ Field notes:
 - `line_closed`: `recovered = seized_units * price` with no haircut. Then either `surplus > 0` or
   `shortfall > 0`, or both are zero.
 
-`open`, `fund`, `draw` and `repay` publish no events today (see planned events below).
+`open` and `fund` publish no events today (see planned events below).
 
 ## PledgeVault (`contracts/pledge-vault`)
 
@@ -155,14 +157,18 @@ All topics use `symbol_short!`.
 | `unp_q` | `id: u64` (timelock id) | `(scope: PauseScope, executes_at: u64)` | `queue_unpause` (admin) | Unpause queued behind the 48h timelock |
 | `unp_exec` | `id: u64` | `scope: PauseScope` | `execute_unpause` (anyone) | Scope unpaused |
 | `unp_canc` | `id: u64` | `scope: PauseScope` | `cancel_unpause` (admin) | Queued unpause dropped |
+| `cfg_q` | `id: u64` (timelock id) | `(asset: Address, config: AssetConfig, executes_at: u64)` | `queue_configure_asset` (admin) | A loosening (or any) config change queued behind the 48h timelock |
+| `cfg_exec` | `id: u64` | `(asset: Address, config: AssetConfig)` | `execute_configure_asset` (anyone) | Queued config applied; it fully replaces the asset's config |
+| `cfg_canc` | `id: u64` | `asset: Address` (bare value) | `cancel_configure_asset` (admin) | Queued config dropped |
 
 Field notes:
 
 - `exit` reports neither `units`, the price nor the recipient `to`; only the token transfer events
   in the same transaction carry them (issue #831 proposes adding them).
-- `configure_asset` publishes nothing on `main` (issue #835). PR #1272 (issue #214) adds a
-  timelocked config path with `cfg_q`, `cfg_exec` and `cfg_canc`. Move those rows here when it
-  merges.
+- `configure_asset` itself publishes nothing (issue #835). The timelocked path from #214
+  (`queue_configure_asset` / `execute_configure_asset` / `cancel_configure_asset`) publishes
+  `cfg_q`, `cfg_exec` and `cfg_canc`; `AssetConfig` is ExitDesk's own struct
+  `{ price_guard, spread_bps, per_holder_daily_cap, desk_inventory_cap }`.
 
 ### Same topic name, different shape
 
@@ -201,8 +207,6 @@ contract.
 |---|---|---|---|---|---|
 | CreditLine | `line_opened` | `line: u64` | `(lender: Address, borrower: Address, asset: Address, limit: i128, rate_bps: u32, cure_s: u64)` | `open` | #138 |
 | CreditLine | `line_funded` | `line: u64` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` | #137 |
-| CreditLine | `drawn` | `line: u64` | `(amount: i128, to: Address, drawn_total: i128, ltv_bps: u32)` | `draw` | #136 |
-| CreditLine | `repaid` | `line: u64` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` | #140 |
 | CreditLine | not named yet | `line: u64` | not specified | `reduce_limit` (new) | #813 |
 | PledgeVault | `asset_configured` | per issue (see note) | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` | #178 |
 | PledgeVault | `gateway_set` | none | `gateway: Address` (expected, by analogy with `vault_set`) | `set_gateway` | #178 |

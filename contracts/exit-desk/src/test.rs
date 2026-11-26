@@ -4,6 +4,7 @@
 
 use super::*;
 use ballast_common::price::PriceStatus;
+use soroban_sdk::testutils::storage::{Instance as _, Persistent as _, Temporary as _};
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::Env;
 
@@ -899,3 +900,123 @@ fn read_only_getters_and_capacity_track_state() {
     );
 }
 
+
+// --- Storage lifetime (#208) ---
+
+fn exited_desk() -> (Harness, Address, i128) {
+    let h = setup();
+    configure(&h, 100, 150 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+    let holder = Address::generate(&h.env);
+    let units = 100 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder, &(units * 4));
+    ExitDeskClient::new(&h.env, &h.desk).exit(&holder, &h.rwa, &units, &0, &holder);
+    (h, holder, units)
+}
+
+fn daily_key(h: &Harness, holder: &Address) -> DataKey {
+    DataKey::DailyUsed(
+        holder.clone(),
+        h.rwa.clone(),
+        h.env.ledger().timestamp() / SECONDS_PER_DAY,
+    )
+}
+
+#[test]
+fn exit_extends_the_instance_and_inventory_and_keeps_daily_used_temporary() {
+    let (h, holder, units) = exited_desk();
+    let key = daily_key(&h, &holder);
+    h.env.as_contract(&h.desk, || {
+        let inventory = DataKey::Inventory(h.rwa.clone());
+        assert_eq!(h.env.storage().instance().get_ttl(), ttl::INSTANCE_EXTEND_TO_LEDGERS);
+        assert_eq!(
+            h.env.storage().persistent().get_ttl(&inventory),
+            ttl::PERSISTENT_EXTEND_TO_LEDGERS
+        );
+        assert!(!h.env.storage().persistent().has(&key));
+        assert_eq!(h.env.storage().temporary().get::<_, i128>(&key), Some(units));
+        assert_eq!(h.env.storage().temporary().get_ttl(&key), DAILY_USED_TTL_LEDGERS);
+    });
+}
+
+#[test]
+fn a_second_exit_the_same_day_refreshes_the_daily_used_lifetime() {
+    let (h, holder, units) = exited_desk();
+    h.env.ledger().with_mut(|l| {
+        l.sequence_number += 10_000;
+        l.timestamp += 60;
+    });
+    ExitDeskClient::new(&h.env, &h.desk).exit(&holder, &h.rwa, &(units / 2), &0, &holder);
+    let key = daily_key(&h, &holder);
+    h.env.as_contract(&h.desk, || {
+        assert_eq!(h.env.storage().temporary().get_ttl(&key), DAILY_USED_TTL_LEDGERS);
+    });
+}
+
+#[test]
+fn withdraw_extends_the_inventory_entry() {
+    let (h, _, _) = exited_desk();
+    h.env.ledger().with_mut(|l| l.sequence_number += 505_000);
+    let to = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).withdraw(&h.admin, &h.rwa, &PRICE_SCALE, &to);
+    h.env.as_contract(&h.desk, || {
+        assert_eq!(
+            h.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Inventory(h.rwa.clone())),
+            ttl::PERSISTENT_EXTEND_TO_LEDGERS
+        );
+        assert_eq!(h.env.storage().instance().get_ttl(), ttl::INSTANCE_EXTEND_TO_LEDGERS);
+    });
+}
+
+#[test]
+fn extend_ttl_keeps_an_idle_desk_alive() {
+    let (h, _, _) = exited_desk();
+    h.env.ledger().with_mut(|l| l.sequence_number += 505_000);
+    ExitDeskClient::new(&h.env, &h.desk).extend_ttl(&h.rwa);
+    h.env.as_contract(&h.desk, || {
+        assert_eq!(h.env.storage().instance().get_ttl(), ttl::INSTANCE_EXTEND_TO_LEDGERS);
+        assert_eq!(
+            h.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Inventory(h.rwa.clone())),
+            ttl::PERSISTENT_EXTEND_TO_LEDGERS
+        );
+    });
+}
+
+#[test]
+fn extend_ttl_for_an_asset_with_no_inventory_does_not_create_an_entry() {
+    let h = setup();
+    let other = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).extend_ttl(&other);
+    h.env.as_contract(&h.desk, || {
+        assert!(!h.env.storage().persistent().has(&DataKey::Inventory(other.clone())));
+    });
+}
+
+#[test]
+fn the_daily_cap_resets_at_the_next_utc_day() {
+    let (h, holder, units) = exited_desk();
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    // 100 of the 150 cap used; a further 100 today is refused (covered by
+    // exit_panics_on_per_holder_daily_cap). Move to the first second of the next day.
+    let now = h.env.ledger().timestamp();
+    let next_day = (now / SECONDS_PER_DAY + 1) * SECONDS_PER_DAY;
+    h.env.ledger().with_mut(|l| {
+        l.timestamp = next_day;
+        l.sequence_number += 17_280;
+    });
+    // The price must still be fresh at the new timestamp.
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+
+    assert_eq!(desk.daily_used(&holder, &h.rwa), 0);
+    assert_eq!(desk.capacity(&holder, &h.rwa).0, 150 * PRICE_SCALE);
+    desk.exit(&holder, &h.rwa, &units, &0, &holder);
+    assert_eq!(desk.daily_used(&holder, &h.rwa), units);
+    assert_eq!(desk.inventory(&h.rwa), units * 2);
+}

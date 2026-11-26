@@ -7,7 +7,7 @@ in this skeleton pass.
 
 | Crate | Responsibility |
 |---|---|
-| `common` | Shared roles/timelock/pause/price/risk/margin logic — not itself a deployable contract |
+| `common` | [Shared roles, timelock, pause, price, risk, and margin logic](common/README.md) — not itself a deployable contract |
 | `registry` | [Asset configs, haircut parameters, timelocked param changes](registry/README.md) |
 | `price-guard` | [Median/band/staleness/halt price logic (PRD §6.4)](price-guard/README.md) |
 | `pledge-vault` | [Escrow/lien collateral positions](pledge-vault/README.md) |
