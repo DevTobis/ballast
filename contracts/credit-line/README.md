@@ -78,6 +78,7 @@ and the payload-order compatibility rule.
 | `repaid` | `(Symbol("repaid"), line: u64)` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` |
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
+| `line_closed_repaid` | `(Symbol("line_closed_repaid"), line: u64)` | `caller: Address` | `close` (lender or borrower, fully repaid `Open` line) |
 | `liquidation_started` | `(Symbol("liquidation_started"), line: u64)` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` |
 | `interest_withdrawn` | `(Symbol("interest_withdrawn"), line: u64)` | `(lender: Address, amount: i128, claimable_after: i128)` | `withdraw_interest` |
 | `collateral_synced` | `(Symbol("collateral_synced"), line: u64)` | `(asset: Address, units: i128, source: Symbol)` (`vault` / `keeper` / `admin`) | `sync_from_vault`, `sync_collateral` |

@@ -91,15 +91,15 @@ export async function runSingleJob(name: string, ctx: KeeperContext): Promise<Jo
   const { db, creditLineClient, pledgeVaultClient, repoDvpClient, signer, alerter, network } = ctx;
   switch (name) {
     case "repo-unwind":
-      return runRepoUnwindJob(db, repoDvpClient, signer);
+      return runRepoUnwindJob(db, repoDvpClient, signer, network);
     case "repo-margin":
-      return runRepoMarginJob(db, repoDvpClient, signer);
+      return runRepoMarginJob(db, repoDvpClient, signer, new Date(), network);
     case "cure-expiry":
-      return runCureExpiryJob(db, creditLineClient, pledgeVaultClient, signer);
+      return runCureExpiryJob(db, creditLineClient, pledgeVaultClient, signer, network);
     case "interest-accrual":
-      return runInterestAccrualJob(db, creditLineClient, signer);
+      return runInterestAccrualJob(db, creditLineClient, signer, network);
     case "sync-collateral":
-      return runSyncCollateralJob(db, creditLineClient, pledgeVaultClient, signer);
+      return runSyncCollateralJob(db, creditLineClient, pledgeVaultClient, signer, network);
     case "balance": {
       await checkOperatorBalance(alerter, {
         horizonUrl: network.horizonUrl,
@@ -160,8 +160,8 @@ export async function main(): Promise<void> {
   const SHUTDOWN_GRACE_MS = Number(process.env.KEEPER_SHUTDOWN_GRACE_MS ?? "60000");
 
   const tasks = [
-    cron.schedule(REPO_UNWIND_CRON, () => runJob("repo-unwind", () => runRepoUnwindJob(db, repoDvpClient, signer))),
-    cron.schedule(REPO_MARGIN_CRON, () => runJob("repo-margin", () => runRepoMarginJob(db, repoDvpClient, signer))),
+    cron.schedule(REPO_UNWIND_CRON, () => runJob("repo-unwind", () => runRepoUnwindJob(db, repoDvpClient, signer, network))),
+    cron.schedule(REPO_MARGIN_CRON, () => runJob("repo-margin", () => runRepoMarginJob(db, repoDvpClient, signer, new Date(), network))),
     cron.schedule(BALANCE_CRON, () => {
       checkOperatorBalance(alerter, {
         horizonUrl: network.horizonUrl,
@@ -170,13 +170,13 @@ export async function main(): Promise<void> {
       }).catch((err) => logger.error({ err }, "keeper: balance check failed"));
     }),
     cron.schedule(CURE_EXPIRY_CRON, () =>
-      runJob("cure-expiry", () => runCureExpiryJob(db, creditLineClient, pledgeVaultClient, signer)),
+      runJob("cure-expiry", () => runCureExpiryJob(db, creditLineClient, pledgeVaultClient, signer, network)),
     ),
     cron.schedule(INTEREST_ACCRUAL_CRON, () =>
-      runJob("interest-accrual", () => runInterestAccrualJob(db, creditLineClient, signer)),
+      runJob("interest-accrual", () => runInterestAccrualJob(db, creditLineClient, signer, network)),
     ),
     cron.schedule(SYNC_COLLATERAL_CRON, () =>
-      runJob("sync-collateral", () => runSyncCollateralJob(db, creditLineClient, pledgeVaultClient, signer)),
+      runJob("sync-collateral", () => runSyncCollateralJob(db, creditLineClient, pledgeVaultClient, signer, network)),
     ),
   ];
 

@@ -15,7 +15,7 @@ but does not call that service.
 | `sync-collateral` | every minute | For each open line, compares `CreditLine`'s pledged units with what `PledgeVault` holds and pushes the vault's figure if they differ. Never derives it from Postgres. Submits nothing for a line already in step. |
 | `cure-expiry` | `*/5 * * * *` | For open lines whose latest `margin_event` is `MarginCall` or `Liquidation`: re-reads LTV from the contract, `poke`s to arm the breach flag, and once the cure window has run out calls `CreditLine.liquidate` then `PledgeVault.liquidate` (collateral goes to the lender). Books `pledge`, `liquidation` and `credit_line` rows. A line only in `MarginCall` is never liquidated. |
 | `interest-accrual` | hourly (`0 * * * *`) | `poke`s every open line that has an on-chain id. |
-| `repo-margin` | `*/5 * * * *` | For settled repo trades: `call_margin` when collateral stops covering exposure, `call_margin` again to clear a cured call, `default_close` after the cure deadline. Records `repo_margin_call` rows. Skips a trade whose guarded price is not usable. |
+| `repo-margin` | `*/5 * * * *` | For settled repo trades: `call_margin` when collateral stops covering exposure, `call_margin` again to clear a cured call, `default_close` after the cure deadline. Records `repo_margin_call` rows with USDC margin currency (RepoDvP cash legs and margin calls are strictly denominated in USDC per PRD §5 and §8). Skips a trade whose guarded price is not usable. |
 | `repo-unwind` | `*/5 * * * *` | `RepoDvp.unwind` for settled trades past maturity; records status and `leg2_tx` on `repo_trade`. |
 | balance check | `7 * * * *` | Alerts when the keeper account's XLM balance is low. |
 
@@ -87,6 +87,7 @@ repo-unwind and repo-margin schedules to every minute for local work.
 - `src/index.ts`: wiring, cron registration, the serial job queue, balance check, graceful shutdown.
 - `src/cli.ts`: run-once CLI runner for operator drills and incident response.
 - `src/jobs/syncCollateral.ts`, `cureExpiry.ts`, `interestAccrual.ts`, `repoMargin.ts`, `repoUnwind.ts`: one file per job.
+- `src/jobs/submit.ts`: shared transaction signing and submission helper for keeper jobs.
 - `src/jobs/types.ts`: the shared `JobResult` shape.
 
 ## Troubleshooting Job Errors

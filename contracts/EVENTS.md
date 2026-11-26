@@ -66,6 +66,7 @@ consumer changes and a redeploy, and this file has to be updated in the same PR.
 | `margin_state_changed` | `line: u64` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke`, only when the state changes | indexer (stored only) |
 | `liquidation_started` | `line: u64` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` (keeper) | indexer (stored only) |
 | `line_closed` | `line: u64` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` (lender) | indexer (stored only) |
+| `line_closed_repaid` | `line: u64` | `caller: Address` (bare value) | `close` (lender or borrower) on a fully repaid `Open` line | indexer (stored only) |
 | `undrawn_withdrawn` | `line: u64` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` (lender) | indexer (stored only) |
 | `interest_withdrawn` | `line: u64` | `(lender: Address, amount: i128, claimable_after: i128)` | `withdraw_interest` (lender) | indexer (stored only) |
 
@@ -123,6 +124,7 @@ longer pause names use `Symbol::new`. Both decode to the same plain string in `c
 
 | Topic | Topic arguments | Payload (in order) | Emitted by | When |
 |---|---|---|---|---|
+| `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` (cash lender) | A new trade is `Proposed` and the lender's leg-1 allowance is granted |
 | `cancel` | `id: u64` | `caller: Address` | `cancel_proposal` (cash lender or cash borrower) | A `Proposed` trade moves to `Cancelled` |
 | `settle` | `id: u64` | `units: i128` (bare value) | `accept_and_settle` (cash borrower) | Leg 1 settled: `units` of RWA pledged, USDC paid out |
 | `unwind` | `id: u64` | `total_due: i128` (bare value) | `unwind` (either party, or keeper) | Leg 2 at or after maturity: borrower repaid principal plus interest, RWA returned |
@@ -131,6 +133,10 @@ longer pause names use `Symbol::new`. Both decode to the same plain string in `c
 | `topup` | `id: u64` | `(extra_units: i128, cured: bool)` | `top_up` (cash borrower; not pause-gated) | Borrower added collateral. `cured` is true when this cleared an open call |
 | `default` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_close` (keeper) | Cure deadline passed without a cure: lender takes `lender_units`, the rest goes back to the borrower |
 | `mat_def` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` (cash lender or keeper) | Leg 2 not repaid by `maturity_at + maturity_grace`; same split as `default` |
+| `usdc` | none (topic is the 1-tuple `(Symbol,)`) | `(old_usdc: Option<Address>, new_usdc: Address)` | `set_usdc` (admin) | Cash-leg token set or changed; `old_usdc` is `None` on the first call |
+| `curegrace` | none | `(old_seconds: u64, new_seconds: u64)` | `set_cure_grace` (admin) | Cure window for margin calls opened from now on |
+| `matgrace` | none | `(old_seconds: u64, new_seconds: u64)` | `set_maturity_grace` (admin) | Grace past maturity before `default_at_maturity` |
+| `cfgasset` | `asset: Address` | `(price_guard: Address, haircut_bps: u32, thresholds: MarginThresholds, max_cash_per_trade: i128, max_term_seconds: u64)` | `configure_asset` (admin) | Asset risk config set; the payload is the full new config |
 | `disable` | `asset: Address` | `()` | `disable_asset` (admin) | `propose` and `accept_and_settle` for `asset` refused; open trades can still unwind, top up and default |
 | `enable` | `asset: Address` | `()` | `enable_asset` (admin) | `asset` re-enabled |
 | `paused` | `scope: PauseScope` | `true: bool` | `pause` (pauser) | Scope paused |
@@ -145,8 +151,8 @@ Field notes:
   lender may still bear a shortfall; the event does not report it.
 - `cured` carries a constant `0i128` so the payload is never empty. Treat the topic alone as the
   signal.
-- `propose`, `set_usdc`, `configure_asset` and `set_cure_grace` publish nothing today (issues #206
-  and #207 propose events for them).
+- `cfgasset` shares no name with CreditLine's `asset_configured`; filter on `chain_event.contract`
+  as well as `topic`.
 
 ## ExitDesk (`contracts/exit-desk`)
 
@@ -215,8 +221,6 @@ contract.
 | CreditLine | `line_opened` | `line: u64` | `(lender: Address, borrower: Address, asset: Address, limit: i128, rate_bps: u32, cure_s: u64)` | `open` | #138 |
 | CreditLine | `line_funded` | `line: u64` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` | #137 |
 | CreditLine | not named yet | `line: u64` | not specified | `reduce_limit` (new) | #813 |
-| RepoDvp | `propose` | `id: u64` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | #206 |
-| RepoDvp | `usdc`, `curegrace`, `cfgasset` | not specified | new values (old values where cheap) | `set_usdc`, `set_cure_grace`, `configure_asset` | #207 |
 | RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |
 | RepoDvp | `cured` (**breaking**: `0i128` becomes a tuple) | `id: u64` | `(exposure: i128, ltv_bps: u32, price: i128)` | `call_margin` | #840 |
 | ExitDesk | `cfgasset` | `asset: Address` | `(price_guard: Address, spread_bps: u32, per_holder_daily_cap: i128, desk_daily_cap: i128, desk_inventory_cap: i128)` | `configure_asset` | #835 |

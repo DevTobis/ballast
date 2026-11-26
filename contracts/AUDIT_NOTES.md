@@ -9,7 +9,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key; withdraw ExitDesk's **own** USDC float and RWA inventory (see [ExitDesk](#exitdesk)); change the parameters listed in [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value), most of them immediately | transfer a borrower's pledged collateral, a lender's committed USDC or a repo party's cash or collateral (see [RepoDvP](#repodvp)) directly: CreditLine, PledgeVault and RepoDvp have no `admin_withdraw`/sweep, and every transfer of those funds needs the owning party's auth or a keeper path; sign for a borrower or lender |
 | `pauser` | pause exits on ExitDesk and new repo activity on RepoDvp, each through that contract's own `pause`; set Registry's own flags (not read by any other contract, see #210) | pause repayment, release or withdrawal paths (invariant 5); pause draws or pledges (CreditLine and PledgeVault have no `pause`, #210) |
-| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
+| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close`/`default_at_maturity` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
 
@@ -267,7 +267,9 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
   closes the line. The lender cannot choose the price, understate the collateral, or close while
   collateral remains in the vault, but **can choose when to close**; until they do the line stays
-  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close.
+  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
+  (no principal, interest, fee or funding left) can be closed by its lender or borrower with
+  `close`; `close` refuses a `Liquidating` line, so it cannot bypass `close_liquidated` (#130).
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
