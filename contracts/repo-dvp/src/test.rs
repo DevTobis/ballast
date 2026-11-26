@@ -2111,7 +2111,7 @@ mod sac {
     }
 
     #[test]
-    #[should_panic(expected = "ballast-common: paused")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn pausing_repos_stops_accept_and_settle() {
         let h = setup();
         let maturity = h.env.ledger().timestamp() + 3_600;
@@ -2122,7 +2122,7 @@ mod sac {
     }
 
     #[test]
-    #[should_panic(expected = "ballast-common: paused")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn pausing_all_stops_accept_and_settle_too() {
         let h = setup();
         let maturity = h.env.ledger().timestamp() + 3_600;

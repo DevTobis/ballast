@@ -4,7 +4,8 @@
 //! Uniswap v4's permissioned-pool pattern (adapter holds/represents the position; the pool
 //! contracts keep internal balances).
 
-use soroban_sdk::{contracttype, Address, Env};
+use crate::error::Error;
+use soroban_sdk::{contracttype, panic_with_error, Address, Env};
 
 #[contracttype]
 enum CustodyDataKey {
@@ -18,8 +19,8 @@ pub fn write_custody(env: &Env, custody: &Address) {
 }
 
 pub fn read_custody(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get(&CustodyDataKey::Custody)
-        .expect("ballast-common: custody not set")
+    match env.storage().instance().get(&CustodyDataKey::Custody) {
+        Some(custody) => custody,
+        None => panic_with_error!(env, Error::NotInitialized),
+    }
 }

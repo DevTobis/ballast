@@ -2112,7 +2112,7 @@ mod test {
     // `as_contract`; see the dead-pause-flag entry-point bugs #30/#32 and the open pause-reach
     // tracking issue #210.
     #[test]
-    #[should_panic(expected = "ballast-common: paused")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn pledge_panics_while_pledges_scope_paused() {
         let h = setup(500, 0, PRICE_SCALE);
         h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
@@ -2124,7 +2124,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ballast-common: paused")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn pledge_panics_while_all_scope_paused() {
         let h = setup(500, 0, PRICE_SCALE);
         h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
