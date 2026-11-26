@@ -54,15 +54,21 @@ describe("RegistryClient", () => {
     expect(xdr.length).toBeGreaterThan(0);
   });
 
+  it("cancelParam() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.cancelParam(source, 1n);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
   it("raiseHaircutNow() returns non-empty unsigned XDR", async () => {
     const xdr = await client.raiseHaircutNow(source, asset, 50);
     expect(xdr.length).toBeGreaterThan(0);
   });
 
-  it("pause() and queueUnpause()/executeUnpause() return non-empty unsigned XDR", async () => {
+  it("pause() and queueUnpause()/executeUnpause()/cancelUnpause() return non-empty unsigned XDR", async () => {
     expect((await client.pause(source, "Draws")).length).toBeGreaterThan(0);
     expect((await client.queueUnpause(source, "All")).length).toBeGreaterThan(0);
     expect((await client.executeUnpause(source, 1n)).length).toBeGreaterThan(0);
+    expect((await client.cancelUnpause(source, 1n)).length).toBeGreaterThan(0);
   });
 
   it("isPaused() simulates a read and does not throw", async () => {

@@ -25,6 +25,8 @@
  *
  * Every step is safe to repeat: a run that dies after `CreditLine.liquidate` finds the line
  * already `Liquidating` on-chain next time and carries on from the vault.
+ *
+ * Operator recovery runbook: see `TROUBLESHOOTING.md` ("Liquidation runs get stuck or stop half-finished").
  */
 import { and, desc, eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";

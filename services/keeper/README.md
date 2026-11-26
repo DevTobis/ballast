@@ -21,7 +21,7 @@ but does not call that service.
 
 Jobs run one at a time through a shared queue, because they share one account and its sequence number.
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
-Liquidation and margin steps are written to be safe to repeat after a crash.
+Liquidation and margin steps are written to be safe to repeat after a crash (see [../../TROUBLESHOOTING.md](../../TROUBLESHOOTING.md#liquidation-runs-get-stuck-or-stop-half-finished) for operator recovery steps).
 
 ## Replica Behaviour and Advisory Locking
 
