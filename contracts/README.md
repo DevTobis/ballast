@@ -123,7 +123,7 @@ stateDiagram-v2
     }
 
     Open --> Liquidating: liquidate / breach armed and later-ledger Ok liquidation
-    Liquidating --> Closed: close_liquidated / lender auth; Liquidating status
+    Liquidating --> Closed: close_liquidated / lender auth; Liquidating status; vault position empty
     Closed --> [*]
 
     note right of Open
@@ -143,7 +143,7 @@ The exact `MarginState` boundaries are computed by `margin::classify`:
 | `MarginCall` | `ltv_bps >= margin_call_bps` and `ltv_bps < liquidation_bps` |
 | `Liquidation` | `ltv_bps >= liquidation_bps` |
 
-Every boundary is inclusive on the higher-LTV side (`>=`). The configured threshold names and limits are: `0 < warning_bps <= margin_call_bps <= liquidation_bps <= 10_000`.
+Every boundary is inclusive on the higher-LTV side (`>=`). The configured threshold names and limits are: `0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`. `MarginThresholds::validate` is strict, so equal thresholds are rejected (`margin: warning_bps must be below margin_call_bps`, `margin: margin_call_bps must be below liquidation_bps`).
 
 `ltv()` is the source of truth for current margin. It reads debt, collateral, the guarded price, and configured thresholds without persisting state. `Line.margin_state` is only a cache refreshed by `draw`, `poke`, `liquidate`, and `close_liquidated`. `sync_from_vault` and `sync_collateral` change `pledged_units` but deliberately do not refresh the cache; a later `ltv()` or `poke()` can therefore report a state different from stored `Line.margin_state`.
 
@@ -159,7 +159,7 @@ This is why `Warning` can remain `Open`: status is the lifecycle state, while ma
 | `poke` — preserve arm | No explicit guard; permissionless. Applies when fresh state is `Liquidation` and fresh price status is `Ok`, and `breach_ledger` is already `Some(...)` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to `Liquidation` | Preserved unchanged |
 | `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to the fresh state: `Healthy`, `Warning`, `MarginCall`, or `Liquidation` (including `Liquidation` with a non-`Ok` price) | Cleared to `None` |
 | `liquidate` | Keeper authorization; breach exists: `credit-line: no confirmed breach flagged; call poke(line) first`; current ledger sequence is greater than `breach_ledger`: `credit-line: liquidation needs a later ledger than the flagged breach`; status is `Open`: `credit-line: line is not open`; fresh guarded price status: `credit-line: price status is not Ok`; fresh state: `credit-line: breach is no longer confirmed` | `Liquidating` | `Liquidation` | Preserved unchanged |
-| `close_liquidated` | Lender authorization; lender matches line: `credit-line: not this line's lender`; status is `Liquidating`: `credit-line: line is not being liquidated` | `Closed` | `Healthy` | Cleared to `None` |
+| `close_liquidated` | Lender authorization; lender matches line: `credit-line: not this line's lender`; status is `Liquidating`: `credit-line: line is not being liquidated`; the vault position is empty (`PledgeVault::position_units == 0`): `credit-line: collateral has not left the vault`, or with no vault configured, zero seized and pledged units: `credit-line: vault not configured` | `Closed` | `Healthy` | Cleared to `None` |
 | `sync_from_vault` | Configured vault authorization; configured vault check: `credit-line: caller is not the configured vault`; vault not configured: `credit-line: vault not configured`; `units >= 0`: `credit-line: units cannot be negative`; matching line asset: `credit-line: not this line's collateral asset` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 | `sync_collateral` | Caller authorization and caller is stored admin or keeper: `ballast-common: caller is neither admin nor keeper`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 
