@@ -53,11 +53,12 @@ const alerter = createConsoleAlerter("ledger");
  *   (an i128 integer scaled to 7 decimals, 1e-7).
  *
  * Rationale for tolerance:
- * Both sources represent 7-decimal fixed-point integers (1 unit = 10_000_000 raw units), so arithmetic
- * rounding should not occur under normal operation unless an external service writes excess precision
- * in `pledge.units`. The `100n` raw-unit allowance (0.0000100 or 1e-5 of an asset unit) exists strictly
- * as a guard against sub-micro-unit string conversion jitter or fractional rounding artifacts across
- * boundary calculations.
+ * Both numbers are exact 7-decimal fixed-point integers (1 unit = 10_000_000 raw units) and the
+ * comparison is pure bigint arithmetic, so there is no rounding. The only way the two can differ
+ * without a real break is a `pledge.units` string written with more than 7 decimals:
+ * `decimalStringToScaled` truncates the extra digits, losing less than 1 raw unit per row. The
+ * `100n` allowance (1e-5 of an asset unit) absorbs that for up to 100 pledge rows on one asset
+ * and is far below any amount that matters.
  *
  * Rule for modification:
  * Do NOT widen this tolerance to suppress reconciliation breaks. Any change to `TOLERANCE_UNITS`

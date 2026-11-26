@@ -54,7 +54,7 @@ When a credit line transitions into `MarginCall` or `Liquidation`, the monitor f
 
 ### Current Limitations
 
-- **Summary Text Headline**: The outer `text` and `content` fields format as `[ballast/margin-monitor] margin_call (<creditLineId>)` and do not include the specific target state in the text string itself. Downstream consumers and notification parsers must inspect `context.state` (or `context.ltvBps`) to distinguish between an initial `MarginCall` and an urgent `Liquidation` escalation.
+- **Summary Text Headline**: The outer `text` and `content` fields format as `[ballast/margin-monitor] margin_call (<creditLineId>)` and do not include the specific target state in the text string itself. Downstream consumers and notification parsers must inspect `context.state` (or `context.ltvBps`) to distinguish between an initial `MarginCall` and an urgent `Liquidation` escalation. The escalation itself is no longer swallowed by the cooldown, because the state is part of the dedupe key (#53).
 
 ## How it connects to the rest
 
