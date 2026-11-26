@@ -31,7 +31,7 @@ use ballast_common::{
     access::{self, Roles},
     pause::{self, PauseScope},
     price::{GuardedPrice, PRICE_SCALE},
-    timelock,
+    timelock, ttl,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, Env,
@@ -43,6 +43,20 @@ pub const QUOTE_TTL_SECONDS: u64 = 60;
 
 const BPS_DENOMINATOR: i128 = 10_000;
 const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Lifetime given to a `DailyUsed` entry on every write: ~2 days of ledgers at ~5s each.
+///
+/// The entry must not expire before its UTC day ends, or the holder's cap would reset early. A
+/// write can land at the very start of the day, so it needs at least a full day of ledgers; the
+/// second day is margin for ledgers closing faster than 5s. Living past its day is harmless: the
+/// key carries the day bucket, so a later day never reads it.
+pub const DAILY_USED_TTL_LEDGERS: u32 = 2 * 17_280;
+
+fn write_daily_used(env: &Env, key: &DataKey, used: i128) {
+    let temporary = env.storage().temporary();
+    temporary.set(key, &used);
+    temporary.extend_ttl(key, DAILY_USED_TTL_LEDGERS, DAILY_USED_TTL_LEDGERS);
+}
 
 #[contractclient(name = "PriceGuardClient")]
 pub trait PriceGuardInterface {
@@ -91,7 +105,9 @@ enum DataKey {
     /// takes inventory back out with `withdraw`.
     Inventory(Address),
     /// Units a `holder` has exited for `asset` within a given UTC day bucket
-    /// (`timestamp / 86_400`), for the per-holder daily cap.
+    /// (`timestamp / 86_400`), for the per-holder daily cap. Kept in temporary storage: only the
+    /// current day's bucket is ever read, so the entry is left to expire instead of piling up one
+    /// persistent entry per holder, asset and day (see [`DAILY_USED_TTL_LEDGERS`]).
     DailyUsed(Address, Address, u64),
     PendingUnpause(u64),
 }
@@ -177,6 +193,7 @@ impl ExitDesk {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("exit-desk: already initialized");
         }
@@ -204,6 +221,7 @@ impl ExitDesk {
         per_holder_daily_cap: i128,
         desk_inventory_cap: i128,
     ) {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         // A 100% spread makes every exit pay nothing, which is a misconfiguration, not a price.
         assert!(
@@ -233,6 +251,7 @@ impl ExitDesk {
     /// Admin-set once; exit swaps pay out this token. See module docs for why this isn't
     /// read from `Registry`.
     pub fn set_usdc(env: Env, admin: Address, usdc: Address) {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
         env.events()
@@ -240,11 +259,13 @@ impl ExitDesk {
     }
 
     pub fn usdc(env: Env) -> Address {
+        ttl::extend_instance(&env);
         read_usdc(&env)
     }
 
     /// Disables an asset so that new quotes and exits are refused. Admin only.
     pub fn disable_asset(env: Env, admin: Address, asset: Address) {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         let _ = read_asset_config(&env, &asset);
         env.storage()
@@ -256,6 +277,7 @@ impl ExitDesk {
 
     /// Re-enables a disabled asset. Admin only.
     pub fn enable_asset(env: Env, admin: Address, asset: Address) {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         let _ = read_asset_config(&env, &asset);
         env.storage()
@@ -267,6 +289,7 @@ impl ExitDesk {
 
     /// Checks whether an asset is currently enabled.
     pub fn is_asset_enabled(env: Env, asset: Address) -> bool {
+        ttl::extend_instance(&env);
         let _ = read_asset_config(&env, &asset);
         !is_asset_disabled(&env, &asset)
     }
@@ -275,6 +298,7 @@ impl ExitDesk {
     /// (admin or keeper) into this contract's float. Requires `set_usdc` to have been called first,
     /// and the token argument must match the configured USDC token address.
     pub fn fund(env: Env, admin_or_keeper: Address, usdc: Address, amount: i128) {
+        ttl::extend_instance(&env);
         access::require_admin_or_keeper(&env, &admin_or_keeper);
         if amount <= 0 {
             panic!("exit-desk: amount must be positive");
@@ -302,6 +326,7 @@ impl ExitDesk {
     /// belonging to a holder is ever in this contract between transactions (PRD §8 invariant 6
     /// concerns user funds and is unaffected).
     pub fn withdraw(env: Env, admin: Address, token: Address, amount: i128, to: Address) {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         assert!(amount > 0, "exit-desk: amount must be positive");
 
@@ -322,6 +347,7 @@ impl ExitDesk {
             env.storage()
                 .persistent()
                 .set(&key, &(held - amount.min(held)));
+            ttl::extend_persistent(&env, &key);
         }
 
         env.events().publish((symbol_short!("withdraw"), token), amount);
@@ -330,6 +356,7 @@ impl ExitDesk {
     /// A pure(-ish) read: no auth required to get a quote, but it still refuses to quote on a
     /// non-`Ok` price (PRD invariant 2).
     pub fn quote(env: Env, asset: Address, units: i128) -> ExitQuote {
+        ttl::extend_instance(&env);
         compute_quote(&env, &asset, units)
     }
 
@@ -339,6 +366,7 @@ impl ExitDesk {
     /// caller whether that quote can be paid before a holder is asked to sign. A read, like
     /// `quote`: the float can still move before the exit lands.
     pub fn available_usdc(env: Env) -> i128 {
+        ttl::extend_instance(&env);
         match env.storage().instance().get::<_, Address>(&DataKey::Usdc) {
             Some(usdc) => token::Client::new(&env, &usdc).balance(&env.current_contract_address()),
             None => 0,
@@ -347,11 +375,13 @@ impl ExitDesk {
 
     /// Read-only helper returning the configured asset parameters for `asset`.
     pub fn asset_config(env: Env, asset: Address) -> AssetConfig {
+        ttl::extend_instance(&env);
         read_asset_config(&env, &asset)
     }
 
     /// Read-only helper returning the current accumulated RWA inventory for `asset`.
     pub fn inventory(env: Env, asset: Address) -> i128 {
+        ttl::extend_instance(&env);
         let key = DataKey::Inventory(asset);
         env.storage().persistent().get(&key).unwrap_or(0)
     }
@@ -359,9 +389,10 @@ impl ExitDesk {
     /// Read-only helper returning the units `holder` has exited for `asset` within the
     /// current UTC day.
     pub fn daily_used(env: Env, holder: Address, asset: Address) -> i128 {
+        ttl::extend_instance(&env);
         let day_bucket = env.ledger().timestamp() / SECONDS_PER_DAY;
         let key = DataKey::DailyUsed(holder, asset, day_bucket);
-        env.storage().persistent().get(&key).unwrap_or(0)
+        env.storage().temporary().get(&key).unwrap_or(0)
     }
 
     /// Read-only convenience returning remaining capacity in units for `(holder, asset)`:
@@ -370,10 +401,11 @@ impl ExitDesk {
     /// `desk_room` is remaining units under `desk_inventory_cap`.
     /// Both are bounded below by 0.
     pub fn capacity(env: Env, holder: Address, asset: Address) -> (i128, i128) {
+        ttl::extend_instance(&env);
         let config = read_asset_config(&env, &asset);
         let day_bucket = env.ledger().timestamp() / SECONDS_PER_DAY;
         let daily_key = DataKey::DailyUsed(holder, asset.clone(), day_bucket);
-        let daily_used: i128 = env.storage().persistent().get(&daily_key).unwrap_or(0);
+        let daily_used: i128 = env.storage().temporary().get(&daily_key).unwrap_or(0);
         let holder_room = (config.per_holder_daily_cap - daily_used).max(0);
 
         let inventory_key = DataKey::Inventory(asset);
@@ -398,6 +430,7 @@ impl ExitDesk {
         to: Address,
         deadline: u64,
     ) -> i128 {
+        ttl::extend_instance(&env);
         assert!(
             env.ledger().timestamp() <= deadline,
             "exit-desk: deadline has passed"
@@ -420,6 +453,7 @@ impl ExitDesk {
         min_usdc_out: i128,
         to: Address,
     ) -> i128 {
+        ttl::extend_instance(&env);
         Self::exit_before(env, holder, asset, units, min_usdc_out, to, u64::MAX)
     }
 
@@ -450,7 +484,7 @@ impl ExitDesk {
 
         let day_bucket = env.ledger().timestamp() / SECONDS_PER_DAY;
         let daily_key = DataKey::DailyUsed(holder.clone(), asset.clone(), day_bucket);
-        let daily_used: i128 = env.storage().persistent().get(&daily_key).unwrap_or(0);
+        let daily_used: i128 = env.storage().temporary().get(&daily_key).unwrap_or(0);
         let new_daily_used = daily_used
             .checked_add(units)
             .expect("exit-desk: overflow in daily-used counter");
@@ -488,10 +522,11 @@ impl ExitDesk {
             &quote.usdc_out,
         );
 
-        env.storage().persistent().set(&daily_key, &new_daily_used);
+        write_daily_used(&env, &daily_key, new_daily_used);
         env.storage()
             .persistent()
             .set(&inventory_key, &new_inventory);
+        ttl::extend_persistent(&env, &inventory_key);
 
         env.events()
             .publish((symbol_short!("exit"), holder, asset), quote.usdc_out);
@@ -501,6 +536,7 @@ impl ExitDesk {
 
     /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
     pub fn pause(env: Env, pauser: Address, scope: PauseScope) {
+        ttl::extend_instance(&env);
         let stored_pauser = access::require_pauser(&env);
         assert_eq!(&stored_pauser, &pauser, "exit-desk: pauser argument mismatch");
         pause::set_paused(&env, &scope, true);
@@ -511,6 +547,7 @@ impl ExitDesk {
     /// Queues an unpause, executable after the 48h timelock — unlike `pause`, lifting a stop is
     /// not urgent and deserves the same notice period as any other risk-loosening change.
     pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         let id = timelock::next_id(&env);
         let key = DataKey::PendingUnpause(id);
@@ -529,6 +566,7 @@ impl ExitDesk {
     }
 
     pub fn execute_unpause(env: Env, id: u64) {
+        ttl::extend_instance(&env);
         let key = DataKey::PendingUnpause(id);
         let pending: PendingUnpause = env
             .storage()
@@ -546,6 +584,7 @@ impl ExitDesk {
     }
 
     pub fn cancel_unpause(env: Env, admin: Address, id: u64) {
+        ttl::extend_instance(&env);
         require_admin_is(&env, &admin);
         let key = DataKey::PendingUnpause(id);
         let pending: PendingUnpause = env
@@ -559,7 +598,20 @@ impl ExitDesk {
     }
 
     pub fn is_paused(env: Env, scope: PauseScope) -> bool {
+        ttl::extend_instance(&env);
         pause::is_paused(&env, &scope)
+    }
+
+    /// Permissionless keep-alive, as on `PledgeVault` and `RepoDvp`: anyone may pay to extend the
+    /// instance (config, USDC address, pause flags, roles) and `asset`'s inventory entry. Every
+    /// entry point already extends the instance and every inventory write extends that entry; this
+    /// is for a desk that sees no traffic for longer than one extension lasts (~30 days).
+    pub fn extend_ttl(env: Env, asset: Address) {
+        ttl::extend_instance(&env);
+        let key = DataKey::Inventory(asset);
+        if env.storage().persistent().has(&key) {
+            ttl::extend_persistent(&env, &key);
+        }
     }
 }
 
