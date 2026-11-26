@@ -71,6 +71,8 @@ All per-asset state is stored in Soroban persistent storage, one entry per key, 
 - `DataKey::IssuerPubKey(Address)`
 - `DataKey::RequireNavSignature(Address)`
 - `DataKey::LastStatus(Address)`
+- `DataKey::SourceAllowed(Address, Symbol)` (the source allowlist, #84)
+- `DataKey::SourceMaxStaleness(Address, Symbol)` (per-source staleness windows, #86)
 
 Every per-asset entry's TTL is extended (`ttl::extend_persistent`) whenever it is read or written. Queued config changes (`DataKey::PendingConfig(id)`), role changes and upgrades are persistent too. The instance entry holds only the roles, a pending admin transfer and the timelock id counter, so its size does not depend on how many assets are configured (`instance_storage_is_independent_of_asset_count_with_20_assets`).
 
