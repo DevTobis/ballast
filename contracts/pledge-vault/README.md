@@ -6,7 +6,8 @@ or `liquidate` by an authorized keeper.
 
 ## Contract Events
 
-Every state-changing entry point publishes one event with the shape `((Symbol, line), payload)`:
+Every state-changing entry point publishes one event with the shape `((Symbol, line), payload)`.
+See [`../EVENTS.md`](../EVENTS.md) for consumers and the payload-order compatibility rule:
 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|

@@ -64,7 +64,8 @@ Change `API_PORT`, `ISSUER_GATEWAY_PORT` or `PAYOUT_HOP_PORT` in the repo-root `
 3. That the issuer NAV key is registered: `scripts/configure-nav-key.sh testnet`.
 
 A move beyond `daily_move_band_bps` against the last good value puts the guard into a sticky `Halted`
-state that only the `risk` role clears (`confirm_halt_cleared`).
+state that only the `risk` role clears (`confirm_halt_cleared`). Follow
+[`docs/runbooks/price-halt.md`](docs/runbooks/price-halt.md) before clearing it.
 
 ## Requests are refused with a compliance error
 
