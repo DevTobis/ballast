@@ -7,13 +7,41 @@ in this skeleton pass.
 
 | Crate | Responsibility |
 |---|---|
-| `common` | Shared roles/timelock/pause/price/risk/margin logic — not itself a deployable contract |
+| `common` | [Shared roles, timelock, pause, price, risk, and margin logic](common/README.md) — not itself a deployable contract |
 | `registry` | [Asset configs, haircut parameters, timelocked param changes](registry/README.md) |
 | `price-guard` | [Median/band/staleness/halt price logic (PRD §6.4)](price-guard/README.md) |
 | `pledge-vault` | [Escrow/lien collateral positions](pledge-vault/README.md) |
-| `credit-line` | Credit lines, draws, repayments, the margin state machine |
+| `credit-line` | [Credit lines, draws, repayments, storage layout, and the margin state machine](credit-line/README.md) |
 | `exit-desk` | [RWA → USDC instant exit](exit-desk/README.md) |
 | `repo-dvp` | Bilateral repo, atomic DvP |
+
+Every event these contracts publish (topics, payload order and types, emitter, consumers) is listed
+in [`EVENTS.md`](EVENTS.md). Payload order is a compatibility contract with `services/indexer` and
+`services/ledger`: read that file before you change an event.
+
+## Differences from PRD section 8
+
+The PRD (`../PRD.md` §8) is the product doc and is untouched; this table is where the code
+diverges from it, so a reader who trusts the PRD writes clients against the right shapes. Each
+row is verified against the code at the cited lines. Status is one of `intended` (a deliberate
+design choice), `planned` (tracked work, not yet built) or `bug` (the code does something the
+PRD does not allow, or silently drops something it promises).
+
+| Item | PRD says | Code does | Status |
+|---|---|---|---|
+| `open` gains `asset` | §8 (`PRD.md:555`): `open(lender, borrower, limit, rate_bps, cure_s, agreement)` — no asset | `open` takes `asset: Address` (`contracts/credit-line/src/lib.rs:329`) | intended — a line must know its collateral asset; the §7 data model ties a line to an asset |
+| One position per (borrower, asset) | §6.2 (`PRD.md:349`): "One position per (borrower, asset)" | `open` allocates a fresh line id with no check for an existing line for the same (borrower, asset) (`contracts/credit-line/src/lib.rs:325`); vault positions are keyed `(line, asset)` (`contracts/pledge-vault/src/lib.rs:135`), so one borrower can hold two positions for one asset | bug — no tracking issue |
+| `liquidate(route)` ignores `route` | §8 (`PRD.md:561`): `liquidate(keeper, line, route)` | the parameter is accepted and discarded (`let _ = route;`, `contracts/credit-line/src/lib.rs:613`) | bug — no tracking issue |
+| `cure_s` stored, never enforced | §8 (`PRD.md:555`) passes `cure_s` to `open`; invariant 3 requires an "expired cure window" before liquidation | `cure_s` is stored on the `Line` (`contracts/credit-line/src/lib.rs:143,360`) and never read; the "no quick liquidation" rule is instead enforced by requiring the breach to have been flagged by a `poke` on an earlier ledger | bug — #147 |
+| `fee_bps` has no on-chain effect | §7 (`PRD.md:496`): the `credit_line` table has `fee_bps`; §5 says the platform fee "is taken on top" | no `fee_bps` anywhere in `contracts/`; it never reaches `open`, `Line`, or `repay` | planned — #146, #920 |
+| No `next accrual` getter | §9 (`PRD.md:606`): `GET /v1/credit-lines/{id}` returns "limit, drawn, LTV, state, next accrual" | no `next_accrual` getter exists; `ltv` returns debt as a single sum and needs a PriceGuard call | planned — #131, #918 |
+| `publish_nav` gains `asset_code` | §8 (`PRD.md:545`): `publish_nav(publisher, asset, value, ts, sig)` | `publish_nav` takes an extra `asset_code: Bytes` (`contracts/price-guard/src/lib.rs:989`) for the issuer-signature check | intended — a deliberate breaking change, documented in "price-guard's `publish_nav`" below |
+| `unpause` is queue + execute | §8 (`PRD.md:542`): `unpause(admin, scope)` (timelocked) | no `unpause` entry point; instead `queue_unpause` (`contracts/registry/src/lib.rs:286`) + `execute_unpause` (`:323`), implementing the 48h timelock as an explicit two-step flow | intended |
+| `propose` flattens `RepoTerms` | §8 (`PRD.md:568`): `propose(cash_lender, terms: RepoTerms)` | `propose` takes the terms as separate parameters — `cash_lender, cash_borrower, asset, units, cash_amount, rate_bps, kind, maturity_at, agreement_hash` (`contracts/repo-dvp/src/lib.rs:597`); no `RepoTerms` type exists, and `cash_borrower` is named up front where the PRD only brings the borrower in at `accept_and_settle` | intended |
+| `repay` returns the applied amount | §8 (`PRD.md:558`): `repay(payer, line, amount)` (no return shown) | `repay(...) -> i128`, returning the amount applied (`min(amount, owed)`) (`contracts/credit-line/src/lib.rs:529`) | intended |
+
+One item from the issue's original list is no longer a difference: `release` now requires the
+post-release LTV to stay `Healthy`, matching the PRD (fixed in #1116, closing #181).
 
 ## Pause scopes
 
@@ -39,7 +67,7 @@ invariant 5 ("pausing cannot move funds") requires it.
 | `credit-line` | `repay` | Repayment must always work. |
 | `credit-line` | `liquidate`, `close_liquidated` | Liquidation must run while paused, or a bad line can never be cleared. |
 | `credit-line` | `withdraw_undrawn`, `withdraw_interest` | The lender taking its own capital back out only lowers exposure. |
-| `pledge-vault` | `release` | The borrower returning collateral, checked to leave the line healthy. |
+| `pledge-vault` | `release` | The borrower returning collateral; checked to leave the line healthy when the line still owes something (with zero debt the price and LTV checks are skipped, #182). |
 | `pledge-vault` | `liquidate` | The keeper seizing collateral must work while paused. |
 | `repo-dvp` | `unwind` | Leg 2 at or after maturity closes the trade and returns collateral. |
 | `repo-dvp` | `top_up` | Adds collateral; a borrower must be able to cure a call while paused. |
@@ -74,11 +102,38 @@ all six contracts against the public Stellar testnet.
 
 ## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
 
-`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
+`PriceGuard.publish_nav` takes an additional `asset_code: Bytes` argument (the asset's ticker,
 e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
 `require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
 issuer key (`configure_issuer_key`, admin-only) over the canonical message
 `"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+
+> [!IMPORTANT]
+> NAV is signed by the **price publisher's** key (`configure_issuer_key` registers it), because
+> issuers publish unsigned data. As documented in [contracts/AUDIT_NOTES.md](AUDIT_NOTES.md), the
+> attestor key is the same key that is authorised to publish. On-chain the signature adds no protection
+> against a compromised publisher: it records who relayed the value. **Do not describe it as issuer attestation.**
+>
+> Full specification, key encoding command, test vectors, and operational guidance are documented in
+> [docs/nav-signing.md](../docs/nav-signing.md).
+
+### Operational summary & key conversion
+To configure an attestor key and enforce signatures on a deployment:
+
+1. Convert the publisher's Stellar address (`G...`) to raw 32-byte hex:
+   ```bash
+   PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PRICE_PUBLISHER")
+   ```
+2. Register the attestor key:
+   ```bash
+   stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
+     --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX"
+   ```
+3. Enable signature verification:
+   ```bash
+   stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
+     --admin "$ADMIN" --required true
+   ```
 
 This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
