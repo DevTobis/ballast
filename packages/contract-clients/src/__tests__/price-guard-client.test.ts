@@ -40,7 +40,12 @@ describe("PriceGuardClient", () => {
   });
 
   it("configureSource() returns non-empty unsigned XDR", async () => {
-    const xdr = await client.configureSource(source, asset, "redstone", 3600);
+    const xdr = await client.configureSource(source, asset, "redstone", true);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("configureSourceStaleness() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureSourceStaleness(source, asset, "redstone", 1800n);
     expect(xdr.length).toBeGreaterThan(0);
   });
 
