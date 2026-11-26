@@ -39,6 +39,21 @@ describe("PriceGuardClient", () => {
     expect(xdr.length).toBeGreaterThan(0);
   });
 
+  it("configureSource() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureSource(source, asset, "redstone", true);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("configureSourceStaleness() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.configureSourceStaleness(source, asset, "redstone", 1800n);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("sourceStaleness() simulates a read and does not throw", async () => {
+    const result = await client.sourceStaleness(asset, "redstone");
+    expect(result).toBeDefined();
+  });
+
   it("publishFeed() returns non-empty unsigned XDR", async () => {
     const xdr = await client.publishFeed(source, asset, "kraken", 100_000_000n, Date.now());
     expect(xdr.length).toBeGreaterThan(0);

@@ -1,5 +1,20 @@
+import type { CustodyMode } from "@ballast/domain-types";
 import { BaseContractClient } from "./base-client.js";
 import { scAddress, scBytes, scI128, scU64 } from "./scval.js";
+
+const CUSTODY_MODE_FROM_CHAIN: Record<string, CustodyMode> = {
+  Escrow: "escrow",
+  IssuerLien: "issuer_lien",
+  CustodianLien: "custodian_lien",
+};
+
+/** Full collateral position returned by `PledgeVault::position(line, asset)`. */
+export interface OnChainPledgePosition {
+  units: bigint;
+  pendingLienUnits: bigint;
+  mode: CustodyMode;
+  lienRef: Uint8Array | null;
+}
 
 export class PledgeVaultClient extends BaseContractClient {
   /**
@@ -45,6 +60,23 @@ export class PledgeVaultClient extends BaseContractClient {
     return this.read<bigint>("position_units", [scU64(line), scAddress(assetAddress)]);
   }
 
+  /**
+   * Read-only: full collateral position for `(line, asset)` (`PledgeVault::position`).
+   * Unknown keys return a default empty Escrow position (`units: 0n`, `pendingLienUnits: 0n`,
+   * `mode: "escrow"`, `lienRef: null`).
+   */
+  async position(line: bigint, assetAddress: string): Promise<OnChainPledgePosition> {
+    const raw = await this.read<OnChainPledgePosition>("position", [
+      scU64(line),
+      scAddress(assetAddress),
+    ]);
+    return {
+      ...raw,
+      mode: CUSTODY_MODE_FROM_CHAIN[raw.mode as unknown as string] ?? raw.mode,
+      lienRef: raw.lienRef ?? null,
+    };
+  }
+
   recordLien(
     source: string,
     line: bigint,
@@ -58,6 +90,44 @@ export class PledgeVaultClient extends BaseContractClient {
       scAddress(assetAddress),
       scI128(units),
       scBytes(lienRef),
+    ]);
+  }
+
+  /**
+   * Borrower-only: cancels unconfirmed pending lien units (`IssuerLien` / `CustodianLien`).
+   * Never touches confirmed position units or moves tokens.
+   */
+  cancelPending(
+    source: string,
+    line: bigint,
+    assetAddress: string,
+    units: bigint,
+  ): Promise<string> {
+    return this.invoke(source, "cancel_pending", [
+      scAddress(source),
+      scU64(line),
+      scAddress(assetAddress),
+      scI128(units),
+    ]);
+  }
+
+  /**
+   * Gateway-only: rejects unconfirmed pending lien units (`IssuerLien` / `CustodianLien`) with a reason.
+   * Never touches confirmed position units or moves tokens.
+   */
+  rejectLien(
+    source: string,
+    line: bigint,
+    assetAddress: string,
+    units: bigint,
+    reason: Buffer,
+  ): Promise<string> {
+    return this.invoke(source, "reject_lien", [
+      scAddress(source),
+      scU64(line),
+      scAddress(assetAddress),
+      scI128(units),
+      scBytes(reason),
     ]);
   }
 }
