@@ -258,6 +258,7 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   every `release` against debt then panicked when it valued the remaining collateral.
   `CreditLine::configure_asset` runs the same two checks, so the two contracts cannot disagree
   about which configs are usable.
+- **Pending lien cancellations and rejections:** Unconfirmed pending units in lien modes (`IssuerLien` / `CustodianLien`) can be cancelled by the borrower via `cancel_pending` (borrower-signed) or rejected by the gateway via `reject_lien` (gateway-signed, with reason). Both only decrement `pending_lien_units` and never affect counted `position.units` or move tokens.
 - **Vault `liquidate` takes its amount and recipient from the keeper.** `units` and `to` are
   supplied by the caller; on-chain they are checked only against `units > 0` and
   `units <= position.units`. Nothing on-chain verifies that `units` equals the frozen
