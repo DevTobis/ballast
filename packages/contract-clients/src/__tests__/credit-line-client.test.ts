@@ -28,6 +28,7 @@ describe("CreditLineClient", () => {
       asset,
       limit: 10_000_000n,
       rateBps: 800,
+      feeBps: 50,
       cureS: 3600,
       agreementHash: Buffer.alloc(32, 7),
     });
@@ -52,6 +53,11 @@ describe("CreditLineClient", () => {
     expect(result).toBeDefined();
   });
 
+  it("debtOf() simulates a read and does not throw", async () => {
+    const result = await client.debtOf(1n);
+    expect(result).toBeDefined();
+  });
+
   it("poke() returns non-empty unsigned XDR", async () => {
     const xdr = await client.poke(1n);
     expect(typeof xdr).toBe("string");
@@ -67,5 +73,11 @@ describe("CreditLineClient", () => {
     expect((await client.withdrawUndrawn(source, 1n, 100n)).length).toBeGreaterThan(0);
     expect((await client.withdrawInterest(source, 1n, 5n)).length).toBeGreaterThan(0);
     expect((await client.closeLiquidated(source, 1n)).length).toBeGreaterThan(0);
+  });
+
+  it("setTreasury(), claimFee() and claimableFee() build tx or read", async () => {
+    expect((await client.setTreasury(source, randomAccountId())).length).toBeGreaterThan(0);
+    expect((await client.claimFee(source, 1n, 25n)).length).toBeGreaterThan(0);
+    expect(await client.claimableFee(1n)).toBeDefined();
   });
 });

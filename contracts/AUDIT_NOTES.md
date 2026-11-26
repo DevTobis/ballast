@@ -7,7 +7,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 
 | Role | Can | Cannot |
 |---|---|---|
-| `admin` | configure assets, thresholds, price bands; set the NAV attestor key | move any user's funds (no `admin_withdraw`/sweep anywhere); sign for a borrower or lender |
+| `admin` | configure assets, thresholds, price bands; set the NAV attestor key; withdraw ExitDesk's **own** USDC float and RWA inventory (see [ExitDesk](#exitdesk)); change the parameters listed in [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value), most of them immediately | transfer a borrower's pledged collateral, a lender's committed USDC or a repo party's cash or collateral (see [RepoDvP](#repodvp)) directly: CreditLine, PledgeVault and RepoDvp have no `admin_withdraw`/sweep, and every transfer of those funds needs the owning party's auth or a keeper path; sign for a borrower or lender |
 | `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close`/`default_at_maturity` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
@@ -38,6 +38,40 @@ matches the real world is the off-chain keeper job's responsibility, not the con
 their timing is not a keeper-supplied value either. They only make stored state match a fresh
 price, which is why that is safe (see #211).
 
+### Admin-set parameters that change settlement value
+
+PRD invariant 6 says the admin cannot move user funds. That holds, **with these exceptions**: the
+admin can withdraw the ExitDesk's own float and inventory (not holder funds, see
+[ExitDesk](#exitdesk)), and the admin sets the parameters below. None of them transfers funds, but
+each changes how much a settlement pays, in which token, to whom, or when a position can be
+liquidated or defaulted. Unless the table says otherwise, a change takes effect immediately, with
+no timelock, and applies to positions that are already open.
+
+| Contract | Entry point | Parameter | What it changes | Timelock |
+|---|---|---|---|---|
+| CreditLine | `configure_asset` | `price_guard` | the price behind LTV, `draw`, `liquidate` and the price frozen in a `LiquidationRecord` | none |
+| CreditLine | `configure_asset` | `haircut_bps`, `thresholds` | collateral value, LTV and the point where a line can be liquidated (thresholds must be ordered, see below) | none |
+| CreditLine | `configure_asset` | `usdc` | the token every draw, repayment, lender withdrawal, surplus payment and fee claim uses on lines for that asset, existing ones included | none |
+| CreditLine | `set_vault` | vault address | the only contract trusted to report collateral through `sync_from_vault` | none |
+| CreditLine | `set_treasury` | treasury address | who can claim repaid platform fees (`claim_fee`) | none |
+| PledgeVault | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | the price and LTV check `release` applies while a line owes something | none |
+| PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and LTV before `release`, and reports collateral to | none |
+| PledgeVault | `configure_asset` | `custody_mode` | escrow or issuer-lien custody for new pledges; a position that still holds units keeps its mode and refuses pledges in the other one | none |
+| PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
+| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
+| ExitDesk | `set_usdc` | USDC address | the token exits pay out in | none |
+| RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | none (#215) |
+| RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | none (#215) |
+| RepoDvp | `set_usdc` | USDC address | the cash token for leg 1, leg 2 and the allowances; it can be re-called, and `accept_and_settle` and `unwind` read it at call time, so a change applies to live trades | none; no tracking issue yet |
+| RepoDvp | `set_cure_grace`, `set_maturity_grace` | seconds (at least 60) | how long a borrower has to cure a margin call before `default_close`, and how long an unpaid trade waits past maturity before `default_at_maturity` can act | none |
+| PriceGuard | `configure_asset`, `queue_config` | bands, window, staleness | when a price is `Ok`, `Degraded` or `Halted` | tightening immediate; loosening 48h via `queue_config` |
+| PriceGuard | `remove_source` | a source name | which sources the median uses | none |
+| PriceGuard | `configure_signature_requirement` | NAV signature on/off | whether unsigned NAV is accepted | turning it on immediate; turning it off 48h via `queue_config` |
+| Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
+
+The timelock column should be updated as #215 lands, along with any RepoDvp `set_usdc`
+change. #103 covers the full Registry and PriceGuard timelocked-or-immediate breakdown.
+
 The admin is trusted to choose margin thresholds, but not to choose ones that break the state
 machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
 `MarginThresholds::validate`, which refuses anything but
@@ -45,11 +79,93 @@ machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
 before #78 and silently removed a state (`Warning` or `MarginCall`). Thresholds stored before that
 change are not re-checked; calling `configure_asset` again is the only way to replace them.
 
+## Registry
+
+- **Holds no funds.** Registry stores role addresses, per-asset `AssetConfig`s and timelocked pending
+  changes; settlements read their own local config copy or the PriceGuard, never a Registry balance
+  (`contracts/registry/src/lib.rs:9`).
+- **`register_asset` is admin-only and not timelocked** (`contracts/registry/src/lib.rs:132`):
+  onboarding a *new* asset carries no existing positions to protect. It is not unvalidated — the
+  config goes through `AssetConfig::validate` before it is stored
+  (`contracts/registry/src/lib.rs:140`) — and a duplicate asset is refused
+  (`contracts/registry/src/lib.rs:136`).
+- **Pending changes live in persistent storage, not temporary.** `queue_param`
+  (`contracts/registry/src/lib.rs:160`) and `queue_unpause` (`contracts/registry/src/lib.rs:301`)
+  write `DataKey::PendingParam` / `PendingUnpause` entries and extend their TTL to cover the 48h delay
+  plus a 7-day grace window (`TIMELOCK_EXTEND_TTL_LEDGERS`, `contracts/common/src/timelock.rs:23`). An
+  entry left unexecuted past that window expires under Soroban state archival unless refreshed or
+  cancelled; `cancel_param` / `cancel_unpause` (admin-only) remove it early
+  (`contracts/registry/src/lib.rs:203`, `contracts/registry/src/lib.rs:323`).
+- **Execution is permissionless, queueing is not.** `execute_param`
+  (`contracts/registry/src/lib.rs:220`) and `execute_unpause` (`contracts/registry/src/lib.rs:338`)
+  may be called by anyone once `executes_at` has passed; only the admin may queue or cancel.
+  Executing deletes the entry, so an id cannot be replayed.
+- **`raise_haircut_now` is the risk role's immediate, increase-only brake**
+  (`contracts/registry/src/lib.rs:265`). It overflow-checks the base increase and caps the *combined*
+  base + FX haircut at 10,000 bps (`contracts/registry/src/lib.rs:275`); loosening risk must go
+  through the timelocked `queue_param` path instead.
+- **Pause is immediate, unpause is timelocked.** `pause` (pauser-only,
+  `contracts/registry/src/lib.rs:288`) sets a scope flag with no delay; lifting it goes through
+  `queue_unpause` / `execute_unpause` (48h). `All` is a stored flag of its own
+  (`PauseDataKey::Paused(All)`, written by `set_paused`), and `is_paused` checks it before the
+  scope's own flag (`contracts/common/src/pause.rs:62-75`).
+- **Registry's pause flags and asset parameters are not read at runtime by the other contracts.**
+  Each contract keeps an admin-configured local copy of its asset config (`configure_asset`) and
+  reads pause flags from its *own* instance storage; `Registry::pause` writes only Registry's
+  (`contracts/registry/src/lib.rs:292`). `exit-desk` and `repo-dvp` expose their own pause/unpause
+  (`contracts/exit-desk/src/lib.rs:433`, `contracts/repo-dvp/src/lib.rs:612`), but `credit-line` and
+  `pledge-vault` only read their flag (`contracts/credit-line/src/lib.rs:497`,
+  `contracts/pledge-vault/src/lib.rs:291`) and have no on-chain writer, so those two scopes cannot
+  currently be paused on chain. Cross-contract pause reach is tracked in #210, and `repo-dvp::propose`
+  is additionally not pause-gated (#846). Because configs are local copies, `credit-line` and
+  `pledge-vault` can hold separate haircut/threshold values (#180).
+- **Roles and pending changes are readable.** `roles()` (`contracts/registry/src/lib.rs:87`),
+  `pending_admin()` (`contracts/registry/src/lib.rs:105`), `pending_role_change(id)`
+  (`contracts/registry/src/lib.rs:124`) and `pending_upgrade(id)`
+  (`contracts/registry/src/lib.rs:386`) expose the stored roles and outstanding timelock entries.
+  Non-admin roles rotate through `queue_role_change` / `execute_role_change` (48h); the admin moves
+  with the two-step `propose_admin` / `accept_admin` pair.
+
+## ballast-common
+
+- **Shared math and guards, no funds.** `risk`, `margin`, `pause`, `access`, `asset`, `price`,
+  `timelock`, `ttl` and `upgrade` are helpers the contracts call so they cannot disagree on
+  valuation, margin bands, pause semantics or role checks.
+- **It trusts the caller for non-negative amounts.** `risk::collateral_value`
+  (`contracts/common/src/risk.rs:13`) checks only that the haircut is <= 100%
+  (`contracts/common/src/risk.rs:14`) and that the fixed-point products do not overflow
+  (`contracts/common/src/risk.rs:18`); it does not reject negative `units` or `guarded_price`, so a
+  negative input yields a negative collateral value (#808). `risk::ltv_bps`
+  (`contracts/common/src/risk.rs:30`) floors the ratio, reading up to 1 bp healthier than reality
+  (#809), and returns `u32::MAX` for zero/negative collateral against debt
+  (`contracts/common/src/risk.rs:34`).
+- **Thresholds are validated where they are configured, not where they are used.**
+  `MarginThresholds::validate` (`contracts/common/src/margin.rs:57`) panics unless
+  `0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`; `classify` trusts that the stored
+  thresholds already passed it (each contract calls `validate` in `configure_asset`).
+- **Pause helpers read the calling contract's own storage.** `pause::is_paused`
+  (`contracts/common/src/pause.rs:69`) and `require_not_paused` (`contracts/common/src/pause.rs:90`)
+  operate on the instance storage of whichever contract invokes them; `require_not_paused` panics
+  with `ballast-common: paused` and is meant only for risk-adding entry points, never
+  repay/cure/liquidate (invariant 5).
+- **Role checks panic on mismatch.** `access::require_admin` / `require_pauser` / `require_risk`
+  (`contracts/common/src/access.rs:73`, `contracts/common/src/access.rs:81`,
+  `contracts/common/src/access.rs:99`) return the stored address or panic; roles live in instance
+  storage (`access::write_roles`, `contracts/common/src/access.rs:57`).
+- **Every guard is a panic, and a panic traps.** The `assert!` / `expect!` / `panic!` paths above
+  abort the whole Soroban transaction — no partial state is committed — rather than returning a
+  recoverable error. The 48h delay and 7-day grace constants live in `timelock`
+  (`contracts/common/src/timelock.rs:8`, `contracts/common/src/timelock.rs:17`); callers assert
+  `is_ready` and panic on a missing pending entry.
+
 ## PriceGuard
 
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
-  good value is a sticky `Halted` that only `risk` clears.
+  good value is a sticky `Halted` that only `risk` clears. The on-call procedure for a halt —
+  detection, independent-source checks, the `risk`-signed `confirm_halt_cleared` command,
+  verification and escalation — is [`docs/runbooks/price-halt.md`](../docs/runbooks/price-halt.md).
+  Confirming promotes the value that tripped the halt, so re-check it has not reverted first.
 - **`LastGood` carries its own timestamp.** `DataKey::LastGood` stores `LastGood { value, ts }`.
   When `guarded_price` returns `Ok`, `GuardedPrice::ts` is the current evaluation timestamp (`now`);
   when it returns `Degraded` or `Halted`, `GuardedPrice::ts` is `last_good.ts` (`0` if there was no
@@ -92,19 +208,29 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - **Liquidation is in kind.** `liquidate` flips the line to `Liquidating` and *freezes* the seized
   units (the whole synced position), the confirmed guarded price and the debt in a
   `LiquidationRecord`. The keeper then moves the collateral to the lender with
-  `PledgeVault::liquidate`. These are two transactions by a trusted keeper; the contracts do not
-  link them. The keeper job refuses to liquidate while booked and on-chain pledged units differ
-  (`sync_collateral` lag), so the units it seizes equal the units the record uses.
-- **`close_liquidated`** (lender-signed) values the collateral at the *frozen* price with no
-  haircut, pays any surplus from the lender's USDC to the borrower in the same call, records any
-  shortfall, writes unrecovered principal off `funded` and closes the line. The lender cannot
-  choose the price or understate the collateral, but **can choose when to close**; until they do
-  the line stays `Liquidating` and the borrower's surplus is not paid. There is no borrower-side
-  or keeper-side close.
+  `PledgeVault::liquidate`. `close_liquidated` verifies cross-contract that collateral has actually
+  left the vault (`PledgeVault::position_units(line, asset) == 0`) before permitting the line to
+  close. If no vault is configured, `close_liquidated` refuses if any collateral was pledged or
+  seized (`record.seized_units > 0 || state.pledged_units > 0`), and succeeds only for uncollateralized
+  lines with zero seized units.
+- **`close_liquidated`** (lender-signed) verifies that collateral has cleared the vault, values the
+  collateral at the *frozen* price with no haircut, pays any surplus from the lender's USDC to the
+  borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
+  closes the line. The lender cannot choose the price, understate the collateral, or close while
+  collateral remains in the vault, but **can choose when to close**; until they do the line stays
+  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close.
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
   Both are lender-only and not pause-gated.
+- **Platform fees & invariant 6 (`fee_bps`)**: `open` takes `fee_bps <= 10_000` (simple
+  non-compounding annual rate on `drawn`, included in `debt_of` and LTV). `repay` allocates
+  `fee -> interest -> principal`; repaid fees accumulate in `FeeClaimable(line)` and can only be
+  withdrawn by the configured `Treasury` address via `claim_fee` (not pause-gated). On
+  liquidation, unpaid platform fees are left out of `LiquidationRecord.debt` and waived in
+  `close_liquidated` so the lender never pockets protocol fees or shrinks the borrower's surplus
+  (any fees already repaid before liquidation remain in `FeeClaimable`). Adding `fee_bps` and
+  `accrued_fee` changes the `Line` storage layout and requires a fresh contract redeploy.
 - `draw` enforces `limit` (it previously only checked `funded`). `fund` is refused on a closed line.
 - Interest is simple, non-compounding, accrued on principal per second.
 - **Collateral is reported by the vault, in the same transaction.** `PledgeVault` calls
@@ -144,6 +270,12 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 ## ExitDesk
 
+- `configure_asset` applies at once only for the first listing of an asset, or for changes that
+  cannot raise payouts (same `price_guard`, spread not lower, caps not higher). A new `price_guard`,
+  a lower spread or a higher cap must be queued with `queue_configure_asset` and executed after the
+  48h timelock (`ballast_common::timelock`). The admin can cancel it in the meantime. The first
+  listing is still immediate, so a compromised admin could list a new asset with a hostile
+  `price_guard` against the shared float; that path is not timelocked.
 - The desk's USDC float and the RWA inventory it accumulates from exits have an admin-only `withdraw`.
   Without it the inventory only ever grew toward `desk_inventory_cap` and the desk eventually refused
   every exit, with no way to rebalance. Withdrawing an RWA frees the same amount under its cap. This is
@@ -156,9 +288,25 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   readable error, not for safety: the swap was already atomic, and a short float used to fail in the
   USDC token's own transfer. `available_usdc` is the same balance as a free read; like a quote, it
   can be out of date by the time an exit lands.
+- **Storage lifetime.** Every entry point extends the instance (asset configs, the USDC address,
+  roles and pause flags) to about 30 days, and every write of an asset's `Inventory` extends that
+  entry to about 30 days. `extend_ttl(asset)` is a permissionless keep-alive for a desk that sees no
+  traffic for longer. Before this nothing was extended, so an idle desk's instance or inventory
+  could be archived and `exit` and `withdraw` fail until someone restored it (#208).
+- **The per-holder daily counter is temporary storage.** `DailyUsed(holder, asset, day)` is only
+  read for the current UTC day, so it lives in temporary storage with about 2 days of ledgers from
+  its last write and then expires. It used to be persistent, which left one entry per holder, asset
+  and day on the ledger for good. The 2 days assume ledgers close in about 5 seconds; if they closed
+  at under half that, an entry written early in a day could expire before the day ended and that
+  holder's cap would reset early.
 
 ## RepoDvP
 
+- **Admin `set_usdc` applies to live trades.** The cash token is read from instance storage each
+  time `accept_and_settle` and `unwind` run, not stored on the trade, and `set_usdc` can be called
+  again at any time. If it changes after a trade settles, `unwind` pays leg 2 in the new token,
+  while the leg-2 allowance the borrower granted at settlement is in the old one. See
+  [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value).
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
   `propose` replaces the first one's allowance.
@@ -170,7 +318,8 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not
-  pause-gated. `margin_view` is a free read.
+  pause-gated. `margin_view` is a free read. Accrued interest in `evaluate_margin` is capped at
+  `maturity_at`, ensuring post-maturity exposure matches what `unwind` collects and what `default_close` covers (#218).
 - **Default.** `default_close` is keeper-only, needs the cure window to have passed, re-evaluates
   the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
   guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the
@@ -194,3 +343,33 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   moving changes the encoding and needs the indexer and ledger readers updated together.
 - No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
   scripts in `scripts/` exercise them on testnet.
+
+### Missing hardening
+
+Each item below is a gap in the current code, not a finding about exploitability. Remove a bullet
+when its fix lands (#175).
+
+- **`initialize` is open to the first caller.** No contract checks who calls `initialize`, and
+  deploy and `initialize` are separate transactions, so whoever initializes first sets every role;
+  the deploy scripts detect this only by reading `roles` back afterwards. No tracking issue yet.
+- **No upgrade path outside Registry and PriceGuard.** CreditLine, PledgeVault, ExitDesk and
+  RepoDvp have no upgrade entry point, so a fix to any of them means a new deployment and moving
+  live state across. RepoDvp and ExitDesk are tracked in #837; CreditLine and PledgeVault have no
+  tracking issue yet.
+- **No role setter outside Registry and PriceGuard.** CreditLine, PledgeVault, ExitDesk and
+  RepoDvp fix their admin and other roles at `initialize` and expose no rotation, so a lost or
+  compromised role key can only be replaced by redeploying. Registry and PriceGuard rotate roles
+  through #93 and #94. No tracking issue yet for the other four.
+- **CreditLine and PledgeVault pause flags have no writer.** `draw` and `pledge` check flags in
+  their own contract's storage, but `pause::set_paused` is reached only through `Registry::pause`,
+  which writes Registry's storage, so those scopes cannot be set on a deployment. ExitDesk and
+  RepoDvp now have their own `pause` (#30, #32). Tracked in #210.
+
+## close_liquidated: dust pledged after liquidation
+
+`CreditLine::close_liquidated` calls `PledgeVault::position_units` cross-contract and panics
+(`"credit-line: collateral has not left the vault"`) if the result is non-zero.  This means that
+any collateral dust pledged to the vault **after** `liquidate` has flipped the line to `Liquidating`
+(e.g. a keeper or borrower pledges a hairline amount) will block `close_liquidated` until the
+keeper sweeps all units out of the vault.  Lenders should be aware that the keeper must drain the
+vault position to zero before the line can be closed.

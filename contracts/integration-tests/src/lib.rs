@@ -187,6 +187,7 @@ fn test_real_credit_line_and_pledge_vault_full_lifecycle() {
         &h.rwa_id,
         &limit,
         &0,
+        &0,
         &86_400,
         &agreement,
     );
@@ -350,6 +351,7 @@ fn test_real_credit_line_and_pledge_vault_liquidation_with_surplus() {
         &h.borrower,
         &h.rwa_id,
         &limit,
+        &0,
         &0,
         &86_400,
         &agreement,
