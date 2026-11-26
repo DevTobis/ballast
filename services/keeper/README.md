@@ -46,6 +46,24 @@ pnpm --filter @ballast/service-keeper dev   # this service only (tsx watch)
 pnpm --filter @ballast/service-keeper build && pnpm --filter @ballast/service-keeper start
 ```
 
+### Run-once job CLI
+
+Run a single keeper job immediately and exit (useful for drills, testing, and incident response):
+
+```bash
+pnpm --filter @ballast/service-keeper run-once <job-name>
+# or via compiled dist:
+node dist/cli.js run <job-name>
+```
+
+Available jobs: `cure-expiry`, `repo-unwind`, `repo-margin`, `sync-collateral`, `interest-accrual`, `balance`.
+The CLI prints the JSON `JobResult` and exits with code 1 if any row errored or the job crashed, 0 otherwise.
+It takes the same Postgres advisory lock as the scheduled job (`keeper:<job>`, or `keeper:global` with
+`KEEPER_LOCK_SCOPE=global`), so if the running keeper is in the middle of that job it refuses with exit
+code 1 instead of racing it. Other jobs on the live keeper can still run at the same moment and share the
+keeper account's sequence number, so prefer stopping the scheduler (or running during a quiet window)
+for anything but a read-mostly job. There is no `--dry-run`: every job signs and submits transactions.
+
 The repo-root `.env` is loaded automatically. `scripts/dev-setup.sh` writes one and sets the cure-expiry,
 repo-unwind and repo-margin schedules to every minute for local work.
 
@@ -67,8 +85,22 @@ repo-unwind and repo-margin schedules to every minute for local work.
 ## Source map
 
 - `src/index.ts`: wiring, cron registration, the serial job queue, balance check, graceful shutdown.
+- `src/cli.ts`: run-once CLI runner for operator drills and incident response.
 - `src/jobs/syncCollateral.ts`, `cureExpiry.ts`, `interestAccrual.ts`, `repoMargin.ts`, `repoUnwind.ts`: one file per job.
 - `src/jobs/types.ts`: the shared `JobResult` shape.
+
+## Troubleshooting Job Errors
+
+When keeper jobs or operator transactions fail, errors originate either in the specific job logic or in `submitSignedTx` (`packages/operator-signing/src/submit.ts`).
+
+| Error Message | Meaning | Retries Next Run? | Safe to Ignore? | Action |
+|---|---|---|---|---|
+| `no stellar account on file for lender <id>` | The lender record exists in Postgres but has no entry in `party_account` with a Stellar public key. Collateral seizure cannot proceed without a destination address. | Yes | **No** | Register the lender's Stellar account in `party_account` or complete lender onboarding/KYB. |
+| `submitSignedTx: send failed: ...` | Stellar RPC rejected transaction submission at the boundary (e.g. `tx_bad_seq`, `tx_insufficient_balance`, or network error). | Yes | **Yes**, if transient (network blip or sequence conflict); **No** if insufficient XLM balance. | Check operator XLM balance (`checkOperatorBalance`); fund account if needed. Verify RPC connectivity. |
+| `submitSignedTx: transaction <hash> failed on-chain` | The transaction was included in a ledger but Soroban execution failed/trapped (e.g. contract condition violated, such as credit line already closed or health restored). | Yes | **Yes**, typically indicates state moved before submission. | Inspect transaction hash on Stellar Expert / Horizon for exact error code; check if the position cured or was resolved by a borrower. |
+| `submitSignedTx: transaction <hash> did not finalize after 30 attempts` | The transaction was submitted to the network, but polling `getTransaction` timed out (~30s) without confirming SUCCESS or FAILED. | Yes | **Ambiguous** — do NOT immediately resubmit manually. | Query Horizon/RPC for `<hash>` to determine whether it eventually landed. The next scheduled keeper run will safely re-evaluate on-chain state before resubmitting. |
+| `no seized units recoverable for line <id>` | `PledgeVault.liquidate` returned 0 seized units (e.g. units were already seized in a prior run or collateral balance was 0). | No (once line status is updated) | **Yes**, if a prior run already moved collateral. | Verify the credit line's on-chain vault position. |
+| *Vault / credit-line disagreement* (silent skip in `cureExpiry.ts:118`) | In `cure-expiry`, if the units held by `PledgeVault` differ from `CreditLine`'s recorded `pledgedUnits`, the row is skipped silently without throwing an error. | Yes | **Yes** | No manual action required. `sync-collateral` runs every minute and automatically repairs discrepancies between `PledgeVault` and `CreditLine`. |
 
 ## Graceful shutdown
 

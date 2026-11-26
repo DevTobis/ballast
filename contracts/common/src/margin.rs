@@ -127,6 +127,20 @@ mod test {
         assert_eq!(classify(9_500, &t), MarginState::Liquidation);
     }
 
+    #[test]
+    fn classifies_at_every_threshold_boundary() {
+        let t = thresholds();
+        // Thresholds are inclusive on the upper state (`classify` uses `>=`): an LTV exactly at a
+        // threshold is already in the higher state, one bp below it is still in the lower one.
+        assert_eq!(classify(0, &t), MarginState::Healthy);
+        assert_eq!(classify(6_999, &t), MarginState::Healthy);
+        assert_eq!(classify(7_000, &t), MarginState::Warning);
+        assert_eq!(classify(7_999, &t), MarginState::Warning);
+        assert_eq!(classify(8_000, &t), MarginState::MarginCall);
+        assert_eq!(classify(8_999, &t), MarginState::MarginCall);
+        assert_eq!(classify(9_000, &t), MarginState::Liquidation);
+    }
+
     const WARNING_ZERO: &str = "margin: warning_bps must be greater than zero";
     const MARGIN_CALL_ZERO: &str = "margin: margin_call_bps must be greater than zero";
     const LIQUIDATION_ZERO: &str = "margin: liquidation_bps must be greater than zero";
