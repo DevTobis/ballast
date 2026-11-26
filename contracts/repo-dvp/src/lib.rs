@@ -1530,6 +1530,9 @@ impl RepoDvp {
         clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
+        // Like `unwind` and `default_close`: this trade is closed, so its ceiling leaves the
+        // borrower's outstanding leg-2 sum and the next settle approves only what is still owed.
+        release_borrower_due(&env, &trade);
 
         env.events()
             .publish((symbol_short!("mat_def"), id), (lender_units, borrower_units));

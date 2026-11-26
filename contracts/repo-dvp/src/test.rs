@@ -1119,6 +1119,37 @@ fn default_at_maturity_exact_fit() {
 }
 
 #[test]
+fn default_at_maturity_releases_the_trades_share_of_the_borrowers_due() {
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 100 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+    let id = propose(&h, units, cash_amount, 0, maturity);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&h.cash_borrower, &units);
+    MockTokenClient::new(&h.env, &h.usdc).mint(&h.cash_lender, &cash_amount);
+    let repo = RepoDvpClient::new(&h.env, &h.repo);
+    repo.accept_and_settle(&h.cash_borrower, &id);
+
+    let due = |h: &Harness| -> i128 {
+        h.env.as_contract(&h.repo, || {
+            h.env
+                .storage()
+                .persistent()
+                .get(&crate::DataKey::BorrowerDue(h.cash_borrower.clone()))
+                .unwrap_or(0)
+        })
+    };
+    assert!(due(&h) > 0, "settling records the trade's leg-2 ceiling");
+
+    h.env
+        .ledger()
+        .set_timestamp(maturity + repo.maturity_grace_seconds());
+    repo.default_at_maturity(&h.cash_lender, &id);
+
+    assert_eq!(due(&h), 0, "a trade defaulted at maturity no longer counts as owed");
+}
+
+#[test]
 fn default_at_maturity_surplus() {
     let h = setup();
     let units = 100 * PRICE_SCALE;

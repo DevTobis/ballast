@@ -391,9 +391,8 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   (`accept_and_settle`). It therefore approves the running sum of the borrower's outstanding leg-2
   ceilings (`DataKey::BorrowerDue`) and never shortens the expiry (`accept_and_settle`, `write_borrower_due`), rather than
   this trade's ceiling alone, which would strand every earlier trade's keeper or lender `unwind`.
-  The sum is released by `unwind` and `default_close` (`release_borrower_due`, called from `unwind` and `default_close`) but **not** by
-  `default_at_maturity`, so a trade defaulted at maturity stays counted and the next settle
-  approves more than the borrower owes. A closed trade's share also stays spendable in the live
+  The sum is released by `unwind`, `default_close` and `default_at_maturity`
+  (`release_borrower_due`), so a closed trade stops counting toward what the next settle approves. A closed trade's share also stays spendable in the live
   allowance until the next settle or expiry (#843).
 - **Terms.** `propose` holds a trade's term, counted from the proposal to `maturity_at`, to its
   `kind`: 24h for intraday, 48h for overnight, 30 days for term and for open. It also refuses a
