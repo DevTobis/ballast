@@ -21,7 +21,12 @@ export function startReconciliationSchedule(cronExpr = CRON_EXPR): cron.Schedule
   });
 }
 
-if (process.env.VITEST !== "true") {
+if (
+  process.env.VITEST !== "true" &&
+  (import.meta.url === `file://${process.argv[1]}` ||
+    process.argv[1]?.endsWith("dist/index.js") ||
+    process.argv[1]?.endsWith("src/index.ts"))
+) {
   startReconciliationSchedule();
   logger.info({ cronExpr: CRON_EXPR }, "ledger: reconciliation schedule started");
 }
