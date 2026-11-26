@@ -107,5 +107,9 @@ export class RepoDvpClient extends BaseContractClient {
   isAssetEnabled(assetAddress: string): Promise<boolean> {
     return this.read<boolean>("is_asset_enabled", [scAddress(assetAddress)]);
   }
+
+  assetConfig(assetAddress: string): Promise<any> {
+    return this.read<any>("asset_config", [scAddress(assetAddress)]);
+  }
 }
 

@@ -16,7 +16,11 @@ The `RepoDvP` contract provides bilateral repos of Real World Asset (RWA) tokens
 
 ## Contract Events
 
-Every state-changing entry point publishes events with the shape `((Symbol, id), payload)`:
+The trade-lifecycle entry points publish events with the shape `((Symbol, id), payload)`, listed
+below. The asset toggles (`disable`, `enable`, keyed by the asset) and the pause events
+(`paused`, `unpause_queued`, `unpause_cancelled`, `unpause_executed`) are listed with their exact
+shapes in [`../EVENTS.md`](../EVENTS.md). `configure_asset` and the admin setters publish nothing
+today (#207).
 
 | Event | Topics | Data | Emitted by | Description |
 |---|---|---|---|---|
