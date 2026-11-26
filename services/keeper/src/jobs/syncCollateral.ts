@@ -15,9 +15,9 @@
  */
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
-import { loadNetworkConfig } from "@ballast/network-config";
 import type { CreditLineClient, PledgeVaultClient } from "@ballast/contract-clients";
-import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
+import type { KmsSigner } from "@ballast/operator-signing";
+import { signAndSubmit, type NetworkSubmissionConfig } from "./submit.js";
 import { emptyResult, type JobResult } from "./types.js";
 
 export async function runSyncCollateralJob(
@@ -25,6 +25,8 @@ export async function runSyncCollateralJob(
   creditLineClient: CreditLineClient,
   pledgeVaultClient: PledgeVaultClient,
   signer: KmsSigner,
+  /** RPC URL and passphrase from the keeper's startup config; omitted, the environment is read. */
+  network?: NetworkSubmissionConfig,
 ): Promise<JobResult> {
   const result = emptyResult();
 
@@ -47,9 +49,7 @@ export async function runSyncCollateralJob(
       }
 
       const unsignedXdr = await creditLineClient.syncCollateral(signer.publicKey(), contractLine, held);
-      const signedXdr = await signer.sign(unsignedXdr);
-      const network = loadNetworkConfig();
-      await submitSignedTx(network.rpcUrl, network.networkPassphrase, signedXdr);
+      await signAndSubmit(signer, unsignedXdr, network);
       result.processed++;
     } catch (err) {
       result.errors.push({ id: line.id, message: err instanceof Error ? err.message : String(err) });
