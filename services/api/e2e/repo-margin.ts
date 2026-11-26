@@ -35,6 +35,8 @@ function setThresholds(warningBps: number, marginCallBps: number, liquidationBps
     "--admin", required("ADMIN"), "--asset", required("RWA_SAC"), "--price_guard", required("PRICE_GUARD_CID"),
     "--haircut_bps", "500",
     "--thresholds", JSON.stringify({ warning_bps: warningBps, margin_call_bps: marginCallBps, liquidation_bps: liquidationBps }),
+    "--max_cash_per_trade", "1000000000000",
+    "--max_term_seconds", "2592000",
   ]);
 }
 
