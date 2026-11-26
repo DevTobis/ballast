@@ -165,6 +165,12 @@ Fix:
    ```
 2. For specific persistent source keys, include the key in a restore footprint transaction or trigger a re-publish once the instance is restored. Regular publishing automatically keeps active keys extended via `extend_ttl`.
 
+## Keeper job errors and transaction failures
+
+Keeper jobs (such as `cure-expiry`, `repo-unwind`, `sync-collateral`) and transaction submissions via `submitSignedTx` report structured errors for conditions like missing lender accounts, on-chain execution traps, submission timeouts, and collateral discrepancies.
+
+For the full error reference table—including causes, whether runs retry, which errors are safe to ignore, and recommended operator actions—see [services/keeper Troubleshooting](services/keeper/README.md#troubleshooting-job-errors).
+
 ## Still stuck
 
 Open a bug report with the exact error, your network, commit hash, and Node and `stellar` versions.

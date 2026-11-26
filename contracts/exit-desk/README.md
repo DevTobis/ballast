@@ -67,7 +67,19 @@ Matches `quote_with_ok_price_applies_spread` in `contracts/exit-desk/src/test.rs
     `"exit-desk: exceeds per-holder daily cap"`.
   - Resets automatically upon rolling into the next UTC day.
 
-### 2. Desk Inventory Cap (`desk_inventory_cap`)
+### 2. Desk Daily Volume Cap (`desk_daily_cap`)
+
+* **Storage Key**: `DataKey::DeskDailyUsed(asset, day_bucket)` (temporary storage, ~2 days of ledgers per write, like `DailyUsed`)
+* **Bucket Calculation**:
+  $$\text{day\_bucket} = \left\lfloor \frac{\text{ledger\_timestamp}}{86{,}400} \right\rfloor$$
+* **Mechanism**:
+  - Partitions aggregate desk volume across all holders into 86,400-second UTC calendar day buckets.
+  - Each exit increments `desk_daily_used` by `units`.
+  - If `new_desk_daily_used > desk_daily_cap`, the transaction panics with:
+    `"exit-desk: exceeds desk daily cap"`.
+  - Resets automatically upon rolling into the next UTC day. Withdrawing RWA inventory does not restore daily volume capacity.
+
+### 3. Desk Inventory Cap (`desk_inventory_cap`)
 
 * **Storage Key**: `DataKey::Inventory(asset)`
 * **Mechanism**:
@@ -100,11 +112,13 @@ stellar contract invoke \
   --price_guard "$PRICE_GUARD_CID" \
   --spread_bps 25 \
   --per_holder_daily_cap $((10000 * UNIT)) \
+  --desk_daily_cap $((50000 * UNIT)) \
   --desk_inventory_cap $((1000000 * UNIT))
 ```
 
 * `--spread_bps 25`: 0.25% exit fee.
 * `--per_holder_daily_cap`: Maximum 10,000 RWA units per holder per UTC day.
+* `--desk_daily_cap`: Maximum 50,000 RWA units aggregated across all holders per UTC day.
 * `--desk_inventory_cap`: Maximum 1,000,000 RWA units accumulated before operator rebalance is required.
 
 #### Changing an existing asset's configuration (48h timelock)
@@ -115,10 +129,10 @@ stellar contract invoke \
 |---|---|
 | First listing of the asset | `configure_asset`, immediate |
 | Same values (re-running the script) | `configure_asset`, immediate |
-| Wider spread (`spread_bps` up), lower `per_holder_daily_cap` or `desk_inventory_cap` | `configure_asset`, immediate |
+| Wider spread (`spread_bps` up), lower `per_holder_daily_cap`, `desk_daily_cap` or `desk_inventory_cap` | `configure_asset`, immediate |
 | Different `price_guard` | `queue_configure_asset`, then `execute_configure_asset` after 48h |
 | Narrower spread (`spread_bps` down) | timelocked, as above |
-| Higher `per_holder_daily_cap` or `desk_inventory_cap` | timelocked, as above |
+| Higher `per_holder_daily_cap`, `desk_daily_cap` or `desk_inventory_cap` | timelocked, as above |
 
 If a call changes several fields and any one of them loosens, the whole change is timelocked.
 `configure_asset` refuses it with
@@ -134,7 +148,8 @@ are worth and drain the float in one transaction. The delay and the `cfg_q` even
 stellar contract invoke --id "$EXIT_DESK_CID" --source admin --network "$NETWORK" \
   -- queue_configure_asset --admin "$ADMIN" --asset "$RWA_SAC" \
   --price_guard "$NEW_PRICE_GUARD_CID" --spread_bps 25 \
-  --per_holder_daily_cap $((10000 * UNIT)) --desk_inventory_cap $((1000000 * UNIT))
+  --per_holder_daily_cap $((10000 * UNIT)) --desk_daily_cap $((50000 * UNIT)) \
+  --desk_inventory_cap $((1000000 * UNIT))
 
 # Inspect while pending (anyone).
 stellar contract invoke --id "$EXIT_DESK_CID" --network "$NETWORK" -- pending_config --id "$ID"
@@ -285,6 +300,7 @@ All events are emitted during the transaction that executes the state transition
 | Insufficient float | `"exit-desk: insufficient USDC float"` | `exit` whose payout is larger than the desk's USDC balance. Checked before the holder's RWA moves. |
 | Slippage | `"exit-desk: usdc_out below min_usdc_out (slippage)"` | Execution output lower than holder's minimum tolerance. |
 | Holder Daily Cap | `"exit-desk: exceeds per-holder daily cap"` | Holder exceeds daily RWA allowance for the UTC day. |
+| Desk Daily Cap | `"exit-desk: exceeds desk daily cap"` | All holders together exceed the asset's daily RWA allowance for the UTC day. |
 | Desk Inventory Cap| `"exit-desk: exceeds desk inventory cap"` | Total RWA inventory in desk exceeds facility capacity. |
 
 ---

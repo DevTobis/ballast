@@ -21,6 +21,8 @@ export interface OnChainExitDeskAssetConfig {
   priceGuard: string;
   spreadBps: number;
   perHolderDailyCap: bigint;
+  /** Units accepted per UTC day across all holders. */
+  deskDailyCap: bigint;
   deskInventoryCap: bigint;
 }
 
@@ -46,6 +48,12 @@ export class ExitDeskClient extends BaseContractClient {
     return this.read<bigint>("daily_used", [scAddress(holder), scAddress(assetAddress)]);
   }
 
+  /** Units exited for the asset today across all holders (counted against `deskDailyCap`). */
+  deskDailyUsed(assetAddress: string): Promise<bigint> {
+    return this.read<bigint>("desk_daily_used", [scAddress(assetAddress)]);
+  }
+
+  /** `[holderRoom, deskRoom]`; `deskRoom` is the smaller of the desk daily and inventory room. */
   capacity(holder: string, assetAddress: string): Promise<[bigint, bigint]> {
     return this.read<[bigint, bigint]>("capacity", [scAddress(holder), scAddress(assetAddress)]);
   }
