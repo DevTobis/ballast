@@ -72,9 +72,20 @@
 //! In addition, a public `extend_ttl(line)` entry point allows anyone (including keepers or users) to extend
 //! the TTL of a dormant credit line before it archives.
 //!
+//! **Liquidation surplus is pulled, not pushed (#149).** `close_liquidated` books the outcome
+//! without moving USDC: any collateral value above the debt is recorded in `SurplusOwed(line)` and
+//! the line is closed, so a lender whose USDC balance is short (or who would rather not pay) can
+//! no longer leave the line `Liquidating` to avoid the payment. The borrower then calls
+//! `claim_surplus`, which pulls exactly that amount from the lender to the borrower through an
+//! allowance the lender granted this contract (`approve` on the USDC token). The claim is zeroed
+//! before the transfer, so it can succeed only once. Until the lender approves (and holds) the
+//! amount, the claim stays recorded and readable through `surplus_owed(line)`: the contract makes
+//! the debt visible and collectable, but it cannot force a lender to fund it.
+//!
 //! **Events.** Like `PledgeVault`, state changes publish one event with the shape
 //! `((Symbol, line), payload)`: `drawn` from `draw`, `repaid` from `repay`, `line_closed` from
-//! `close_liquidated` and `undrawn_withdrawn` from `withdraw_undrawn` (which moves the lender's
+//! `close_liquidated`, `surplus_claimed` from `claim_surplus` and `undrawn_withdrawn` from
+//! `withdraw_undrawn` (which moves the lender's
 //! funded exposure and so needs an on-chain trace for the console and indexer). See `README.md`'s
 //! events table for the exact topics and payloads:
 //! - `drawn`: `((Symbol("drawn"), line: u64), (amount: i128, to: Address, drawn_total: i128, ltv_bps: u32))`
@@ -266,6 +277,8 @@ enum DataKey {
     /// Platform fees repaid on a line that the treasury has not withdrawn yet.
     FeeClaimable(u64),
     Liquidation(u64),
+    /// Liquidation surplus booked by `close_liquidated` and not yet pulled with `claim_surplus`.
+    SurplusOwed(u64),
 }
 
 fn read_claimable(env: &Env, line: u64) -> i128 {
@@ -339,6 +352,25 @@ fn write_liquidation(env: &Env, line: u64, record: &LiquidationRecord) {
     ttl::extend_persistent(env, &key);
 }
 
+fn read_surplus_owed(env: &Env, line: u64) -> i128 {
+    let key = DataKey::SurplusOwed(line);
+    let amount = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        ttl::extend_persistent(env, &key);
+    }
+    amount
+}
+
+fn write_surplus_owed(env: &Env, line: u64, amount: i128) {
+    let key = DataKey::SurplusOwed(line);
+    if amount > 0 {
+        env.storage().persistent().set(&key, &amount);
+        ttl::extend_persistent(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
 fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
     env.storage()
         .instance()
@@ -378,6 +410,13 @@ fn compute_ltv(env: &Env, line: &Line) -> LtvView {
 
 /// Same as `compute_ltv`, also returning the guarded price the view was computed from.
 fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
+    read_ltv_with_units(env, line, line.pledged_units)
+}
+
+/// `read_ltv` as if the line had `units` of collateral pledged instead of `line.pledged_units`.
+/// Same config, price and debt, so `ltv_after` and `poke` can never disagree about a given
+/// collateral figure.
+fn read_ltv_with_units(env: &Env, line: &Line, units: i128) -> (LtvView, i128) {
     let config = read_asset_config(env, &line.asset);
     let guarded = PriceGuardClient::new(env, &config.price_guard).guarded_price(&line.asset);
 
@@ -387,8 +426,7 @@ fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
         + interest_delta(line, now)
         + line.accrued_fee
         + fee_delta(line, now);
-    let collateral_value =
-        risk::collateral_value(line.pledged_units, guarded.value, config.haircut_bps);
+    let collateral_value = risk::collateral_value(units, guarded.value, config.haircut_bps);
     let ltv_bps = risk::ltv_bps(debt, collateral_value);
     let margin_state = margin::classify(ltv_bps, &config.thresholds);
 
@@ -781,6 +819,18 @@ impl CreditLine {
         compute_ltv(&env, &state)
     }
 
+    /// Read-only: the `ltv` view as if the line had `new_units` of collateral instead of what is
+    /// pledged now, computed with this contract's own haircut, thresholds, PriceGuard and debt
+    /// (interest and platform fee included). `PledgeVault::release` asks this before letting
+    /// collateral go, so the vault keeps no second copy of the risk config that could drift from
+    /// the one `poke`, `draw` and `liquidate` use (#180).
+    pub fn ltv_after(env: Env, line: u64, new_units: i128) -> LtvView {
+        ttl::extend_instance(&env);
+        assert!(new_units >= 0, "credit-line: units cannot be negative");
+        let state = read_line(&env, line);
+        read_ltv_with_units(&env, &state, new_units).0
+    }
+
     /// Permissionless: recomputes the margin state via a fresh price read and persists it, also
     /// arming (or clearing) the breach flag `liquidate` needs. Anyone may call this — it can only
     /// ever make on-chain state match a fresh price read, never move funds.
@@ -893,9 +943,11 @@ impl CreditLine {
     ///
     /// The collateral is valued at the guarded price confirmed when the breach was flagged
     /// (`LiquidationRecord`), not at a price the lender supplies, so the lender cannot understate
-    /// what they received. If it is worth more than the debt the lender pays the difference to the
-    /// borrower in USDC in this same call (that is why it needs the lender's auth); if it is worth
-    /// less, the gap is recorded as the lender's shortfall. Principal that was lent out and not
+    /// what they received. If it is worth more than the debt the difference is **booked**, not
+    /// paid: it is recorded in `SurplusOwed(line)` and the borrower pulls it with `claim_surplus`
+    /// using an allowance the lender granted this contract, so a lender with an insufficient USDC
+    /// balance can still close (#149). If it is worth less, the gap is recorded as the lender's
+    /// shortfall. Principal that was lent out and not
     /// repaid is written off the line's funded balance, so what is left in `funded` is exactly the
     /// USDC still held here and withdrawable with `withdraw_undrawn`.
     pub fn close_liquidated(env: Env, lender: Address, line: u64) {
@@ -933,15 +985,6 @@ impl CreditLine {
         let surplus = (recovered - record.debt).max(0);
         let shortfall = (record.debt - recovered).max(0);
 
-        if surplus > 0 {
-            let config = read_asset_config(&env, &state.asset);
-            token::Client::new(&env, &config.usdc).transfer(
-                &lender,
-                muxed(&state.borrower),
-                &surplus,
-            );
-        }
-
         state.funded -= state.drawn;
         state.drawn = 0;
         state.accrued_interest = 0;
@@ -959,6 +1002,9 @@ impl CreditLine {
         record.surplus = surplus;
         record.shortfall = shortfall;
         write_liquidation(&env, line, &record);
+        // Booked, not paid: the borrower pulls it with `claim_surplus`. No USDC moves here, so a
+        // lender whose balance is short can still close the line.
+        write_surplus_owed(&env, line, surplus);
 
         env.events().publish(
             (Symbol::new(&env, "line_closed"), line),
@@ -966,11 +1012,62 @@ impl CreditLine {
         );
     }
 
+    /// Pays the borrower the liquidation surplus booked by `close_liquidated`, pulling it from the
+    /// lender (#149).
+    ///
+    /// The lender must have granted this contract an allowance on the line's USDC token
+    /// (`approve(spender = CreditLine, amount >= surplus)`); the call then uses
+    /// `transfer_from(lender, borrower, surplus)`. The outstanding amount is zeroed *before* the
+    /// transfer, so a repeated or re-entrant call finds nothing owed and the surplus is paid at most
+    /// once; if the transfer fails (no allowance or balance) the whole call reverts and the claim
+    /// stays recorded. A break-even or shortfall close books nothing, so there is nothing to claim.
+    pub fn claim_surplus(env: Env, borrower: Address, line: u64) {
+        ttl::extend_instance(&env);
+        borrower.require_auth();
+
+        let state = read_line(&env, line);
+        assert_eq!(
+            state.borrower, borrower,
+            "credit-line: not this line's borrower"
+        );
+        assert_eq!(
+            state.status,
+            LineStatus::Closed,
+            "credit-line: line is not closed"
+        );
+
+        let owed = read_surplus_owed(&env, line);
+        assert!(owed > 0, "credit-line: no surplus to claim");
+
+        // Consume the claim before moving USDC: the surplus can be paid out only once even if the
+        // token call were to re-enter this contract.
+        write_surplus_owed(&env, line, 0);
+
+        let config = read_asset_config(&env, &state.asset);
+        token::Client::new(&env, &config.usdc).transfer_from(
+            &env.current_contract_address(),
+            &state.lender,
+            &borrower,
+            &owed,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "surplus_claimed"), line),
+            (borrower, state.lender, owed),
+        );
+    }
+
+    /// Liquidation surplus booked by `close_liquidated` and not yet pulled by the borrower.
+    pub fn surplus_owed(env: Env, line: u64) -> i128 {
+        ttl::extend_instance(&env);
+        read_surplus_owed(&env, line)
+    }
+
     /// Closes a fully repaid `Open` line (#130), so it stops accepting draws and funding and the
     /// keeper and indexer can treat it as finished. Either the lender or the borrower may call it.
     ///
     /// Requires `status == Open` (a `Liquidating` line can only be finished by
-    /// `close_liquidated`, which books the recovery and pays the surplus), and nothing left on the
+    /// `close_liquidated`, which books the recovery and the borrower's surplus claim), and nothing left on the
     /// line: no principal, accrued interest or accrued fee, and no funding (the lender withdraws it
     /// first with `withdraw_undrawn`). Repaid interest and fees already credited stay claimable
     /// through `withdraw_interest` / `claim_fee`, and pledged collateral can still be released from
@@ -1213,6 +1310,10 @@ impl CreditLine {
         if env.storage().persistent().has(&liq_key) {
             ttl::extend_persistent(&env, &liq_key);
         }
+        let surplus_key = DataKey::SurplusOwed(line);
+        if env.storage().persistent().has(&surplus_key) {
+            ttl::extend_persistent(&env, &surplus_key);
+        }
     }
 }
 
@@ -1236,6 +1337,7 @@ mod test {
         #[contracttype]
         enum DataKey {
             Balance(Address),
+            Allowance(Address, Address),
         }
 
         #[contractimpl]
@@ -1255,17 +1357,42 @@ mod test {
 
             pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
                 from.require_auth();
-                let to_addr = to.address();
-                let from_key = DataKey::Balance(from);
-                let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
-                assert!(from_bal >= amount, "mock-token: insufficient balance");
-                let to_key = DataKey::Balance(to_addr);
-                let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+                move_balance(&env, &from, &to.address(), amount);
+            }
+
+            pub fn approve(env: Env, from: Address, spender: Address, amount: i128) {
+                from.require_auth();
                 env.storage()
                     .instance()
-                    .set(&from_key, &(from_bal - amount));
-                env.storage().instance().set(&to_key, &(to_bal + amount));
+                    .set(&DataKey::Allowance(from, spender), &amount);
             }
+
+            pub fn transfer_from(
+                env: Env,
+                spender: Address,
+                from: Address,
+                to: Address,
+                amount: i128,
+            ) {
+                spender.require_auth();
+                let key = DataKey::Allowance(from.clone(), spender);
+                let allowance: i128 = env.storage().instance().get(&key).unwrap_or(0);
+                assert!(allowance >= amount, "mock-token: insufficient allowance");
+                env.storage().instance().set(&key, &(allowance - amount));
+                move_balance(&env, &from, &to, amount);
+            }
+        }
+
+        fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) {
+            let from_key = DataKey::Balance(from.clone());
+            let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
+            assert!(from_bal >= amount, "mock-token: insufficient balance");
+            let to_key = DataKey::Balance(to.clone());
+            let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&from_key, &(from_bal - amount));
+            env.storage().instance().set(&to_key, &(to_bal + amount));
         }
     }
 
@@ -2401,23 +2528,119 @@ mod test {
     }
 
     #[test]
-    fn closing_with_a_surplus_pays_the_borrower_from_the_lender() {
+    fn a_lender_with_no_usdc_can_close_and_the_surplus_is_booked_for_the_borrower() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         // $0.64: 1,000 units are worth 640 against 600 of debt (LTV 93.75%, past liquidation).
         let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        assert_eq!(h.token.balance(&h.lender), 0);
         let borrower_before = h.token.balance(&h.borrower);
-        h.token.mint(&h.lender, &(40 * PRICE_SCALE)); // the lender needs USDC to pay the surplus
 
         // The price recovering afterwards must not change the outcome: it is frozen at liquidation.
         h.price_guard.set_price(&(2 * PRICE_SCALE), &PriceStatus::Ok);
         h.credit_line.close_liquidated(&h.lender, &id);
 
         let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
         assert_eq!(record.recovered, 640 * PRICE_SCALE);
         assert_eq!(record.surplus, 40 * PRICE_SCALE);
         assert_eq!(record.shortfall, 0);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+        assert_eq!(h.credit_line.surplus_owed(&id), 40 * PRICE_SCALE);
+        // Closing moves no USDC: the borrower is paid when they claim.
+        assert_eq!(h.token.balance(&h.borrower), borrower_before);
+
+        h.token.mint(&h.lender, &(40 * PRICE_SCALE));
+        h.token
+            .approve(&h.lender, &h.credit_line.address, &(40 * PRICE_SCALE));
+        h.credit_line.claim_surplus(&h.borrower, &id);
+
         assert_eq!(h.token.balance(&h.borrower) - borrower_before, 40 * PRICE_SCALE);
         assert_eq!(h.token.balance(&h.lender), 0);
+        assert_eq!(h.credit_line.surplus_owed(&id), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: no surplus to claim")]
+    fn claim_surplus_pays_exactly_once() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        let borrower_before = h.token.balance(&h.borrower);
+        h.token.mint(&h.lender, &(80 * PRICE_SCALE));
+        h.token
+            .approve(&h.lender, &h.credit_line.address, &(80 * PRICE_SCALE));
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        h.credit_line.claim_surplus(&h.borrower, &id);
+        assert_eq!(h.token.balance(&h.borrower) - borrower_before, 40 * PRICE_SCALE);
+        assert_eq!(h.credit_line.surplus_owed(&id), 0);
+        // A second claim finds nothing owed, even though the allowance still covers 40 more.
+        h.credit_line.claim_surplus(&h.borrower, &id);
+    }
+
+    #[test]
+    fn claim_surplus_without_an_allowance_fails_and_keeps_the_claim() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        h.token.mint(&h.lender, &(40 * PRICE_SCALE));
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        // The lender has the balance but never approved the pull.
+        assert!(h.credit_line.try_claim_surplus(&h.borrower, &id).is_err());
+        assert_eq!(h.credit_line.surplus_owed(&id), 40 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: not this line's borrower")]
+    fn only_the_borrower_can_claim_the_surplus() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        h.credit_line.close_liquidated(&h.lender, &id);
+        h.credit_line.claim_surplus(&h.lender, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line is not closed")]
+    fn the_surplus_cannot_be_claimed_before_close() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        h.credit_line.claim_surplus(&h.borrower, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: no surplus to claim")]
+    fn a_break_even_close_leaves_nothing_to_claim() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 60 * PRICE_SCALE / 100);
+        h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.credit_line.liquidation_record(&id).surplus, 0);
+        assert_eq!(h.credit_line.surplus_owed(&id), 0);
+        h.credit_line.claim_surplus(&h.borrower, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: no surplus to claim")]
+    fn a_shortfall_close_has_no_surplus_for_the_borrower() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        // $0.50: 1,000 units are worth 500 against 600 of debt.
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        h.credit_line.close_liquidated(&h.lender, &id);
+        let record = h.credit_line.liquidation_record(&id);
+        assert_eq!(record.surplus, 0);
+        assert_eq!(record.shortfall, 100 * PRICE_SCALE);
+        assert_eq!(h.credit_line.surplus_owed(&id), 0);
+        h.credit_line.claim_surplus(&h.borrower, &id);
+    }
+
+    /// #1264's vault check still applies: a lender cannot book a surplus claim (or close at all)
+    /// while the seized collateral is still in the vault.
+    #[test]
+    fn no_surplus_is_booked_while_collateral_is_still_in_the_vault() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        h.vault.set_position_units(&id, &h.asset, &(1_000 * PRICE_SCALE));
+        assert!(h.credit_line.try_close_liquidated(&h.lender, &id).is_err());
+        assert_eq!(h.credit_line.surplus_owed(&id), 0);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Liquidating);
     }
 
     #[test]
@@ -3770,9 +3993,11 @@ mod test {
         assert_eq!(frozen.debt, 600 * PRICE_SCALE);
 
         let borrower_before = h.token.balance(&h.borrower);
-        // Full surplus = 650 - 600 = 50 (not shrunk to 40 by unpaid platform fee).
-        h.token.mint(&h.lender, &(50 * PRICE_SCALE));
+        // Full surplus = 650 - 600 = 50 (not shrunk to 40 by unpaid platform fee). Closing only
+        // books it (#149): the borrower is paid when they pull it with `claim_surplus`.
         h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.token.balance(&h.borrower), borrower_before);
+        assert_eq!(h.credit_line.surplus_owed(&id), 50 * PRICE_SCALE);
 
         let closed = h.credit_line.liquidation_record(&id);
         assert!(closed.closed);
@@ -3780,6 +4005,11 @@ mod test {
         assert_eq!(closed.recovered, 650 * PRICE_SCALE);
         assert_eq!(closed.surplus, 50 * PRICE_SCALE);
         assert_eq!(closed.shortfall, 0);
+
+        h.token.mint(&h.lender, &(50 * PRICE_SCALE));
+        h.token
+            .approve(&h.lender, &h.credit_line.address, &(50 * PRICE_SCALE));
+        h.credit_line.claim_surplus(&h.borrower, &id);
         assert_eq!(
             h.token.balance(&h.borrower) - borrower_before,
             50 * PRICE_SCALE

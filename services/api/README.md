@@ -1,7 +1,11 @@
 # services/api
 
 REST API for the console and for institutions. Two ways to authenticate; everything except `/healthz`,
-`GET /v1/assets*` and `GET /v1/public/markets` needs one of them.
+`/v1/openapi.json`, `GET /v1/assets*` and `GET /v1/public/markets` needs one of them.
+
+## OpenAPI specification
+
+An OpenAPI 3.1 document is served at `GET /v1/openapi.json` (unauthenticated). It describes all transaction-building POST routes (`/v1/credit-lines`, `/v1/exit`, `/v1/repo`), documenting request body shapes, 201 response envelopes (`{ xdr, txHash, ... }`), and field formats. All monetary amounts are documented as decimal strings (representing 7-decimal fixed-point integers scaled by 10^7, matching Stellar stroop format).
 
 ## Session (SEP-10)
 
@@ -96,6 +100,112 @@ pnpm --filter @ballast/db compliance clear <partyId> <reviewer> "reviewed: diffe
 ```
 
 A manual clear is persistent for the reviewed entity matches (`entNum`s). When screening re-runs after the 24-hour TTL (`SCREENING_TTL_MS`), previously reviewed and cleared matches do not re-hold the party, preventing false positives from recurring daily. If OFAC lists a new match under a different `entNum`, the party is held again for review.
+
+### Gated routes
+
+With `COMPLIANCE_ENFORCED=true` (the default in production), the compliance `preHandler` hook screens the calling party and any counterparty named in the request body before the route handler executes. If `COMPLIANCE_ENFORCED=false` (e.g. local dev), the hook is bypassed.
+
+| Gated Route | Method | Caller Screened | Counterparty Field Screened | Description |
+| --- | --- | --- | --- | --- |
+| `/v1/credit-lines` | `POST` | Lender (`request.partyId`) | `body.borrowerId` | Opening a credit line |
+| `/v1/credit-lines/:id/fund` | `POST` | Lender (`request.partyId`) | None | Funding credit line with USDC |
+| `/v1/credit-lines/:id/pledges` | `POST` | Borrower (`request.partyId`) | None | Depositing collateral units |
+| `/v1/credit-lines/:id/draws` | `POST` | Borrower (`request.partyId`) | None | Drawing USDC against credit line |
+| `/v1/exit/quotes` | `POST` | Asset holder (`request.partyId`) | None | Requesting an exit desk quote |
+| `/v1/exit/quotes/:id/execute` | `POST` | Asset holder (`request.partyId`) | None | Executing an exit quote |
+| `/v1/repo/proposals` | `POST` | Cash lender (`request.partyId`) | `body.cashBorrowerId` | Proposing a repo trade |
+| `/v1/repo/proposals/:id/accept` | `POST` | Cash borrower (`request.partyId`) | None | Accepting repo proposal (leg 1) |
+
+### Non-gated routes
+
+Routes that return money or allow a party to exit risk are intentionally **not** gated, ensuring a party can always settle obligations or withdraw funds:
+- `POST /v1/credit-lines/:id/repayments` (repaying borrowed debt)
+- `DELETE /v1/credit-lines/:id/pledges/:pledgeId` (releasing collateral)
+- `POST /v1/credit-lines/:id/withdrawals` (withdrawing undrawn principal or interest)
+- `POST /v1/credit-lines/:id/close-liquidation` (lender closing liquidated line)
+- `POST /v1/repo/trades/:id/unwind` (unwinding repo at maturity)
+- `POST /v1/repo/trades/:id/top-ups` (adding collateral to cure repo margin call)
+- `POST /v1/tx/submit` (transaction submission is not gated today)
+- Read-only queries (`GET /v1/*`)
+- Webhook management and API key management
+
+### Compliance hold responses
+
+When a party is held or screening cannot proceed, the API returns:
+
+| HTTP Status | Error Message | Meaning | Resolution |
+| --- | --- | --- | --- |
+| `403` | `party not found` | The authenticated caller or the screened counterparty ID does not exist in the database. | Register or verify the party ID. |
+| `403` | `compliance hold: KYB is <status>` | The party's KYB verification is not `approved` (e.g. `pending`, `rejected`, `suspended`). | Contact platform operator. Operators update status via `pnpm --filter @ballast/db compliance kyb <partyId> approved <provider> <ref>`. |
+| `403` | `compliance hold: sanctions screening needs review` | The party's legal name or Stellar account matched an entry on the OFAC SDN list and has not been cleared. | Contact platform operator. Operators review matches and clear false positives via `pnpm --filter @ballast/db compliance clear <partyId> <reviewer> "<reason>"`. |
+| `503` | `sanctions list unavailable: <detail>` | The OFAC SDN list could not be loaded and there is no last good copy recent enough to keep screening against. Fails closed. | Wait for SDN list sync or check upstream network connectivity. |
+
+### Screening cache TTL and false-positive resolution
+
+- **24-hour TTL (`SCREENING_TTL_MS`)**: Clear screening results are cached and reused for 24 hours (`24 * 3600 * 1000` ms). After 24 hours, the next gated request triggers a fresh screen against the latest OFAC SDN list.
+- **Match persistence**: A sanctions `match` is never aged out or expired automatically. It persists as a hold until manually reviewed.
+- **Cleared matches**: When an operator clears a match with `pnpm --filter @ballast/db compliance clear ...`, the reviewed OFAC entity IDs (`entNum`s) are recorded. Subsequent 24-hour screenings ignore these reviewed entities so false positives do not recur daily.
+
+## Statuses and Lifecycles
+
+This section details the state machines for the core domain entities: credit lines, collateral pledges, exit quotes, repo trades, and transaction intents. Values match the database column definitions and JSDoc comments in `packages/db/src/schema.ts`.
+
+### Credit Line (`credit_line`)
+
+Possible statuses: `pending_open`, `open`, `liquidating`, `closed`, `failed`.
+
+| Status | Type | Transition Trigger | Permitted Operations & Route Guards |
+| --- | --- | --- | --- |
+| `pending_open` | Initial | Created by `POST /v1/credit-lines` while the on-chain opening transaction is prepared. | Waiting for on-chain settlement. Any action requiring an active line (`fund`, `draws`, `repayments`, `pledges`, `withdrawals`) returns `409 credit line has not settled on-chain yet`. |
+| `open` | Active | Set by `applySuccess` in `intents.ts` upon `credit_line.open` transaction settling on-chain (`contractLineId` assigned). | Permitted: `POST .../fund`, `POST .../draws`, `POST .../repayments`, `POST .../pledges`, `DELETE .../pledges/:pledgeId`, `POST .../withdrawals`. Cannot close liquidation: returns `409 credit line is open, not liquidating`. |
+| `liquidating` | Remedial | Set by `services/keeper/src/jobs/cureExpiry.ts` when a margin call grace period expires uncured. | Collateral is seized in kind. Only permitted route: `POST .../close-liquidation` (lender closes line). Other routes return `409 credit line is liquidating, not open` or similar. |
+| `closed` | Terminal | Set by `applySuccess` in `intents.ts` upon `credit_line.close_liquidated` transaction settling on-chain. | Terminal state (`closedAt` set). No further credit line operations permitted (`409 credit line is closed, not liquidating`). |
+| `failed` | Terminal | Set by `applyFailure` in `intents.ts` if the initial `credit_line.open` transaction fails on-chain. | Terminal state. No operations permitted. |
+
+### Pledge (`pledge`)
+
+Possible statuses: `pending`, `active`, `pending_release`, `released`, `failed`.
+
+| Status | Type | Transition Trigger | Permitted Operations & Route Guards |
+| --- | --- | --- | --- |
+| `pending` | Initial | Created by `POST /v1/credit-lines/:id/pledges` while the deposit transaction is prepared. | Waiting for on-chain deposit. Release is blocked: `DELETE .../pledges/:pledgeId` returns `409 pledge is pending, not active`. |
+| `active` | Active | Set by `applySuccess` in `intents.ts` upon `pledge.create` transaction settling on-chain. | Active collateral backing the credit line. Release permitted via `DELETE .../pledges/:pledgeId` provided post-release LTV remains healthy (< 70%). |
+| `pending_release` | In-Flight | Set by `DELETE /v1/credit-lines/:id/pledges/:pledgeId` while the release transaction is being submitted. | Release in-flight. Further release requests return `409 pledge is pending_release, not active`. Reverts to `active` via `applyFailure` if the release transaction fails on-chain. |
+| `released` | Terminal | Set by `applySuccess` in `intents.ts` upon `pledge.release` transaction settling on-chain. | Terminal state. Collateral has left the vault. Cannot be released again (`409 pledge is released, not active`). |
+| `failed` | Terminal | Set by `applyFailure` in `intents.ts` if the initial `pledge.create` deposit transaction fails on-chain. | Terminal state. No operations permitted. |
+
+### Exit Quote (`exit_quote`)
+
+Possible statuses: `open`, `expired`, `filled`.
+
+| Status | Type | Transition Trigger | Permitted Operations & Route Guards |
+| --- | --- | --- | --- |
+| `open` | Initial | Created by `POST /v1/exit/quotes` with on-chain price and payout calculated from ExitDesk contract. | Can be executed via `POST /v1/exit/quotes/:id/execute` before `expiresAt`. If `expiresAt < now`, execution transitions quote to `expired` and returns `409 quote expired`. Disallows duplicate in-flight executes: returns `409 an execute for this quote is already pending`. |
+| `expired` | Terminal | Set by `POST /v1/exit/quotes/:id/execute` when it is called after `expiresAt` (`routes/exit.ts`). Nothing else expires a quote, so an unexecuted quote stays `open` in the table after `expiresAt`. | Terminal state. Cannot be executed (`409 quote is expired` or `409 quote expired`). |
+| `filled` | Terminal | Set by `applySuccess` in `intents.ts` upon `exit.execute` transaction settling on-chain (`exit_fill` recorded). | Terminal state. Cannot be re-executed (`409 quote is filled`). |
+
+### Repo Trade (`repo_trade`)
+
+Possible statuses: `proposed`, `settled`, `unwound`, `defaulted`, `failed`.
+
+| Status | Type | Transition Trigger | Permitted Operations & Route Guards |
+| --- | --- | --- | --- |
+| `proposed` | Initial | Created by `POST /v1/repo/proposals` by the cash lender while proposal transaction is prepared. | Can be accepted by the cash borrower via `POST /v1/repo/proposals/:id/accept` once `contractTradeId` has settled on-chain. If proposal tx has not settled: `409 repo proposal has not settled on-chain yet`. Unwind or top-up returns `409 trade is proposed, not settled`. |
+| `settled` | Active | Set by `applySuccess` in `intents.ts` upon `repo.accept` (leg 1) settling on-chain (`startLedger` and `leg1Tx` recorded). | Active trade. Permitted operations: `POST /v1/repo/trades/:id/top-ups` (cure margin call) and `POST /v1/repo/trades/:id/unwind` (at or after maturity). Cannot accept again (`409 trade is settled`). |
+| `unwound` | Terminal | Set by `applySuccess` in `intents.ts` upon `repo.unwind` (leg 2) settling on-chain (`leg2Tx` recorded). | Terminal state. Collateral and cash returned. Further unwinds or top-ups return `409 trade is unwound, not settled`. |
+| `defaulted` | Terminal | Set by the keeper: `repoMargin.ts` after it calls `default_close` once a margin call's cure deadline passes, and `repoMargin.ts` / `repoUnwind.ts` when they find the trade already `Defaulted` on-chain (for example after `default_at_maturity`). | Terminal state. Collateral retained by lender. No further operations permitted (`409 trade is defaulted, not settled`). |
+| `failed` | Terminal | Set by `applyFailure` in `intents.ts` if `repo.propose` transaction fails on-chain. | Terminal state. No operations permitted. |
+
+### Transaction Intent (`tx_intent`)
+
+Possible statuses: `pending`, `settled`, `failed`, `expired`.
+
+| Status | Type | Transition Trigger | Permitted Operations & Route Guards |
+| --- | --- | --- | --- |
+| `pending` | Initial | Created by `recordIntent` in `intents.ts` when unsigned transaction envelope XDR is generated. | Awaits signature and submission. `POST /v1/tx/submit` accepts only `pending` intents; duplicate submissions or unknown intents are rejected. `POST /v1/tx/:hash/settle` polls status. |
+| `settled` | Terminal | Set by `applySuccess` in `intents.ts` when transaction inclusion in a ledger is confirmed by Stellar RPC (`settledAt` and `ledger` recorded). | Successfully closed transaction. Books updated. |
+| `failed` | Terminal | Set by `applyFailure` in `intents.ts` when transaction simulation or execution fails on-chain (`error` recorded). | Optimistic row updates rolled back. |
+| `expired` | Terminal | Set by `sweepPendingIntents` (`intents.ts`, run on an interval from `index.ts`) when RPC still has no record of the transaction `INTENT_EXPIRY_MS` (the unsigned-tx timeout plus 120 s) after the intent was created; `applyFailure` then rolls the optimistic rows back in the same database transaction. | Intent timed out without inclusion. |
 
 ## Amount and unit conventions
 

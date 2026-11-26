@@ -53,6 +53,11 @@ describe("CreditLineClient", () => {
     expect(result).toBeDefined();
   });
 
+  it("ltvAfter() simulates a read and does not throw", async () => {
+    const result = await client.ltvAfter(1n, 500n);
+    expect(result).toBeDefined();
+  });
+
   it("owed() simulates a read and does not throw", async () => {
     const result = await client.owed(1n);
     expect(result).toBeDefined();

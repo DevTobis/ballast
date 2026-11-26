@@ -28,7 +28,7 @@ export class SpikoNavAdapter implements IssuerNavAdapter {
 
   async fetchNav(assetCode: string): Promise<{ value: bigint; ts: number }> {
     const url = `${this.baseUrl}/net-asset-values/${encodeURIComponent(assetCode.toUpperCase())}/latest`;
-    const body = await getJson<SpikoLatestNav>(url, this.fetchImpl);
+    const body = await getJson<SpikoLatestNav>(url, this.fetchImpl, "spiko");
 
     if (!body || typeof body !== "object") {
       throw new Error(`spikoNavAdapter: invalid response body for ${assetCode}: expected object`);

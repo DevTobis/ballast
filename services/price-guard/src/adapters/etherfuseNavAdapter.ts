@@ -48,7 +48,7 @@ export class EtherfuseNavAdapter implements IssuerNavAdapter {
 
   async fetchNav(assetCode: string): Promise<{ value: bigint; ts: number }> {
     const url = `${this.baseUrl}/lookup/tokens/cost/${encodeURIComponent(assetCode.toUpperCase())}`;
-    const body = await getJson<EtherfuseTokenCost>(url, this.fetchImpl);
+    const body = await getJson<EtherfuseTokenCost>(url, this.fetchImpl, "etherfuse");
 
     if (!body || typeof body !== "object") {
       throw new Error(`etherfuseNavAdapter: invalid response body for ${assetCode}: expected object`);

@@ -33,6 +33,11 @@ describe("PledgeVaultClient", () => {
     expect(xdr.length).toBeGreaterThan(0);
   });
 
+  it("configureAsset() takes only the credit line and custody mode", async () => {
+    const xdr = await client.configureAsset(source, asset, randomContractId(), "escrow");
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
   it("cancelPending() returns non-empty unsigned XDR", async () => {
     const xdr = await client.cancelPending(source, 1n, asset, 500n);
     expect(xdr.length).toBeGreaterThan(0);

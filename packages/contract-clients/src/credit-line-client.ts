@@ -135,6 +135,14 @@ export class CreditLineClient extends BaseContractClient {
     return this.read<LtvView>("ltv", [scU64(line)]);
   }
 
+  /**
+   * Read-only: the `ltv` view as if the line had `newUnits` of collateral pledged, computed with
+   * the line's own haircut, thresholds and price. `PledgeVault::release` uses it on-chain (#180).
+   */
+  ltvAfter(line: bigint, newUnits: bigint): Promise<LtvView> {
+    return this.read<LtvView>("ltv_after", [scU64(line), scI128(newUnits)]);
+  }
+
   /** Read-only: exact payoff components and timestamp without calling PriceGuard (PRD §9, Backlog B-0131). */
   owed(line: bigint): Promise<Owed> {
     return this.read<Owed>("owed", [scU64(line)]);
@@ -176,10 +184,23 @@ export class CreditLineClient extends BaseContractClient {
 
   /**
    * Lender books a liquidation's outcome and closes the line. If the collateral was worth more than
-   * the debt this also pays the surplus to the borrower out of the lender's USDC.
+   * the debt the surplus is recorded for the borrower to pull with `claimSurplus`; no USDC moves.
    */
   closeLiquidated(source: string, line: bigint): Promise<string> {
     return this.invoke(source, "close_liquidated", [scAddress(source), scU64(line)]);
+  }
+
+  /**
+   * Borrower pulls a liquidation surplus from the lender. The lender must have approved this
+   * contract on the USDC token for at least the surplus first.
+   */
+  claimSurplus(borrower: string, line: bigint): Promise<string> {
+    return this.invoke(borrower, "claim_surplus", [scAddress(borrower), scU64(line)]);
+  }
+
+  /** Read-only: liquidation surplus booked but not yet claimed by the borrower. */
+  surplusOwed(line: bigint): Promise<bigint> {
+    return this.read<bigint>("surplus_owed", [scU64(line)]);
   }
 
   /** Read-only: interest repaid on the line and not yet withdrawn. */

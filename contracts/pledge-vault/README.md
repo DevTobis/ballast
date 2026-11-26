@@ -17,7 +17,7 @@ See [`../EVENTS.md`](../EVENTS.md) for consumers and the payload-order compatibi
 | `lien_rejected` | `(Symbol("lien_rejected"), line: u64)` | `(asset: Address, units: i128, reason: Bytes)` | `reject_lien` |
 | `pending_cancelled` | `(Symbol("pending_cancelled"), line: u64)` | `(asset: Address, units: i128)` | `cancel_pending` |
 | `liquidated` | `(Symbol("liquidated"), line: u64)` | `(asset: Address, units: i128, to: Address)` | `liquidate` |
-| `asset_configured` | `(Symbol("asset_configured"), asset: Address)` | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` |
+| `asset_configured` | `(Symbol("asset_configured"), asset: Address)` | `(credit_line: Address, custody_mode: CustodyMode)` | `configure_asset` |
 | `gateway_set` | `(Symbol("gateway_set"),)` | `gateway: Address` | `set_gateway` |
 
 ## Storage layout
@@ -75,7 +75,9 @@ approximately one day and 30 days respectively. Timelock entries use a 34,560-le
 
 Stored types marked `#[contracttype]` use Soroban's typed encoding. Their field and enum variant
 order must not be reordered or removed without a migration: existing persistent entries can be
-decoded incorrectly or fail to decode after an incompatible upgrade. This applies to `AssetConfig`,
+decoded incorrectly or fail to decode after an incompatible upgrade. This applies to `AssetConfig`
+(which #180 shrank to `credit_line` and `custody_mode`, so a deployment with configs stored by an
+earlier build must be redeployed or have every asset reconfigured, not upgraded in place),
 `Position`, `CustodyMode`, `Roles`, `PendingAdmin`, `PendingRoleChange`, `RoleKind`, and
 `PauseScope`.
 
@@ -93,7 +95,7 @@ Every asset configured via `configure_asset` uses one of three `CustodyMode` val
 | `record_lien` | Not used for escrow positions (fails if `units > position.pending_lien_units`, which is always `0` in `Escrow`). | Configured `gateway` signs. Moves `units` from `pending_lien_units` to `position.units`, sets `position.lien_ref = Some(lien_ref)`, syncs updated `position.units` to `CreditLine`, and emits `lien_recorded`. | Same as `IssuerLien` (gateway confirms custodian lien and moves pending to counted `units`). |
 | `cancel_pending` | Not used for escrow positions (fails if `units > position.pending_lien_units`, which is always `0` in `Escrow`). | Borrower signs. Decrements `position.pending_lien_units`; does not affect `position.units` or move tokens; emits `pending_cancelled`. | Same as `IssuerLien`. |
 | `reject_lien` | Not used for escrow positions (fails if `units > position.pending_lien_units`, which is always `0` in `Escrow`). | Configured `gateway` signs. Decrements `position.pending_lien_units`; does not affect `position.units` or move tokens; emits `lien_rejected`. | Same as `IssuerLien`. |
-| `release` | Borrower signs. Checks `debt_of(line) == 0` or `Ok` price + `Healthy` post-release LTV via `CreditLine`; transfers `units` of RWA token back to `borrower`; decrements `position.units`; syncs to `CreditLine`; emits `released`. | Borrower signs. Runs the same zero-debt / `Healthy` post-release LTV check, decrements `position.units`, syncs to `CreditLine`, and emits `released`. **No on-chain token transfer** — the issuer must downgrade/release the trustline hold off-chain after observing `released`. | Same as `IssuerLien` (**no on-chain token transfer** — custodian must release the lien off-chain after observing `released`). |
+| `release` | Borrower signs. Checks `debt_of(line) == 0` or `Ok` price + `Healthy` post-release LTV via `CreditLine::ltv_after` (CreditLine's own haircut, thresholds and price; the vault holds none, #180); transfers `units` of RWA token back to `borrower`; decrements `position.units`; syncs to `CreditLine`; emits `released`. | Borrower signs. Runs the same zero-debt / `Healthy` post-release LTV check, decrements `position.units`, syncs to `CreditLine`, and emits `released`. **No on-chain token transfer** — the issuer must downgrade/release the trustline hold off-chain after observing `released`. | Same as `IssuerLien` (**no on-chain token transfer** — custodian must release the lien off-chain after observing `released`). |
 | `liquidate` | Keeper signs (after `CreditLine::liquidate`). Transfers `units` of RWA token from `PledgeVault` to `to`; decrements `position.units` (`pending_lien_units` untouched); syncs to `CreditLine`; emits `liquidated`. | Keeper signs. Decrements `position.units` (`pending_lien_units` untouched), syncs to `CreditLine`, and emits `liquidated`. **No on-chain token transfer** — issuer clawback/delivery to `to` happens off-chain. | Same as `IssuerLien` (**no on-chain token transfer** — custodian delivers to `to` off-chain). |
 
 ### Pending-Lien Sequence (`IssuerLien` / `CustodianLien`)

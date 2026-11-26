@@ -274,6 +274,16 @@ pub struct RepoMarginView {
     pub price_ok: bool,
 }
 
+/// A configuration change queued by `queue_asset_config`, applied by `execute_asset_config` once
+/// `executes_at` has passed. The queued config is a full replacement.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingAssetConfig {
+    pub asset: Address,
+    pub config: RepoAssetConfig,
+    pub executes_at: u64,
+}
+
 #[contracttype]
 struct PendingUnpause {
     scope: PauseScope,
@@ -301,6 +311,7 @@ enum DataKey {
     MaturityGrace,
 
     PendingUnpause(u64),
+    PendingAssetConfig(u64),
 
     LatestProposal(Address),
 }
@@ -404,6 +415,52 @@ fn read_usdc(env: &Env) -> Address {
         .instance()
         .get(&DataKey::Usdc)
         .expect("repo-dvp: usdc not configured")
+}
+
+fn validate_asset_config(config: &RepoAssetConfig) {
+    assert!(
+        config.haircut_bps as i128 <= BPS_DENOMINATOR,
+        "repo-dvp: haircut exceeds 100%"
+    );
+    config.thresholds.validate();
+    assert!(
+        config.max_cash_per_trade > 0,
+        "repo-dvp: max_cash_per_trade must be positive"
+    );
+    assert!(
+        config.max_term_seconds > 0,
+        "repo-dvp: max_term_seconds must be positive"
+    );
+}
+
+/// Whether moving from `current` to `next` could hide a margin call, delay a default, make a
+/// default seize more, or let larger or longer repos in: a different price source, a lower
+/// haircut, any higher threshold, or a higher per-trade cash or term cap. Such changes are
+/// timelocked (#215).
+fn loosens(current: &RepoAssetConfig, next: &RepoAssetConfig) -> bool {
+    next.price_guard != current.price_guard
+        || next.haircut_bps < current.haircut_bps
+        || next.thresholds.warning_bps > current.thresholds.warning_bps
+        || next.thresholds.margin_call_bps > current.thresholds.margin_call_bps
+        || next.thresholds.liquidation_bps > current.thresholds.liquidation_bps
+        || next.max_cash_per_trade > current.max_cash_per_trade
+        || next.max_term_seconds > current.max_term_seconds
+}
+
+fn write_asset_config(env: &Env, asset: &Address, config: &RepoAssetConfig) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetConfig(asset.clone()), config);
+    env.events().publish(
+        (symbol_short!("cfgasset"), asset.clone()),
+        (
+            config.price_guard.clone(),
+            config.haircut_bps,
+            config.thresholds.clone(),
+            config.max_cash_per_trade,
+            config.max_term_seconds,
+        ),
+    );
 }
 
 fn require_admin_is(env: &Env, admin: &Address) {
@@ -708,6 +765,12 @@ impl RepoDvp {
         pause::is_paused(&env, &scope)
     }
 
+    /// Sets an asset's risk config. The first listing applies immediately, and so does any
+    /// change that cannot loosen risk (same price guard, haircut not lower, no threshold or cap
+    /// higher). Anything else panics here and must go through `queue_asset_config` and the 48h
+    /// timelock (#215): repointing `price_guard` at a contract that returns a low price would let a
+    /// keeper `default_close` an open call into a total seizure, and a lower haircut or higher
+    /// thresholds would hide a margin call. The risk role tightens with `tighten_asset_config`.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -720,39 +783,138 @@ impl RepoDvp {
     ) {
         require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
+        let config = RepoAssetConfig {
+            price_guard,
+            haircut_bps,
+            thresholds,
+            max_cash_per_trade,
+            max_term_seconds,
+        };
+        validate_asset_config(&config);
+        let current: Option<RepoAssetConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetConfig(asset.clone()));
+        if let Some(current) = current {
+            assert!(
+                !loosens(&current, &config),
+                "repo-dvp: change loosens the asset config; use queue_asset_config"
+            );
+        }
+        write_asset_config(&env, &asset, &config);
+    }
+
+    /// The risk role's emergency brake (#215): raises the haircut and/or lowers the margin
+    /// thresholds of an already-configured asset immediately, keeping its price guard and caps.
+    /// Refuses anything that would loosen. Like `configure_asset`, it publishes `cfgasset`.
+    pub fn tighten_asset_config(
+        env: Env,
+        risk: Address,
+        asset: Address,
+        haircut_bps: u32,
+        thresholds: MarginThresholds,
+    ) {
+        ttl::extend_instance(&env);
+        let stored_risk = access::require_risk(&env);
+        assert_eq!(stored_risk, risk, "repo-dvp: risk argument mismatch");
+        let current = read_asset_config(&env, &asset);
+        let config = RepoAssetConfig {
+            price_guard: current.price_guard.clone(),
+            haircut_bps,
+            thresholds,
+            max_cash_per_trade: current.max_cash_per_trade,
+            max_term_seconds: current.max_term_seconds,
+        };
+        validate_asset_config(&config);
         assert!(
-            haircut_bps as i128 <= BPS_DENOMINATOR,
-            "repo-dvp: haircut exceeds 100%"
+            !loosens(&current, &config),
+            "repo-dvp: tighten_asset_config cannot loosen the asset config"
         );
-        thresholds.validate();
-        assert!(
-            max_cash_per_trade > 0,
-            "repo-dvp: max_cash_per_trade must be positive"
-        );
-        assert!(
-            max_term_seconds > 0,
-            "repo-dvp: max_term_seconds must be positive"
-        );
-        env.storage().instance().set(
-            &DataKey::AssetConfig(asset.clone()),
-            &RepoAssetConfig {
-                price_guard: price_guard.clone(),
-                haircut_bps,
-                thresholds: thresholds.clone(),
-                max_cash_per_trade,
-                max_term_seconds,
+        write_asset_config(&env, &asset, &config);
+    }
+
+    /// Queues a full replacement config for an already-configured asset, applied by
+    /// `execute_asset_config` after the 48h timelock. This is the only path for changes
+    /// `configure_asset` refuses (a new price guard, a lower haircut, a higher threshold or cap).
+    /// Validation runs here, when the change is queued. Returns the id.
+    pub fn queue_asset_config(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        price_guard: Address,
+        haircut_bps: u32,
+        thresholds: MarginThresholds,
+        max_cash_per_trade: i128,
+        max_term_seconds: u64,
+    ) -> u64 {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset);
+        let config = RepoAssetConfig {
+            price_guard,
+            haircut_bps,
+            thresholds,
+            max_cash_per_trade,
+            max_term_seconds,
+        };
+        validate_asset_config(&config);
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingAssetConfig {
+                asset: asset.clone(),
+                config: config.clone(),
+                executes_at,
             },
         );
-        env.events().publish(
-            (symbol_short!("cfgasset"), asset),
-            (
-                price_guard,
-                haircut_bps,
-                thresholds,
-                max_cash_per_trade,
-                max_term_seconds,
-            ),
+        timelock::extend_entry_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("cfg_q"), id), (asset, config, executes_at));
+        id
+    }
+
+    /// Applies a queued config once its timelock has elapsed. Permissionless, like
+    /// `execute_unpause`: the change was authorised and published when it was queued.
+    pub fn execute_asset_config(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending asset config");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "repo-dvp: timelock has not elapsed"
         );
+        env.storage().persistent().remove(&key);
+        write_asset_config(&env, &pending.asset, &pending.config);
+        env.events()
+            .publish((symbol_short!("cfg_exec"), id), pending.asset);
+    }
+
+    /// Drops a queued config before it executes. Admin only.
+    pub fn cancel_asset_config(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending asset config");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((symbol_short!("cfg_canc"), id), pending.asset);
+    }
+
+    pub fn pending_asset_config(env: Env, id: u64) -> Option<PendingAssetConfig> {
+        ttl::extend_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAssetConfig(id))
     }
 
     /// Reads the active configuration for an asset.

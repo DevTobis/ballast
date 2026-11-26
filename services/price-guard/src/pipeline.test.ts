@@ -142,7 +142,10 @@ describe("runPriceUpdateCycle", () => {
 
     // 2 price_observation rows + 1 price_snapshot row
     expect(db.insert).toHaveBeenCalledTimes(3);
-    expect(db.values).toHaveBeenNthCalledWith(1, expect.objectContaining({ source: "issuer_nav", value: "0.0657660" }));
+    expect(db.values).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ source: "issuer_nav", value: "0.0657660", signature: expect.any(String) }),
+    );
     expect(db.values).toHaveBeenNthCalledWith(2, expect.objectContaining({ source: "redstone", value: "0.0657500" }));
     expect(db.values).toHaveBeenNthCalledWith(3, expect.objectContaining({ assetId: "asset-1", status: "Ok" }));
 
@@ -152,6 +155,18 @@ describe("runPriceUpdateCycle", () => {
     expect(value).toBe(657_660n);
     expect(ts).toBe(1_791_447_179);
     expect(verifyNavSignature(code, ts, value, sig, attestorPublicKeyBase64(sendSigner as any))).toBe(true);
+
+    // Assert the signature stored on the issuer_nav row also verifies.
+    const storedNavSig = ((db.values as any).mock.calls[0][0]).signature;
+    expect(
+      verifyNavSignature(
+        code,
+        ts,
+        value,
+        Buffer.from(storedNavSig, "base64"),
+        attestorPublicKeyBase64(sendSigner as any),
+      ),
+    ).toBe(true);
 
     expect(client.publishFeed).toHaveBeenCalledWith(
       keypair.publicKey(),
@@ -304,6 +319,10 @@ describe("runPriceUpdateCycle", () => {
       await runPriceUpdateCycle(db as any, client as any, sendSigner as any, [makeAsset()], submit, shadowEnv);
 
       expect(db.insert).toHaveBeenCalledTimes(2);
+      expect(db.values).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ source: "issuer_nav", signature: null }),
+      );
       expect(client.publishNav).not.toHaveBeenCalled();
       expect(client.publishFeed).not.toHaveBeenCalled();
       expect(client.guardedPrice).not.toHaveBeenCalled();

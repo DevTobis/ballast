@@ -30,13 +30,27 @@ const invoke = (fn: string, extra: string[], send = false): string =>
     ...(send ? ["--send=yes"] : []), "--", fn, ...extra,
   ]);
 
+interface ChainThresholds { warning_bps: number; margin_call_bps: number; liquidation_bps: number }
+
+// Lowering thresholds tightens risk and applies at once; raising any of them is a loosening change
+// that RepoDvp only takes through queue_asset_config and a 48h timelock (#215). Each band is
+// therefore set to the lower of the requested value and the current one: the result stays strictly
+// ordered (the element-wise minimum of two ordered triples is ordered) and never loosens. The
+// haircut and caps are passed through unchanged for the same reason.
 function setThresholds(warningBps: number, marginCallBps: number, liquidationBps: number): void {
+  const config: { haircut_bps: number; thresholds: ChainThresholds; max_cash_per_trade: string | number; max_term_seconds: string | number } =
+    JSON.parse(invoke("asset_config", ["--asset", required("RWA_SAC")]));
+  const current = config.thresholds;
   invoke("configure_asset", [
     "--admin", required("ADMIN"), "--asset", required("RWA_SAC"), "--price_guard", required("PRICE_GUARD_CID"),
-    "--haircut_bps", "500",
-    "--thresholds", JSON.stringify({ warning_bps: warningBps, margin_call_bps: marginCallBps, liquidation_bps: liquidationBps }),
-    "--max_cash_per_trade", "1000000000000",
-    "--max_term_seconds", "2592000",
+    "--haircut_bps", String(config.haircut_bps),
+    "--thresholds", JSON.stringify({
+      warning_bps: Math.min(warningBps, current.warning_bps),
+      margin_call_bps: Math.min(marginCallBps, current.margin_call_bps),
+      liquidation_bps: Math.min(liquidationBps, current.liquidation_bps),
+    }),
+    "--max_cash_per_trade", String(config.max_cash_per_trade),
+    "--max_term_seconds", String(config.max_term_seconds),
   ]);
 }
 

@@ -49,6 +49,31 @@ describe("SpikoNavAdapter", () => {
     await expect(new SpikoNavAdapter(undefined, fetchImpl).fetchNav("USTBL")).rejects.toThrow(/503/);
   });
 
+  it("truncates 5 kB HTML error bodies to 200 characters, strips newlines, and names spiko", async () => {
+    const largeHtml = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n" +
+      "Cloudflare CDN Error: Server unreachable.\n".repeat(200) +
+      "\r\n</body>\r\n</html>";
+    expect(largeHtml.length).toBeGreaterThan(5000);
+
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      text: async () => largeHtml,
+    })) as unknown as typeof fetch;
+
+    await expect(new SpikoNavAdapter(undefined, fetchImpl).fetchNav("USTBL")).rejects.toSatisfy((err: unknown) => {
+      const error = err as Error;
+      expect(error.message).toContain("spiko NAV request failed: GET https://public-api.spiko.io/v0/net-asset-values/USTBL/latest -> 502 Bad Gateway:");
+      expect(error.message).not.toMatch(/[\r\n]/);
+      // Ensure the error snippet after statusText is capped to at most 200 chars
+      const prefix = "spiko NAV request failed: GET https://public-api.spiko.io/v0/net-asset-values/USTBL/latest -> 502 Bad Gateway: ";
+      const snippet = error.message.slice(prefix.length);
+      expect(snippet.length).toBeLessThanOrEqual(200);
+      return true;
+    });
+  });
+
   it("throws clear error naming adapter, asset and field when required fields are missing", async () => {
     const valid = fixture("spiko-ustbl-latest.json");
 
@@ -107,6 +132,28 @@ describe("EtherfuseNavAdapter", () => {
     );
     expect(nav.value).toBe(657_660n);
     expect(nav.ts).toBe(1_791_447_179);
+  });
+
+  it("truncates 5 kB HTML error bodies to 200 characters, strips newlines, and names etherfuse", async () => {
+    const largeHtml = "<html>\r\n<body>\r\n" + "WAF Blocked Request.\n".repeat(300) + "\r\n</body>\r\n</html>";
+    expect(largeHtml.length).toBeGreaterThan(5000);
+
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 403,
+      statusText: "Forbidden",
+      text: async () => largeHtml,
+    })) as unknown as typeof fetch;
+
+    await expect(new EtherfuseNavAdapter(undefined, fetchImpl).fetchNav("CETES")).rejects.toSatisfy((err: unknown) => {
+      const error = err as Error;
+      expect(error.message).toContain("etherfuse NAV request failed: GET https://api.etherfuse.com/lookup/tokens/cost/CETES -> 403 Forbidden:");
+      expect(error.message).not.toMatch(/[\r\n]/);
+      const prefix = "etherfuse NAV request failed: GET https://api.etherfuse.com/lookup/tokens/cost/CETES -> 403 Forbidden: ";
+      const snippet = error.message.slice(prefix.length);
+      expect(snippet.length).toBeLessThanOrEqual(200);
+      return true;
+    });
   });
 
   it("computes median timestamp correctly for even, odd, and dirty counts", () => {

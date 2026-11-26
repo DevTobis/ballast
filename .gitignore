@@ -28,3 +28,6 @@ contracts/**/test_snapshots/
 
 # An interrupted scripts/deploy-mainnet-prices.sh run: contract ids on mainnet, not yet in the final file
 .env.*-deploy.partial
+
+# Threshold restore id queued by scripts/e2e-repo-margin.sh
+.e2e-repo-margin-restore.*
