@@ -42,13 +42,15 @@
 //! two separate transactions. Flagged here and in the build report as the least clean part of
 //! this skeleton.
 //!
-//! **Events.** Published with shape `((Symbol, line), payload)`:
+//! **Events.** Published with shape `(topics, payload)`:
 //! - `pledged`: `((Symbol("pledged"), line), (asset: Address, units: i128))`
 //! - `released`: `((Symbol("released"), line), (asset: Address, units: i128))`
 //! - `lien_recorded`: `((Symbol("lien_recorded"), line), (asset: Address, units: i128, lien_ref: Bytes))`
 //! - `lien_rejected`: `((Symbol("lien_rejected"), line), (asset: Address, units: i128, reason: Bytes))`
 //! - `pending_cancelled`: `((Symbol("pending_cancelled"), line), (asset: Address, units: i128))`
 //! - `liquidated`: `((Symbol("liquidated"), line), (asset: Address, units: i128, to: Address))`
+//! - `asset_configured`: `((Symbol("asset_configured"), asset: Address), (price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode))`
+//! - `gateway_set`: `((Symbol("gateway_set"),), gateway: Address)`
 
 use ballast_common::{
     access::{self, Roles},
@@ -266,14 +268,25 @@ impl PledgeVault {
         risk::validate_haircut_bps(haircut_bps);
         thresholds.validate();
         env.storage().instance().set(
-            &DataKey::AssetConfig(asset),
+            &DataKey::AssetConfig(asset.clone()),
             &AssetConfig {
+                price_guard: price_guard.clone(),
+                credit_line: credit_line.clone(),
+                haircut_bps,
+                thresholds: thresholds.clone(),
+                custody_mode: custody_mode.clone(),
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "asset_configured"), asset),
+            (
                 price_guard,
                 credit_line,
                 haircut_bps,
                 thresholds,
                 custody_mode,
-            },
+            ),
         );
     }
 
@@ -283,6 +296,8 @@ impl PledgeVault {
         access::require_admin(&env);
         ttl::extend_instance(&env);
         env.storage().instance().set(&DataKey::Gateway, &gateway);
+
+        env.events().publish((Symbol::new(&env, "gateway_set"),), gateway);
     }
 
     /// Escrow mode (`CustodyMode::Escrow`): pulls `units` of the RWA token from `borrower` into
@@ -717,7 +732,9 @@ mod test {
             Lender,
             Status,
             Asset,
+            LineAsset(u64),
             Synced,
+            SyncedLine,
         }
 
         #[contractimpl]
@@ -778,22 +795,35 @@ mod test {
                 env.storage().instance().set(&DataKey::Asset, &asset);
             }
 
-            pub fn asset_of(env: Env, _line: u64) -> Address {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::Asset)
-                    .expect("mock-credit-line: asset not set")
+            pub fn set_line_asset(env: Env, line: u64, asset: Address) {
+                env.storage().instance().set(&DataKey::LineAsset(line), &asset);
+            }
+
+            pub fn asset_of(env: Env, line: u64) -> Address {
+                if let Some(asset) = env.storage().instance().get(&DataKey::LineAsset(line)) {
+                    asset
+                } else {
+                    env.storage()
+                        .instance()
+                        .get(&DataKey::Asset)
+                        .expect("mock-credit-line: asset not set")
+                }
             }
 
             /// Records the last figure the vault reported, so tests can see that every change to a
             /// position reached the credit line in the same transaction.
-            pub fn sync_from_vault(env: Env, vault: Address, _line: u64, _asset: Address, units: i128) {
+            pub fn sync_from_vault(env: Env, vault: Address, line: u64, _asset: Address, units: i128) {
                 vault.require_auth();
                 env.storage().instance().set(&DataKey::Synced, &units);
+                env.storage().instance().set(&DataKey::SyncedLine, &line);
             }
 
             pub fn synced_units(env: Env) -> i128 {
                 env.storage().instance().get(&DataKey::Synced).unwrap_or(-1)
+            }
+
+            pub fn synced_line(env: Env) -> u64 {
+                env.storage().instance().get(&DataKey::SyncedLine).unwrap_or(0)
             }
         }
     }
@@ -978,6 +1008,63 @@ mod test {
         h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
 
         h.vault.release(&h.borrower, &1, &h.asset, &PRICE_SCALE);
+    }
+
+    // ── #190: release around the Warning threshold, using the issue's numbers ─────────────
+    //
+    // `release` only succeeds when the line stays Healthy (#1116 / #181); Warning is never allowed.
+    // `main` already covers the same boundary under the default thresholds
+    // (`release_leaving_ltv_exactly_at_the_warning_threshold_panics` and its one-bp-under twin).
+    // These tests use the issue's 700 debt / 1,000 pledge figures, so they are a worked example
+    // of #190 rather than new coverage.
+
+    #[test]
+    fn release_passes_at_7990_bps_when_still_healthy() {
+        // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
+        // Releasing 124 leaves 876 collateral units.
+        // Collateral value = 876 * 1.0 = 876 (haircut 0).
+        // LTV bps = 700 * 10_000 / 876 = 7,990 bps.
+        // With warning_bps moved to 8,000, 7,990 bps is still Healthy (< 8,000 bps), so the
+        // release succeeds. It would fail under the default 7,000 warning threshold (see below).
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(124 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 876 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_panics_at_exactly_8000_bps_at_the_warning_threshold() {
+        // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
+        // Releasing 125 leaves 875 collateral units.
+        // Collateral value = 875 * 1.0 = 875 (haircut 0).
+        // LTV bps = 700 * 10_000 / 875 = exactly 8,000 bps.
+        // With `bands(8_000, 8_500, 9_000)`, 8,000 bps is exactly the Warning threshold, so the
+        // line would no longer be Healthy and the release panics.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(125 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
+    fn release_at_7990_bps_panics_under_default_warning_threshold_after_rule_update() {
+        // Under default thresholds (warning_bps: 7_000, margin_call_bps: 8_000, liquidation_bps: 9_000)
+        // and following the rule update in #181 (where release requires MarginState::Healthy),
+        // releasing 124 leaves 876 collateral -> 7,990 bps.
+        // Because 7,990 bps >= 7,000 bps (Warning band), release panics under the updated rule.
+        let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.vault.release(&h.borrower, &1, &h.asset, &(124 * PRICE_SCALE));
     }
 
     #[test]
@@ -2062,6 +2149,92 @@ mod test {
         assert_eq!(confirmed.lien_ref, Some(lien_ref));
     }
 
+    #[test]
+    fn position_isolation_per_line_and_asset_and_defaults_for_unknown_keys() {
+        let h = setup(0, 0, PRICE_SCALE);
+
+        // Unknown key returns 0 units
+        assert_eq!(h.vault.position_units(&99, &h.asset), 0);
+        let unknown_asset = Address::generate(&h.env);
+        assert_eq!(h.vault.position_units(&1, &unknown_asset), 0);
+
+        // Register and configure a second asset
+        let token2_id = h.env.register(mock_token::MockToken, ());
+        let token2 = mock_token::MockTokenClient::new(&h.env, &token2_id);
+        h.vault.configure_asset(
+            &h.admin,
+            &token2_id,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &0,
+            &h.thresholds,
+            &CustodyMode::Escrow,
+        );
+
+        // Configure line assets on mock credit line
+        h.credit_line.set_line_asset(&1, &h.asset);
+        h.credit_line.set_line_asset(&2, &token2_id);
+        h.credit_line.set_line_asset(&3, &h.asset);
+        h.credit_line.set_line_asset(&4, &token2_id);
+
+        // Mint balances to borrower
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        token2.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+
+        // Pledge on 4 distinct (line, asset) pairs:
+        // (Line 1, Asset 1): 100
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 1);
+        assert_eq!(h.credit_line.synced_units(), 100 * PRICE_SCALE);
+
+        // (Line 2, Asset 2): 200
+        h.vault.pledge(&h.borrower, &2, &token2_id, &(200 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 2);
+        assert_eq!(h.credit_line.synced_units(), 200 * PRICE_SCALE);
+
+        // (Line 3, Asset 1): 300
+        h.vault.pledge(&h.borrower, &3, &h.asset, &(300 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 3);
+        assert_eq!(h.credit_line.synced_units(), 300 * PRICE_SCALE);
+
+        // (Line 4, Asset 2): 400
+        h.vault.pledge(&h.borrower, &4, &token2_id, &(400 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 4);
+        assert_eq!(h.credit_line.synced_units(), 400 * PRICE_SCALE);
+
+        // Verify initial state across all positions
+        assert_eq!(h.vault.position_units(&1, &h.asset), 100 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 400 * PRICE_SCALE);
+
+        // Release 40 from (Line 1, Asset 1)
+        h.vault.release(&h.borrower, &1, &h.asset, &(40 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 1);
+        assert_eq!(h.credit_line.synced_units(), 60 * PRICE_SCALE);
+
+        // Verify (Line 1, Asset 1) is reduced to 60 while all other positions are unchanged
+        assert_eq!(h.vault.position_units(&1, &h.asset), 60 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 400 * PRICE_SCALE);
+
+        // Release 50 from (Line 4, Asset 2)
+        h.vault.release(&h.borrower, &4, &token2_id, &(50 * PRICE_SCALE));
+        assert_eq!(h.credit_line.synced_line(), 4);
+        assert_eq!(h.credit_line.synced_units(), 350 * PRICE_SCALE);
+
+        // Verify (Line 4, Asset 2) is reduced to 350 while all other positions remain unchanged
+        assert_eq!(h.vault.position_units(&1, &h.asset), 60 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&2, &token2_id), 200 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&3, &h.asset), 300 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&4, &token2_id), 350 * PRICE_SCALE);
+
+        // Never-used (line, asset) key remains 0
+        assert_eq!(h.vault.position_units(&99, &h.asset), 0);
+        assert_eq!(h.vault.position_units(&1, &Address::generate(&h.env)), 0);
+    }
+
     // TODO: set these flags through a real on-chain pause entry point once pause wiring lands.
     // `pledge-vault` has no pause writer today, so the tests set the flag directly via
     // `as_contract`; see the dead-pause-flag entry-point bugs #30/#32 and the open pause-reach
@@ -2579,5 +2752,208 @@ mod test {
         h.vault.pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
         let reason = Bytes::from_slice(&h.env, b"zero");
         h.vault.reject_lien(&gateway, &1, &h.asset, &0, &reason);
+    }
+
+    // ── #178: configure_asset and set_gateway events ─────────────────────────
+
+    #[test]
+    fn configure_asset_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let fresh_asset = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 6_000,
+            margin_call_bps: 7_500,
+            liquidation_bps: 8_500,
+        };
+
+        // 1. Success case
+        h.vault.configure_asset(
+            &h.admin,
+            &fresh_asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &300,
+            &thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let contract_events = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .cloned()
+            .collect::<std::vec::Vec<_>>();
+
+        let last_event = contract_events
+            .last()
+            .expect("must emit asset_configured event");
+        let expected_topic0 = ScVal::Symbol(ScSymbol("asset_configured".try_into().unwrap()));
+        let fresh_asset_val: soroban_sdk::Val = fresh_asset.clone().into_val(&h.env);
+        let expected_topic1 =
+            ScVal::try_from_val(&h.env, &fresh_asset_val).unwrap();
+        let expected_payload_val: soroban_sdk::Val = (
+            h.price_guard.address.clone(),
+            h.credit_line.address.clone(),
+            300u32,
+            thresholds.clone(),
+            CustodyMode::IssuerLien,
+        )
+            .into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &expected_payload_val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // 2. Failure case: invalid thresholds
+        let invalid_thresholds = MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 9_000,
+            liquidation_bps: 9_000,
+        };
+        let bad_thresh_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.configure_asset(
+                &h.admin,
+                &Address::generate(&h.env),
+                &h.price_guard.address,
+                &h.credit_line.address,
+                &500,
+                &invalid_thresholds,
+                &CustodyMode::Escrow,
+            );
+        }));
+        assert!(bad_thresh_res.is_err(), "invalid thresholds must fail");
+        let events_after_thresh_fail = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .count();
+        assert_eq!(
+            events_after_thresh_fail, 0,
+            "no contract event on failed configure_asset"
+        );
+
+        // 3. Failure case: non-admin caller
+        let stranger = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "configure_asset",
+                args: (
+                    stranger.clone(),
+                    fresh_asset.clone(),
+                    h.price_guard.address.clone(),
+                    h.credit_line.address.clone(),
+                    500u32,
+                    thresholds.clone(),
+                    CustodyMode::Escrow,
+                )
+                    .into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let bad_auth_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.configure_asset(
+                &stranger,
+                &fresh_asset,
+                &h.price_guard.address,
+                &h.credit_line.address,
+                &500,
+                &thresholds,
+                &CustodyMode::Escrow,
+            );
+        }));
+        assert!(bad_auth_res.is_err(), "non-admin caller must fail");
+        let events_after_auth_fail = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .count();
+        assert_eq!(
+            events_after_auth_fail, 0,
+            "no contract event on unauthorized configure_asset"
+        );
+    }
+
+    #[test]
+    fn set_gateway_publishes_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+
+        // 1. Success case
+        h.vault.set_gateway(&h.admin, &gateway);
+
+        let contract_events = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .cloned()
+            .collect::<std::vec::Vec<_>>();
+
+        let last_event = contract_events.last().expect("must emit gateway_set event");
+        let expected_topic0 = ScVal::Symbol(ScSymbol("gateway_set".try_into().unwrap()));
+        let gateway_val: soroban_sdk::Val = gateway.clone().into_val(&h.env);
+        let expected_data =
+            ScVal::try_from_val(&h.env, &gateway_val).unwrap();
+
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.len(), 1);
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // 2. Failure case: non-admin caller
+        let stranger = Address::generate(&h.env);
+        let other_gateway = Address::generate(&h.env);
+        h.env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &h.vault.address,
+                fn_name: "set_gateway",
+                args: (stranger.clone(), other_gateway.clone()).into_val(&h.env),
+                sub_invokes: &[],
+            },
+        }]);
+        let bad_auth_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault.set_gateway(&stranger, &other_gateway);
+        }));
+        assert!(bad_auth_res.is_err(), "non-admin caller must fail");
+        let events_after_auth_fail = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .count();
+        assert_eq!(
+            events_after_auth_fail, 0,
+            "no contract event on unauthorized set_gateway"
+        );
     }
 }

@@ -382,6 +382,8 @@ for row in "${ROWS[@]}"; do
       --admin "$ADMIN" --asset "$SAC" --band_bps "$PRICE_BAND_BPS" --daily_move_band_bps "$DAILY_MOVE_BAND_BPS" \
       --window_seconds "$WINDOW_SECONDS" --window_move_band_bps "$WINDOW_MOVE_BAND_BPS" \
       --max_staleness_s "$MAX_STALENESS_S" >/dev/null
+    run stellar contract invoke --id "${CID[price-guard]}" --source mainnet_admin --network "$NETWORK" -- configure_source \
+      --admin "$ADMIN" --asset "$SAC" --name redstone --enabled true >/dev/null
     mark_step "GUARD_$CODE"
   fi
 

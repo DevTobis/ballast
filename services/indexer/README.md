@@ -40,6 +40,18 @@ pnpm --filter @ballast/service-indexer dev      # tsx watch, loads the repo-root
 pnpm --filter @ballast/service-indexer build && pnpm --filter @ballast/service-indexer start
 ```
 
+### Backfill CLI
+
+Validate and plan a historical ledger backfill range:
+
+```bash
+pnpm --filter @ballast/service-indexer backfill --from <start> --to <end> [--source rpc|lake]
+```
+
+- `--from`: positive integer start ledger.
+- `--to`: positive integer end ledger (`to >= from`).
+- `--source`: `rpc` (default) or `lake`. `--source lake` clearly reports not implemented.
+
 `pnpm dev` at the root starts it with the other services. Migrations must already be applied
 (`pnpm db:migrate`).
 
