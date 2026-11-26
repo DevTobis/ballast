@@ -3,14 +3,17 @@ import { loadNetworkConfig } from "@ballast/network-config";
 import { createLogger, createConsoleAlerter } from "@ballast/observability";
 import { createRpcClient } from "./rpc.js";
 import { pollOnce, runIndexerCycle, type IndexerState } from "./poller.js";
+import { shouldAlertLag, DEFAULT_LAG_ALERT_SECONDS, LEDGER_CLOSE_SECONDS } from "./lag.js";
 
 const logger = createLogger("indexer");
 const alerter = createConsoleAlerter("indexer");
 
 const POLL_INTERVAL_MS = Number(process.env.INDEXER_POLL_INTERVAL_MS ?? 5000);
-const LEDGER_CLOSE_SECONDS = 5; // Stellar's approximate ledger close time
-const LAG_ALERT_SECONDS = Number(process.env.INDEXER_LAG_ALERT_SECONDS ?? 60);
-const LAG_ALERT_LEDGERS = Math.ceil(LAG_ALERT_SECONDS / LEDGER_CLOSE_SECONDS);
+const LAG_ALERT_SECONDS = Number(process.env.INDEXER_LAG_ALERT_SECONDS ?? DEFAULT_LAG_ALERT_SECONDS);
+const LAG_ALERT_LEDGERS = Math.ceil(
+  (!Number.isNaN(LAG_ALERT_SECONDS) && LAG_ALERT_SECONDS > 0 ? LAG_ALERT_SECONDS : DEFAULT_LAG_ALERT_SECONDS) /
+    LEDGER_CLOSE_SECONDS,
+);
 
 /**
  * Contracts to watch. PRD §6.5: the indexer ingests CAP-67 and contract events for every Ballast
@@ -43,6 +46,12 @@ async function main() {
   while (!stopped) {
     try {
       const result = await runIndexerCycle(db, rpcServer, contractIds, state, alerter, LAG_ALERT_LEDGERS);
+      if (shouldAlertLag(result.latestLedger, result.fromLedger, LAG_ALERT_SECONDS)) {
+        logger.warn(
+          { latestLedger: result.latestLedger, fromLedger: result.fromLedger, lagAlertSeconds: LAG_ALERT_SECONDS },
+          "indexer: RPC lag exceeded configured alert threshold",
+        );
+      }
       if (result.skippedFrom !== undefined && result.skippedTo !== undefined) {
         logger.warn(
           { fromLedger: result.skippedFrom, toLedger: result.skippedTo },

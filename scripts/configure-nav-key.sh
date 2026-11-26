@@ -29,10 +29,15 @@ retry() {
 # A G-address is base32(version byte | 32-byte key | 2-byte checksum): the key is bytes 1..33.
 PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PRICE_PUBLISHER")
 
-echo ">>> Registering $PRICE_PUBLISHER as the NAV attestor for $RWA_SAC"
+# asset_code is a Bytes argument, and the CLI takes Bytes as hex: "RWA1" -> 52574131. It is bound
+# to the asset on first registration and cannot change afterwards (#90).
+ASSET_CODE="${RWA_ASSET_CODE:-RWA1}"
+ASSET_CODE_HEX=$(printf %s "$ASSET_CODE" | od -An -tx1 | tr -d ' \n')
+
+echo ">>> Registering $PRICE_PUBLISHER as the NAV attestor for $RWA_SAC ($ASSET_CODE)"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
-  --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
+  --admin "$ADMIN" --asset "$RWA_SAC" --asset_code "$ASSET_CODE_HEX" --issuer_pubkey "$PUBLISHER_KEY_HEX" >/dev/null
 
 echo ">>> Requiring NAV signatures"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
-  --admin "$ADMIN" --required true >/dev/null
+  --admin "$ADMIN" --asset "$RWA_SAC" --required true >/dev/null

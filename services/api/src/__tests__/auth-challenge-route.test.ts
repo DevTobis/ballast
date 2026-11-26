@@ -154,4 +154,25 @@ describe("POST /v1/auth/challenge + /v1/auth/token (real SEP-10)", () => {
 
     expect(tokenRes.statusCode).toBe(404);
   });
+
+  it("returns 503 from both auth routes when server secret is unset in dev", async () => {
+    const unconfiguredConfig: ApiConfig = { ...config, sep10ServerSecret: "" };
+    const app = buildServer({ config: unconfiguredConfig, db: createFakeDb(new Map()), contracts: {} as ContractClients });
+
+    const challengeRes = await app.inject({
+      method: "POST",
+      url: "/v1/auth/challenge",
+      payload: { account: Keypair.random().publicKey() },
+    });
+    expect(challengeRes.statusCode).toBe(503);
+    expect(challengeRes.json()).toEqual({ error: "SEP-10 server keypair not configured" });
+
+    const tokenRes = await app.inject({
+      method: "POST",
+      url: "/v1/auth/token",
+      payload: { transaction: "dummy-tx" },
+    });
+    expect(tokenRes.statusCode).toBe(503);
+    expect(tokenRes.json()).toEqual({ error: "SEP-10 server keypair not configured" });
+  });
 });

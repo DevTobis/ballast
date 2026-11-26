@@ -137,13 +137,22 @@ retry stellar contract invoke --id "${CID[price-guard]}" --source admin --networ
   --admin "$ADMIN" --asset "$RWA_SAC" --band_bps 50 --daily_move_band_bps 100 \
   --window_seconds 86400 --window_move_band_bps 100 --max_staleness_s "$PRICE_MAX_STALENESS_S" >/dev/null
 
-log "Configuring PledgeVault for RWA1 (5% haircut, escrow mode)"
+# One name per feed (#84): `redstone` is the name services/price-guard publishes the RedStone feed
+# under. The issuer NAV needs no entry; `issuer` is reserved for publish_nav.
+log "Allowlisting price sources for RWA1 in PriceGuard"
+retry stellar contract invoke --id "${CID[price-guard]}" --source admin --network "$NETWORK" -- configure_source \
+  --admin "$ADMIN" --asset "$RWA_SAC" --name redstone --enabled true >/dev/null
+
+# The vault takes only its CreditLine and the custody mode: `release` checks health with
+# CreditLine::ltv_after, so haircut, thresholds and PriceGuard are set once, on CreditLine (#180).
+log "Configuring PledgeVault for RWA1 (escrow mode)"
 retry stellar contract invoke --id "${CID[pledge-vault]}" --source admin --network "$NETWORK" -- configure_asset \
-  --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "${CID[price-guard]}" --credit_line "${CID[credit-line]}" \
-  --haircut_bps 500 \
-  --thresholds '{"warning_bps":7000,"margin_call_bps":8000,"liquidation_bps":9000}' \
+  --admin "$ADMIN" --asset "$RWA_SAC" --credit_line "${CID[credit-line]}" \
   --custody_mode '"Escrow"' >/dev/null
 
+# These thresholds must match the API's API_MARGIN_WARNING_BPS / API_MARGIN_CALL_BPS /
+# API_MARGIN_LIQUIDATION_BPS (defaults 7000/8000/9000), or the API's fallback margin state and
+# release check disagree with the chain.
 log "Configuring CreditLine for RWA1/TUSD"
 retry stellar contract invoke --id "${CID[credit-line]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "${CID[price-guard]}" --usdc "$USDC_SAC" \

@@ -18,7 +18,8 @@ off-chain arithmetic. `Degraded` and `Halted` fire `price_degraded` / `price_hal
 source or asset does not stop the others.
 
 Issuers do not sign NAV, so the price-publisher key signs each NAV reading itself over
-`<assetCode>:<ts>:<value>` (`navAttestor.ts`) and checks the signature against its own public key before
+`ballast-nav-v1:<contract>:<assetCode>:<ts>:<value>` (`navAttestor.ts`), where `<contract>` is the
+PriceGuard's `C...` id, so a signature only verifies on that deployment and for that asset (#90), and checks the signature against its own public key before
 sending. `PriceGuard.publish_nav` verifies it on-chain against the key set by `configure_issuer_key`. This
 attests "Ballast's publisher saw this value from the issuer API", not that the issuer vouched for it.
 
@@ -35,6 +36,72 @@ Shadow mode (`PRICE_GUARD_PUBLISH=false`) records real readings and alerts when 
 than the asset's `price_band_bps`, but sends nothing on-chain, writes no `price_snapshot` and needs no
 contract or publisher key. `scripts/shadow-run.sh` drives it. `smoke` touches neither chain nor database.
 
+## Smoke Test (`smoke.ts`)
+
+Live read-only test: calls each real source once and prints the returned prices. It sends nothing on-chain and touches no database, making it safe to run against mainnet.
+
+### Usage
+
+```bash
+# Human mode (supports multiple ASSET_CODE:issuerCode targets):
+pnpm --filter @ballast/service-price-guard smoke CETES:etherfuse USTBL:spiko BENJI:franklin
+
+# JSON mode (requires exactly one ASSET_CODE:issuerCode target):
+pnpm --filter @ballast/service-price-guard smoke --json CETES:etherfuse
+```
+
+### Flags & Contract
+
+- `--json`: Formats output as a single JSON object `{ nav, feed }`. Requires exactly one target. Price values are formatted as 1e7 scaled integers represented as strings. For issuers with no public NAV API (e.g., Franklin), `nav` is `null`.
+- `ASSET_CODE:issuerCode`: Target asset code and issuer adapter identifier (`etherfuse`, `spiko`, `franklin`).
+
+### Sample Output
+
+The CETES values below come from the recorded fixtures (`etherfuse-cetes-cost.json`,
+`redstone-cetes-feed.json`). There is no recorded BENJI fixture, so its feed value is illustrative;
+the shape (`nav: null`, "none (no public NAV API ...)") is exactly what `smoke.ts` prints for a
+Franklin target.
+
+**Human mode:**
+```text
+CETES (etherfuse)
+  issuer NAV   $0.0657660  updated 2026-10-08T06:52:59.000Z (2 min ago)
+  RedStone     $0.0657500  updated 2026-10-08T06:25:40.000Z (29 min ago)
+  divergence   2 bps
+
+BENJI (franklin)
+  issuer NAV   none (no public NAV API for this issuer)
+  RedStone     $1.0000000  updated 2026-10-08T06:25:40.000Z (29 min ago)
+```
+
+**JSON mode (`--json CETES:etherfuse`):**
+```json
+{"nav":{"value":"657660","ts":1791447179},"feed":{"value":"657500","ts":1791445540}}
+```
+
+**JSON mode with Franklin (`--json BENJI:franklin`, illustrative feed value):**
+```json
+{"nav":null,"feed":{"value":"10000000","ts":1791445540}}
+```
+
+### Exit Codes
+
+| Exit Code | Description |
+|-----------|-------------|
+| `0` | Success: every queried source answered successfully (or single target evaluated in `--json` mode). |
+| `1` | Failure: one or more sources failed to answer, invalid arguments, or `--json` invoked without exactly one target. |
+
+### Environment
+
+The smoke test requires:
+- `STELLAR_RPC_URL`: Soroban RPC endpoint (e.g., `https://mainnet.sorobanrpc.com`) for simulating RedStone reads.
+- `STELLAR_HORIZON_URL`: Horizon endpoint.
+- `STELLAR_NETWORK_PASSPHRASE`: Network passphrase (e.g. `"Public Global Stellar Network ; September 2015"`).
+- `STELLAR_SIMULATION_SOURCE`: Any valid funded Stellar account address used to simulate the contract read without submitting transactions.
+- `REDSTONE_FEED_CONTRACT_IDS`: JSON mapping asset codes to RedStone feed contract addresses (e.g. `{"CETES":"CCYGBQZ5..."}`).
+- `REDSTONE_RPC_URL` + `REDSTONE_NETWORK_PASSPHRASE`: RedStone publishes its RWA feeds on mainnet only, so when the rest of the environment points at testnet these must point the feed read at a mainnet RPC (`scripts/real-sources.env` sets both for `e2e-smoke.sh`).
+- *Note*: No database connection or signing key is required; no on-chain transactions are sent.
+
 ## Environment
 
 - `DATABASE_URL`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `STELLAR_HORIZON_URL`, `STELLAR_NETWORK_PASSPHRASE`.
@@ -42,6 +109,7 @@ contract or publisher key. `scripts/shadow-run.sh` drives it. `smoke` touches ne
 - `PRICE_GUARD_CONTRACT_ID`: required unless shadow.
 - `PRICE_GUARD_PUBLISH`: `false` for a shadow run; anything else publishes.
 - `PRICE_GUARD_CRON`: cycle schedule, default `*/1 * * * *`.
+- `PRICE_GUARD_RUN_ON_START`: whether to execute one cycle immediately at startup (default `true`; `false` disables).
 - `PRICE_PUBLISHER_SIGNER_MODE` (`local`, `vault`, `kms-envelope`) and `PRICE_PUBLISHER_SECRET_KEY` (local
   mode); Vault and KMS variables are listed in `.env.example`.
 - `REDSTONE_FEED_CONTRACT_IDS`: JSON `{assetCode: feedContractId}`. Required; the cycle throws without it.
@@ -59,6 +127,41 @@ contract or publisher key. `scripts/shadow-run.sh` drives it. `smoke` touches ne
   `liveNavShared.ts` (10s timeout, one retry on network error, none on HTTP error).
 - `src/navAttestor.ts`, `src/navSignature.ts`: NAV message format and Ed25519 check; keep it identical to the contract's.
 - `src/scaled.ts`: decimal string to and from 1e7 integers. `src/smoke.ts`, `src/seedShadow.ts`: the two scripts.
+
+## Precision and scaling
+
+Ballast represents all prices, asset values, and margin ratios as 7-decimal fixed-point integers (`PRICE_SCALE = 10_000_000n`, `1e7`). This matches Stellar and Soroban native precision (1 stroop = 10⁻⁷ XLM) and is required across the protocol contracts (`PriceGuard`, `CreditLine`, `RepoDvP`).
+
+### Rounding and Truncation Rule
+- All fixed-point conversions truncate **toward zero**:
+  - `decimalStringToScaled`: parses the whole and fractional parts as strings, pads or slices the fractional part to exactly 7 digits (`slice(0, 7)`), discarding excess digits without rounding up.
+  - `rescalePrice`: integer-divides feeds with more than 7 decimals (`price / 10n ** (decimals - 7)`), which in integer arithmetic truncates toward zero.
+- **Worst-case error**: truncating to 7 decimals loses less than one unit of `PRICE_SCALE`, i.e.
+  under `1e-7` USD per token, whatever the source's own precision. In relative terms that is
+  `1e-7 / price`:
+  - RedStone CETES (8 decimals, ~$0.0657): the dropped 8th digit is worth under `1e-7 / 0.0657`
+    ≈ 1.5e-6, about **0.015 bps**.
+  - A $1.00 asset such as Spiko USTBL: under 0.001 bps.
+  - Etherfuse CETES (6 decimals): nothing is lost converting to 7 decimals (the 7th digit is a
+    padded zero). The limit there is the source itself: one 6th-decimal step is
+    `1e-6 / 0.0657` ≈ **0.15 bps** of resolution.
+
+### Worked Examples from Recorded Fixtures
+
+1. **Etherfuse CETES** (`etherfuse-cetes-cost.json`):
+   - Upstream raw JSON: `"token_cost_in_usd": "0.065766"` (6 fractional digits).
+   - `decimalStringToScaled("0.065766")`: pads fractional digits with zero to 7 places (`"0657660"`).
+   - Fixed-point integer: `657_660n` ($0.0657660).
+
+2. **RedStone CETES feed** (`redstone-cetes-feed.json`):
+   - Contract raw reading: `price = 6_575_000n` with `decimals = 8`.
+   - Scaling shift: `8 - 7 = 1`.
+   - `rescalePrice(6_575_000n, 8)`: `6_575_000n / 10n = 657_500n` ($0.0657500).
+
+3. **Spiko USTBL** (`spiko-ustbl-latest.json`):
+   - Upstream raw JSON: `"amount": { "value": "1.098479", "currency": "USD" }`.
+   - `decimalStringToScaled("1.098479")`: pads to 7 decimal places (`"0984790"`).
+   - Fixed-point integer: `10_984_790n` ($1.0984790).
 
 ## Tests
 

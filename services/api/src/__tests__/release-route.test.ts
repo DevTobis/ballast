@@ -32,7 +32,7 @@ const bearer = () => ({ authorization: `Bearer ${signSessionToken(BORROWER.accou
  * collateral is worth 800, so the contract's threshold (80%) breaks above 640 of debt.
  * Postgres only knows the 500 of principal drawn: 500 / 800 = 62.5%, which passes.
  */
-function server(creditLine: Record<string, unknown>) {
+function server(creditLine: Record<string, unknown>, customConfig = config) {
   const contracts = {
     creditLine,
     pledgeVault: { release: vi.fn().mockResolvedValue("xdr-release") },
@@ -54,7 +54,7 @@ function server(creditLine: Record<string, unknown>) {
       [schema.repayment, []],
     ]),
   );
-  return { app: buildServer({ config, db, contracts, chain }), contracts };
+  return { app: buildServer({ config: customConfig, db, contracts, chain }), contracts };
 }
 
 const release = (app: ReturnType<typeof server>["app"]) =>
@@ -99,5 +99,21 @@ describe("DELETE /v1/credit-lines/:id/pledges/:pledgeId", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ projectedLtvBps: 6250, debtSource: "estimate" });
+  });
+
+  it("respects non-default thresholds from config for the release gate", async () => {
+    // 600 owed against 800 left = 7500 bps.
+    // Default warning is 7000 (which rejects).
+    // With non-default warning at 8000 bps, 7500 bps is healthy and allowed.
+    const customConfig: ApiConfig = {
+      ...config,
+      marginThresholds: { warningBps: 8000, marginCallBps: 8500, liquidationBps: 9000 },
+    };
+    const { app } = server({ ltv: vi.fn().mockResolvedValue({ debt: 6_000_000_000n }) }, customConfig);
+
+    const res = await release(app);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ xdr: "xdr-release", projectedLtvBps: 7500, debtSource: "on-chain" });
   });
 });

@@ -12,6 +12,7 @@ import { schema, type Database } from "@ballast/db";
 import type { ApiConfig } from "../config.js";
 import { newKeyId, newKeySecret } from "../apiKeys.js";
 import { encryptSecret, isValidSecretKey } from "../webhooks/secretBox.js";
+import { withPartyAdvisoryLock } from "../party-lock.js";
 
 const MAX_ACTIVE_KEYS_PER_PARTY = 10;
 
@@ -31,28 +32,32 @@ export function registerApiKeyRoutes(app: FastifyInstance, db: Database, config:
     const parsed = createSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
 
-    const mine = await db.select().from(schema.partyApiKey).where(eq(schema.partyApiKey.partyId, request.partyId));
-    if (mine.filter((k) => k.status === "active").length >= MAX_ACTIVE_KEYS_PER_PARTY) {
-      return reply.code(409).send({ error: `at most ${MAX_ACTIVE_KEYS_PER_PARTY} active API keys per party` });
-    }
+    const result = await withPartyAdvisoryLock(db, request.partyId, async (tx) => {
+      const mine = await tx.select().from(schema.partyApiKey).where(eq(schema.partyApiKey.partyId, request.partyId));
+      if (mine.filter((k) => k.status === "active").length >= MAX_ACTIVE_KEYS_PER_PARTY) {
+        return { status: 409, body: { error: `at most ${MAX_ACTIVE_KEYS_PER_PARTY} active API keys per party` } };
+      }
 
-    const keyId = newKeyId();
-    const secret = newKeySecret();
-    await db.insert(schema.partyApiKey).values({
-      partyId: request.partyId,
-      stellarAccount: request.stellarAccount!,
-      keyId,
-      secretCiphertext: encryptSecret(secret, config.apiKeySecretKey),
-      label: parsed.data.label ?? null,
-    });
-    await db.insert(schema.auditLog).values({
-      actor: request.stellarAccount!,
-      action: "api_key.create",
-      payload: { keyId, partyId: request.partyId },
+      const keyId = newKeyId();
+      const secret = newKeySecret();
+      await tx.insert(schema.partyApiKey).values({
+        partyId: request.partyId,
+        stellarAccount: request.stellarAccount!,
+        keyId,
+        secretCiphertext: encryptSecret(secret, config.apiKeySecretKey),
+        label: parsed.data.label ?? null,
+      });
+      await tx.insert(schema.auditLog).values({
+        actor: request.stellarAccount!,
+        action: "api_key.create",
+        payload: { keyId, partyId: request.partyId },
+      });
+
+      // The secret is shown exactly once; only its ciphertext is kept.
+      return { status: 201, body: { keyId, secret, label: parsed.data.label ?? null } };
     });
 
-    // The secret is shown exactly once; only its ciphertext is kept.
-    return reply.code(201).send({ keyId, secret, label: parsed.data.label ?? null });
+    return reply.code(result.status).send(result.body);
   });
 
   app.get("/v1/api-keys", { preHandler: sessionOnly }, async (request) => {
@@ -76,6 +81,9 @@ export function registerApiKeyRoutes(app: FastifyInstance, db: Database, config:
       .where(and(eq(schema.partyApiKey.keyId, request.params.keyId), eq(schema.partyApiKey.partyId, request.partyId)))
       .limit(1);
     if (!key) return reply.code(404).send({ error: "api key not found" });
+    if (key.status === "revoked") {
+      return reply.code(204).send();
+    }
 
     await db
       .update(schema.partyApiKey)

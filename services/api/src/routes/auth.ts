@@ -51,7 +51,7 @@ export function registerAuthRoutes(app: FastifyInstance, db: Database, config: A
     try {
       serverKeypair = loadServerKeypair(config);
     } catch {
-      return reply.code(500).send({ error: "SEP-10 server keypair not configured" });
+      return reply.code(503).send({ error: "SEP-10 server keypair not configured" });
     }
 
     const transaction = WebAuth.buildChallengeTx(
@@ -76,7 +76,7 @@ export function registerAuthRoutes(app: FastifyInstance, db: Database, config: A
     try {
       serverKeypair = loadServerKeypair(config);
     } catch {
-      return reply.code(500).send({ error: "SEP-10 server keypair not configured" });
+      return reply.code(503).send({ error: "SEP-10 server keypair not configured" });
     }
 
     let clientAccountID: string;

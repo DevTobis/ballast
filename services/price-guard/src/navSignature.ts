@@ -1,6 +1,6 @@
 /**
  * Canonical NAV message and its Ed25519 verification. Issuers do not sign NAV, so the
- * price-publisher key attests each reading over `` `${assetCode}:${ts}:${value}` `` (UTF-8 bytes)
+ * price-publisher key attests each reading over `` `ballast-nav-v1:${contractAddress}:${assetCode}:${ts}:${value}` `` (UTF-8 bytes)
  * — see `navAttestor.ts` — and `pipeline.ts` checks the signature here before publishing.
  *
  * This is the SAME canonical message the on-chain `PriceGuard.publish_nav` verifies via
@@ -21,8 +21,13 @@ import { createPublicKey, verify as cryptoVerify, type KeyObject } from "node:cr
 const ED25519_SPKI_DER_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 /** Builds the canonical UTF-8 message both the off-chain and on-chain verifiers sign/verify. */
-export function canonicalNavMessage(assetCode: string, ts: number, value: bigint): Buffer {
-  return Buffer.from(`${assetCode}:${ts}:${value.toString()}`, "utf8");
+export function canonicalNavMessage(
+  contractAddress: string,
+  assetCode: string,
+  ts: number,
+  value: bigint,
+): Buffer {
+  return Buffer.from(`ballast-nav-v1:${contractAddress}:${assetCode}:${ts}:${value.toString()}`, "utf8");
 }
 
 /** Reconstructs a Node `KeyObject` from a raw 32-byte Ed25519 public key. */
@@ -39,13 +44,14 @@ export function publicKeyFromRawBase64(rawBase64: string): KeyObject {
 
 /** Verifies `sig` is a valid Ed25519 detached signature of the canonical NAV message. */
 export function verifyNavSignature(
+  contractAddress: string,
   assetCode: string,
   ts: number,
   value: bigint,
   sig: Buffer,
   issuerPublicKeyRawBase64: string,
 ): boolean {
-  const message = canonicalNavMessage(assetCode, ts, value);
+  const message = canonicalNavMessage(contractAddress, assetCode, ts, value);
   const publicKey = publicKeyFromRawBase64(issuerPublicKeyRawBase64);
   return cryptoVerify(null, message, publicKey, sig);
 }

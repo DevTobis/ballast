@@ -14,28 +14,29 @@
  * recovers between this job's read and its transaction cannot cost the borrower their collateral.
  * Every step is safe to repeat. A trade whose guarded price is not usable is left alone: a call
  * is never opened or defaulted on a price the PriceGuard does not stand behind.
+ *
+ * Counts as: processed = `default_close` after the cure deadline, or `call_margin` opening or
+ * clearing a call. skipped = no on-chain id; trade no longer Settled (a Defaulted one is still
+ * reconciled into `repo_trade`); price not usable; healthy with no call, or a call still inside its
+ * cure window. error = the trade threw.
  */
 import { and, eq, isNull } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
 import { scaledToDecimalString } from "@ballast/domain-types";
-import { loadNetworkConfig } from "@ballast/network-config";
 import type { RepoDvpClient } from "@ballast/contract-clients";
-import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
+import type { KmsSigner } from "@ballast/operator-signing";
+import { signAndSubmit, type NetworkSubmissionConfig } from "./submit.js";
 import { emptyResult, type JobResult } from "./types.js";
 
 const IN_CALL_BAND = new Set(["MarginCall", "Liquidation"]);
-
-async function signAndSubmit(signer: KmsSigner, unsignedXdr: string): Promise<string> {
-  const network = loadNetworkConfig();
-  const submitted = await submitSignedTx(network.rpcUrl, network.networkPassphrase, await signer.sign(unsignedXdr));
-  return submitted.hash;
-}
 
 export async function runRepoMarginJob(
   db: Database,
   repoDvpClient: RepoDvpClient,
   signer: KmsSigner,
   now: Date = new Date(),
+  /** RPC URL and passphrase from the keeper's startup config; omitted, the environment is read. */
+  network?: NetworkSubmissionConfig,
 ): Promise<JobResult> {
   const result = emptyResult();
   const keeper = signer.publicKey();
@@ -71,7 +72,7 @@ export async function runRepoMarginJob(
       const deadline = onChain.cureDeadline != null ? Number(onChain.cureDeadline) : null;
 
       if (onChain.pendingMarginCall && inBand && deadline !== null && now.getTime() / 1000 >= deadline) {
-        await signAndSubmit(signer, await repoDvpClient.defaultClose(keeper, id));
+        await signAndSubmit(signer, await repoDvpClient.defaultClose(keeper, id), network);
         await db.update(schema.repoTrade).set({ status: "defaulted" }).where(eq(schema.repoTrade.id, trade.id));
         result.processed++;
         continue;
@@ -79,10 +80,15 @@ export async function runRepoMarginJob(
 
       if (inBand !== onChain.pendingMarginCall) {
         // Either a call has to be opened, or the open one has been cured by the price.
-        await signAndSubmit(signer, await repoDvpClient.callMargin(keeper, id));
+        await signAndSubmit(signer, await repoDvpClient.callMargin(keeper, id), network);
         const after = await repoDvpClient.trade(id);
 
         if (after.pendingMarginCall && after.cureDeadline != null) {
+          // USDC is correct by construction, not a shortcut: RepoDvP holds one cash token per
+          // deployment (the instance `usdc` set by `set_usdc`), every cash leg moves that token,
+          // and `margin_call_amount` is denominated in it. `repo_trade` therefore has no currency
+          // column; if RepoDvP ever supports more than one cash token, store it on the trade
+          // and read it here instead.
           await db.insert(schema.repoMarginCall).values({
             tradeId: trade.id,
             amount: scaledToDecimalString(BigInt(after.marginCallAmount)),

@@ -13,15 +13,35 @@ but does not call that service.
 | job | default schedule | what it does |
 |---|---|---|
 | `sync-collateral` | every minute | For each open line, compares `CreditLine`'s pledged units with what `PledgeVault` holds and pushes the vault's figure if they differ. Never derives it from Postgres. Submits nothing for a line already in step. |
-| `cure-expiry` | `*/5 * * * *` | For open lines whose latest `margin_event` is `MarginCall` or `Liquidation`: re-reads LTV from the contract, `poke`s to arm the breach flag, and once the cure window has run out calls `CreditLine.liquidate` then `PledgeVault.liquidate` (collateral goes to the lender). Books `pledge`, `liquidation` and `credit_line` rows. A line only in `MarginCall` is never liquidated. |
+| `cure-expiry` | `*/5 * * * *` | For open lines whose latest `margin_event` is `MarginCall` or `Liquidation`: re-reads LTV from the contract, `poke`s to arm the breach flag, and once the cure window has run out calls `CreditLine.liquidate` then `PledgeVault.liquidate` (collateral goes to the lender). The cure clock is measured from `margin_event.created_at` (see `services/margin-monitor/README.md` for detection timing and cure window interactions). Books `pledge`, `liquidation` and `credit_line` rows. A line only in `MarginCall` is never liquidated. |
 | `interest-accrual` | hourly (`0 * * * *`) | `poke`s every open line that has an on-chain id. |
-| `repo-margin` | `*/5 * * * *` | For settled repo trades: `call_margin` when collateral stops covering exposure, `call_margin` again to clear a cured call, `default_close` after the cure deadline. Records `repo_margin_call` rows. Skips a trade whose guarded price is not usable. |
+| `repo-margin` | `*/5 * * * *` | For settled repo trades: `call_margin` when collateral stops covering exposure, `call_margin` again to clear a cured call, `default_close` after the cure deadline. Records `repo_margin_call` rows with USDC margin currency (RepoDvP cash legs and margin calls are strictly denominated in USDC per PRD §5 and §8). Skips a trade whose guarded price is not usable. |
 | `repo-unwind` | `*/5 * * * *` | `RepoDvp.unwind` for settled trades past maturity; records status and `leg2_tx` on `repo_trade`. |
 | balance check | `7 * * * *` | Alerts when the keeper account's XLM balance is low. |
 
 Jobs run one at a time through a shared queue, because they share one account and its sequence number.
 Each job returns `{ processed, skipped, errors }`; a failing row is logged and does not stop the rest.
 Liquidation and margin steps are written to be safe to repeat after a crash (see [../../TROUBLESHOOTING.md](../../TROUBLESHOOTING.md#liquidation-runs-get-stuck-or-stop-half-finished) for operator recovery steps).
+
+## Deployment Constraints
+
+**Strictly only one keeper instance may run per operator account.**
+
+Do not attempt to scale the keeper service (`--scale keeper=N`) for high availability. Every keeper job signs transactions using the same operator key, and Stellar strictly enforces sequential sequence numbers per account.
+
+### Why only one instance
+If multiple keeper instances run concurrently with the same operator account:
+- **`txBadSeq` errors**: Concurrent jobs fetch the same sequence number from the RPC network, causing one or both transactions to be rejected by the Stellar network.
+- **Race conditions & duplicate bookings**: Multiple instances could attempt to process the same unhealthy loan or mature repo trade simultaneously, resulting in duplicate liquidation records or conflicting contract calls.
+- **Wasted fees**: Redundant transactions that race each other burn transaction fees.
+
+### Rolling restarts
+When deploying updates to the keeper:
+- Always use a **stop-before-start** strategy (stop the old keeper container before starting the new one). Never use an overlapping start-before-stop rolling update.
+- Ensure the old instance is given enough time to shut down gracefully (`stop_grace_period: 70s` in Docker Compose allows `KEEPER_SHUTDOWN_GRACE_MS` to finish the in-flight job).
+
+### Advisory locking
+To defend against temporary overlaps during rolling restarts or misconfigured deployments, keeper acquires session-level Postgres advisory locks (`pg_try_advisory_lock`) on each tick before running a job. While this prevents simultaneous execution, running multiple instances remains an operational anti-pattern.
 
 ## Replica Behaviour and Advisory Locking
 
@@ -46,6 +66,24 @@ pnpm --filter @ballast/service-keeper dev   # this service only (tsx watch)
 pnpm --filter @ballast/service-keeper build && pnpm --filter @ballast/service-keeper start
 ```
 
+### Run-once job CLI
+
+Run a single keeper job immediately and exit (useful for drills, testing, and incident response):
+
+```bash
+pnpm --filter @ballast/service-keeper run-once <job-name>
+# or via compiled dist:
+node dist/cli.js run <job-name>
+```
+
+Available jobs: `cure-expiry`, `repo-unwind`, `repo-margin`, `sync-collateral`, `interest-accrual`, `balance`.
+The CLI prints the JSON `JobResult` and exits with code 1 if any row errored or the job crashed, 0 otherwise.
+It takes the same Postgres advisory lock as the scheduled job (`keeper:<job>`, or `keeper:global` with
+`KEEPER_LOCK_SCOPE=global`), so if the running keeper is in the middle of that job it refuses with exit
+code 1 instead of racing it. Other jobs on the live keeper can still run at the same moment and share the
+keeper account's sequence number, so prefer stopping the scheduler (or running during a quiet window)
+for anything but a read-mostly job. There is no `--dry-run`: every job signs and submits transactions.
+
 The repo-root `.env` is loaded automatically. `scripts/dev-setup.sh` writes one and sets the cure-expiry,
 repo-unwind and repo-margin schedules to every minute for local work.
 
@@ -67,8 +105,23 @@ repo-unwind and repo-margin schedules to every minute for local work.
 ## Source map
 
 - `src/index.ts`: wiring, cron registration, the serial job queue, balance check, graceful shutdown.
+- `src/cli.ts`: run-once CLI runner for operator drills and incident response.
 - `src/jobs/syncCollateral.ts`, `cureExpiry.ts`, `interestAccrual.ts`, `repoMargin.ts`, `repoUnwind.ts`: one file per job.
+- `src/jobs/submit.ts`: shared transaction signing and submission helper for keeper jobs.
 - `src/jobs/types.ts`: the shared `JobResult` shape.
+
+## Troubleshooting Job Errors
+
+When keeper jobs or operator transactions fail, errors originate either in the specific job logic or in `submitSignedTx` (`packages/operator-signing/src/submit.ts`).
+
+| Error Message | Meaning | Retries Next Run? | Safe to Ignore? | Action |
+|---|---|---|---|---|
+| `no stellar account on file for lender <id>` | The lender record exists in Postgres but has no entry in `party_account` with a Stellar public key. Collateral seizure cannot proceed without a destination address. | Yes | **No** | Register the lender's Stellar account in `party_account` or complete lender onboarding/KYB. |
+| `submitSignedTx: send failed: ...` | Stellar RPC rejected transaction submission at the boundary (e.g. `tx_bad_seq`, `tx_insufficient_balance`, or network error). | Yes | **Yes**, if transient (network blip or sequence conflict); **No** if insufficient XLM balance. | Check operator XLM balance (`checkOperatorBalance`); fund account if needed. Verify RPC connectivity. |
+| `submitSignedTx: transaction <hash> failed on-chain` | The transaction was included in a ledger but Soroban execution failed/trapped (e.g. contract condition violated, such as credit line already closed or health restored). | Yes | **Yes**, typically indicates state moved before submission. | Inspect transaction hash on Stellar Expert / Horizon for exact error code; check if the position cured or was resolved by a borrower. |
+| `submitSignedTx: transaction <hash> did not finalize after 30 attempts` | The transaction was submitted to the network, but polling `getTransaction` timed out (~30s) without confirming SUCCESS or FAILED. | Yes | **Ambiguous** — do NOT immediately resubmit manually. | Query Horizon/RPC for `<hash>` to determine whether it eventually landed. The next scheduled keeper run will safely re-evaluate on-chain state before resubmitting. |
+| `no seized units recoverable for line <id>` | `PledgeVault.liquidate` returned 0 seized units (e.g. units were already seized in a prior run or collateral balance was 0). | No (once line status is updated) | **Yes**, if a prior run already moved collateral. | Verify the credit line's on-chain vault position. |
+| *Vault / credit-line disagreement* (silent skip in `cureExpiry.ts:118`) | In `cure-expiry`, if the units held by `PledgeVault` differ from `CreditLine`'s recorded `pledgedUnits`, the row is skipped silently without throwing an error. | Yes | **Yes** | No manual action required. `sync-collateral` runs every minute and automatically repairs discrepancies between `PledgeVault` and `CreditLine`. |
 
 ## Graceful shutdown
 

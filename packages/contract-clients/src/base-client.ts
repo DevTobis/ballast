@@ -16,6 +16,10 @@ export abstract class BaseContractClient {
     this.contractId = config.contractId;
   }
 
+  get contractAddress(): string {
+    return this.contractId;
+  }
+
   /** Returns unsigned, prepared XDR for a state-changing call. */
   protected invoke(sourcePublicKey: string, method: string, args: xdr.ScVal[]): Promise<string> {
     return buildUnsignedTx(this.network, sourcePublicKey, this.contractId, method, args);
