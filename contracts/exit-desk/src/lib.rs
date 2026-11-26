@@ -564,7 +564,7 @@ impl ExitDesk {
         let daily_used: i128 = env.storage().temporary().get(&daily_key).unwrap_or(0);
         let holder_room = (config.per_holder_daily_cap - daily_used).max(0);
 
-        let inventory_key = DataKey::Inventory(asset);
+        let inventory_key = DataKey::Inventory(asset.clone());
         let inventory: i128 = env.storage().persistent().get(&inventory_key).unwrap_or(0);
         let inventory_room = (config.desk_inventory_cap - inventory).max(0);
 
