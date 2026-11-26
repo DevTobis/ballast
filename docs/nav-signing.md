@@ -112,8 +112,16 @@ stellar contract invoke \
 ```
 
 ### 4. Publishing NAV
-The publisher signs the canonical message using `scripts/sign-nav.mjs` and submits:
+The publisher signs the canonical message using `scripts/sign-nav.mjs` and submits.
+
+`asset_code` is a `Bytes` argument. The stellar CLI takes `Bytes` (and `BytesN`) arguments as a hex
+string, not as text, so encode the ticker first. `sign-nav.mjs` takes the plain ticker, because the
+signed message contains its raw UTF-8 bytes:
+
 ```bash
+ASSET_CODE=SPIKO
+ASSET_CODE_HEX=$(printf %s "$ASSET_CODE" | od -An -tx1 | tr -d ' \n')   # "SPIKO" -> 5350494b4f
+
 NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" "$ASSET_CODE" "$TS" "$VALUE")
 
 stellar contract invoke \
