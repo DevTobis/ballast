@@ -179,7 +179,7 @@ Decimal strings appear only where routes return raw database rows without going 
 | `POST /v1/credit-lines/:id/pledges` | `units` (`bigintish`, scaled) | Passed to contract as `BigInt`; stored via `scaledToDecimalString` in `pledge.units` | `xdr`, `txHash`, `pledgeId` (no monetary fields) |
 | `DELETE /v1/credit-lines/:id/pledges/:pledgeId` | — | Stored `pledge.units` (decimal string) converted via `decimalStringToScaled` for contract `release` | `projectedLtvBps` (bps; no monetary fields) |
 | `POST /v1/credit-lines/:id/draws` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt`; `amount.toString()` in audit log & intent payload | `xdr`, `txHash` (no monetary fields) |
-| `POST /v1/credit-lines/:id/repayments` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt`; `amount.toString()` in audit log & intent payload | `xdr`, `txHash` (no monetary fields) |
+| `POST /v1/credit-lines/:id/repayments` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt` (amount acts as a cap: on-chain `repay` applies `min(amount, owed)`); `amount.toString()` in audit log & intent payload | `xdr`, `txHash` (no monetary fields) |
 
 ### Exit endpoints
 

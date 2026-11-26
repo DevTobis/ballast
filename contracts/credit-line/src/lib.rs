@@ -2,6 +2,10 @@
 // Contract entry points take their inputs as flat arguments (that's the on-chain interface), and
 // `#[contractimpl]` generates client functions with the same arity.
 #![allow(clippy::too_many_arguments)]
+// Events are published with `Events::publish`, which soroban-sdk now deprecates in favour of
+// `#[contractevent]`. Moving over changes how events are encoded on-chain, so it has to be done
+// together with the off-chain readers (services/indexer, services/ledger) and a redeploy.
+#![allow(deprecated)]
 
 //! `CreditLine` (PRD §6.2, §8): lender commitments, draws, repayments, interest accrual, LTV
 //! computation, the margin state machine, and the liquidation entry point. Holds USDC "in transit
@@ -28,8 +32,17 @@
 //! doc comment. A fully wired system would have this function call it cross-contract
 //! automatically; that dependency isn't set up in this pass (this crate deliberately doesn't take
 //! a Cargo dependency on `pledge-vault`), so an off-chain keeper service is expected to call both
-//! `CreditLine::liquidate` and `PledgeVault::liquidate`. This is the least clean part of this
-//! skeleton.
+//! `CreditLine::liquidate` and `PledgeVault::liquidate`. However, `close_liquidated` verifies
+//! cross-contract that collateral has actually left `PledgeVault` (`position_units == 0`) before
+//! closing, preventing the line from closing while collateral is still in the vault.
+//!
+//! **Input bounds on `open`.** `open` refuses a non-positive or oversized `limit`
+//! (`MAX_LIMIT`), a `rate_bps` above `MAX_RATE_BPS`, a cure window shorter than `MIN_CURE_S`,
+//! `lender == borrower`, and an asset that has not been `configure_asset`d. Before these checks,
+//! a line could be opened with `rate_bps = u32::MAX` (the interest product then traps for a large
+//! line, blocking `ltv`, `release` and `liquidate`), with no cure window, against an unconfigured
+//! asset (the first `fund` panicked and left an orphan line id), or with the lender as the
+//! borrower. The caps are derived and documented at their definitions below.
 //!
 //! **Invariant 6** ("the admin cannot move user funds"): every function that moves USDC out of
 //! this contract (`draw`) or pulls funds in from a specific party (`fund`, `repay`) requires
@@ -48,9 +61,11 @@
 //! the TTL of a dormant credit line before it archives.
 //!
 //! **Events.** Like `PledgeVault`, state changes publish one event with the shape
-//! `((Symbol, line), payload)`: `line_closed` from `close_liquidated` and `undrawn_withdrawn` from
-//! `withdraw_undrawn` (which moves the lender's funded exposure and so needs an on-chain trace for
-//! the console and indexer). See `README.md`'s events table for the exact topics and payloads.
+//! `((Symbol, line), payload)`: `drawn` from `draw`, `repaid` from `repay`, `line_closed` from
+//! `close_liquidated` and `undrawn_withdrawn` from `withdraw_undrawn` (which moves the lender's
+//! funded exposure and so needs an on-chain trace for the console and indexer). See `README.md`'s
+//! events table for the exact topics and payloads:
+//! - `drawn`: `((Symbol("drawn"), line: u64), (amount: i128, to: Address, drawn_total: i128, ltv_bps: u32))`
 
 use ballast_common::{
     access::{self, Roles},
@@ -66,12 +81,46 @@ use soroban_sdk::{
 
 const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 const BPS_DENOMINATOR: i128 = 10_000;
+const MAX_FEE_BPS: u32 = 10_000;
+
+/// The largest annual rate `open` accepts, in bps: 10,000 = 100% a year, the same cap `RepoDvP`
+/// applies to a repo's `rate_bps`. A larger rate makes `interest_delta`'s
+/// `drawn * rate_bps * elapsed` product grow fast enough to trap on i128 overflow for a large
+/// line, which would block `ltv`, `release` and `liquidate`.
+pub const MAX_RATE_BPS: u32 = 10_000;
+
+/// The shortest cure window `open` accepts, in seconds: one hour. PRD §5's default is 24h; a zero
+/// (or near-zero) window would let the keeper liquidate in the same breath as the margin call,
+/// giving the borrower no chance to top up or repay.
+pub const MIN_CURE_S: u64 = 3_600;
+
+/// The longest term the `MAX_LIMIT` overflow bound assumes: 100 years. A line can be opened for
+/// any duration `open` accepts, but accrual that far out is already far beyond any realistic
+/// credit-line term and still leaves the interest product well inside `i128`.
+pub const MAX_TERM_S: u64 = 100 * 365 * 24 * 60 * 60;
+
+/// The largest principal `open` accepts, in 7-decimal units. Derived from the worst case for
+/// `rate_delta`'s `drawn * bps * elapsed` product: the full `MAX_TERM_S` at the combined annual
+/// cap `MAX_RATE_BPS + MAX_FEE_BPS` = 20,000 bps. Keeping that product at or below `i128::MAX`
+/// means interest and fee accrual cannot trap for a line `open` accepted, even if the line sits
+/// untouched for the whole term. `rate_delta` computes the rate and the fee separately, so using
+/// the combined cap here is already conservative. This is an overflow guard, not an economic
+/// limit: per-deployment exposure limits belong elsewhere.
+pub const MAX_LIMIT: i128 =
+    i128::MAX / ((MAX_RATE_BPS as i128 + MAX_FEE_BPS as i128) * MAX_TERM_S as i128);
 
 /// Cross-contract call to PriceGuard, declared as a local trait so CreditLine never takes a
 /// Cargo dependency on the price-guard crate (being rewritten concurrently by another agent).
 #[contractclient(name = "PriceGuardClient")]
 pub trait PriceGuardInterface {
     fn guarded_price(env: Env, asset: Address) -> GuardedPrice;
+}
+
+/// Cross-contract call to PledgeVault, declared as a local trait so CreditLine never takes a
+/// Cargo dependency on the pledge-vault crate.
+#[contractclient(name = "PledgeVaultClient")]
+pub trait PledgeVaultInterface {
+    fn position_units(env: Env, line: u64, asset: Address) -> i128;
 }
 
 fn muxed(addr: &Address) -> MuxedAddress {
@@ -123,7 +172,8 @@ pub struct LiquidationRecord {
     pub seized_units: i128,
     /// Guarded price (7-decimal) read when the breach was confirmed.
     pub price: i128,
-    /// Principal plus interest owed at that moment.
+    /// Principal plus interest owed to the lender at that moment (excludes unpaid platform fees,
+    /// which are waived on liquidation rather than settled to the lender).
     pub debt: i128,
     pub closed: bool,
     /// `seized_units * price`, no haircut. Zero until the line is closed.
@@ -145,11 +195,13 @@ pub struct Line {
     pub drawn: i128,
     pub pledged_units: i128,
     pub rate_bps: u32,
+    pub fee_bps: u32,
     pub cure_s: u64,
     pub agreement: BytesN<32>,
     pub status: LineStatus,
     pub last_accrual_ts: u64,
     pub accrued_interest: i128,
+    pub accrued_fee: i128,
     pub margin_state: MarginState,
     /// PRD §8 invariant 3: the ledger sequence at which a `Liquidation`-state breach was first
     /// observed (via `poke`), and the LTV that was observed then. `liquidate` requires a
@@ -172,8 +224,12 @@ enum DataKey {
     Line(u64),
     /// The `PledgeVault` allowed to report a line's collateral directly (see `sync_from_vault`).
     Vault,
+    /// Protocol treasury allowed to withdraw repaid platform fees (`claim_fee`).
+    Treasury,
     /// Interest repaid on a line that the lender has not withdrawn yet.
     Claimable(u64),
+    /// Platform fees repaid on a line that the treasury has not withdrawn yet.
+    FeeClaimable(u64),
     Liquidation(u64),
 }
 
@@ -188,6 +244,28 @@ fn read_claimable(env: &Env, line: u64) -> i128 {
 
 fn write_claimable(env: &Env, line: u64, amount: i128) {
     let key = DataKey::Claimable(line);
+    env.storage().persistent().set(&key, &amount);
+    ttl::extend_persistent(env, &key);
+}
+
+fn read_treasury(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::Treasury)
+        .expect("credit-line: treasury not configured")
+}
+
+fn read_fee_claimable(env: &Env, line: u64) -> i128 {
+    let key = DataKey::FeeClaimable(line);
+    let amount = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        ttl::extend_persistent(env, &key);
+    }
+    amount
+}
+
+fn write_fee_claimable(env: &Env, line: u64, amount: i128) {
+    let key = DataKey::FeeClaimable(line);
     env.storage().persistent().set(&key, &amount);
     ttl::extend_persistent(env, &key);
 }
@@ -233,13 +311,28 @@ fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
         .expect("credit-line: asset not configured")
 }
 
+fn rate_delta(drawn: i128, bps: u32, elapsed: i128) -> i128 {
+    (drawn * bps as i128 * elapsed) / SECONDS_PER_YEAR / BPS_DENOMINATOR
+}
+
 /// Interest accrued between `line.last_accrual_ts` and `now`, on top of whatever is already
 /// booked in `line.accrued_interest`. Simple, non-compounding annualized rate, matching PRD §5's
 /// "Fixed annual rate per line, accrued per ledger": `drawn * rate_bps * elapsed_s / year_s /
 /// 10_000`.
 fn interest_delta(line: &Line, now: u64) -> i128 {
     let elapsed = now.saturating_sub(line.last_accrual_ts) as i128;
-    (line.drawn * line.rate_bps as i128 * elapsed) / SECONDS_PER_YEAR / BPS_DENOMINATOR
+    rate_delta(line.drawn, line.rate_bps, elapsed)
+}
+
+fn fee_delta(line: &Line, now: u64) -> i128 {
+    let elapsed = now.saturating_sub(line.last_accrual_ts) as i128;
+    rate_delta(line.drawn, line.fee_bps, elapsed)
+}
+
+fn accrue(line: &mut Line, now: u64) {
+    line.accrued_interest += interest_delta(line, now);
+    line.accrued_fee += fee_delta(line, now);
+    line.last_accrual_ts = now;
 }
 
 /// Recomputes debt, collateral value, and LTV for `line` from a fresh guarded price read. Doesn't
@@ -253,7 +346,12 @@ fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
     let config = read_asset_config(env, &line.asset);
     let guarded = PriceGuardClient::new(env, &config.price_guard).guarded_price(&line.asset);
 
-    let debt = line.drawn + line.accrued_interest + interest_delta(line, env.ledger().timestamp());
+    let now = env.ledger().timestamp();
+    let debt = line.drawn
+        + line.accrued_interest
+        + interest_delta(line, now)
+        + line.accrued_fee
+        + fee_delta(line, now);
     let collateral_value =
         risk::collateral_value(line.pledged_units, guarded.value, config.haircut_bps);
     let ltv_bps = risk::ltv_bps(debt, collateral_value);
@@ -340,12 +438,29 @@ impl CreditLine {
         asset: Address,
         limit: i128,
         rate_bps: u32,
+        fee_bps: u32,
         cure_s: u64,
         agreement: BytesN<32>,
     ) -> u64 {
         ttl::extend_instance(&env);
         lender.require_auth();
         assert!(limit > 0, "credit-line: limit must be positive");
+        assert!(limit <= MAX_LIMIT, "credit-line: limit exceeds MAX_LIMIT");
+        assert!(
+            rate_bps <= MAX_RATE_BPS,
+            "credit-line: rate_bps exceeds MAX_RATE_BPS"
+        );
+        assert!(
+            cure_s >= MIN_CURE_S,
+            "credit-line: cure_s is below MIN_CURE_S"
+        );
+        assert!(
+            lender != borrower,
+            "credit-line: lender and borrower must differ"
+        );
+        assert!(fee_bps <= MAX_FEE_BPS, "credit-line: fee_bps exceeds 10_000");
+        // Fail here, before an id is consumed, rather than at the first `fund`.
+        read_asset_config(&env, &asset);
 
         let id: u64 = env
             .storage()
@@ -368,11 +483,13 @@ impl CreditLine {
                 drawn: 0,
                 pledged_units: 0,
                 rate_bps,
+                fee_bps,
                 cure_s,
                 agreement,
                 status: LineStatus::Open,
                 last_accrual_ts: env.ledger().timestamp(),
                 accrued_interest: 0,
+                accrued_fee: 0,
                 margin_state: MarginState::Healthy,
                 breach_ledger: None,
                 breach_ltv_bps: 0,
@@ -509,8 +626,7 @@ impl CreditLine {
         );
 
         let now = env.ledger().timestamp();
-        state.accrued_interest += interest_delta(&state, now);
-        state.last_accrual_ts = now;
+        accrue(&mut state, now);
 
         assert!(
             amount <= state.funded - state.drawn,
@@ -530,7 +646,7 @@ impl CreditLine {
 
         let collateral_value =
             risk::collateral_value(state.pledged_units, guarded.value, config.haircut_bps);
-        let post_draw_debt = state.drawn + state.accrued_interest + amount;
+        let post_draw_debt = state.drawn + state.accrued_interest + state.accrued_fee + amount;
         let ltv_bps = risk::ltv_bps(post_draw_debt, collateral_value);
         let margin_state = margin::classify(ltv_bps, &config.thresholds);
         assert!(
@@ -547,6 +663,11 @@ impl CreditLine {
         state.drawn += amount;
         state.margin_state = margin_state;
         write_line(&env, line, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "drawn"), line),
+            (amount, to, state.drawn, ltv_bps),
+        );
     }
 
     /// PRD §8 invariant 5 ("pausing cannot move funds"): deliberately *not* gated by
@@ -556,6 +677,11 @@ impl CreditLine {
     /// only that is transferred. It returns the amount applied. A borrower who wants to clear the
     /// line signs a figure at or above the debt and interest accrued before inclusion cannot strand
     /// dust or make the call panic.
+    ///
+    /// Publishes `(Symbol("repaid"), line)` with `(payer, interest_paid, principal_paid,
+    /// drawn_after)`, the split the repayment row in PRD §7 needs. The two paid figures sum to the
+    /// amount applied and `drawn_after` is the remaining principal; a reverted repayment publishes
+    /// nothing.
     pub fn repay(env: Env, payer: Address, line: u64, amount: i128) -> i128 {
         ttl::extend_instance(&env);
         payer.require_auth();
@@ -564,22 +690,30 @@ impl CreditLine {
         let mut state = read_line(&env, line);
 
         let now = env.ledger().timestamp();
-        state.accrued_interest += interest_delta(&state, now);
-        state.last_accrual_ts = now;
+        accrue(&mut state, now);
 
         // `amount` is a cap, not an exact figure: the borrower signs it some time before the
-        // ledger closes, and interest keeps accruing in between. Applying `min(amount, owed)`
-        // lets "pay everything, up to X" clear a line instead of leaving dust or panicking.
-        let owed = state.accrued_interest + state.drawn;
+        // ledger closes, and interest/fees keep accruing in between. Applying `min(amount, owed)`
+        // (fee -> interest -> principal) lets "pay everything, up to X" clear a line cleanly.
+        let owed = state.accrued_fee + state.accrued_interest + state.drawn;
         assert!(owed > 0, "credit-line: nothing owed");
         let applied = amount.min(owed);
 
         let mut remaining = applied;
+        let pay_fee = remaining.min(state.accrued_fee);
+        state.accrued_fee -= pay_fee;
+        remaining -= pay_fee;
+        if pay_fee > 0 {
+            write_fee_claimable(&env, line, read_fee_claimable(&env, line) + pay_fee);
+        }
+
         let pay_interest = remaining.min(state.accrued_interest);
         state.accrued_interest -= pay_interest;
         remaining -= pay_interest;
-        // Interest belongs to the lender, who takes it out with `withdraw_interest`.
-        write_claimable(&env, line, read_claimable(&env, line) + pay_interest);
+        if pay_interest > 0 {
+            // Interest belongs to the lender, who takes it out with `withdraw_interest`.
+            write_claimable(&env, line, read_claimable(&env, line) + pay_interest);
+        }
 
         let pay_principal = remaining.min(state.drawn);
         state.drawn -= pay_principal;
@@ -595,6 +729,14 @@ impl CreditLine {
         );
 
         write_line(&env, line, &state);
+
+        // The interest/principal split is otherwise lost off chain: the indexer stores events
+        // generically, and recomputing the split would need a pre-state it may not have.
+        env.events().publish(
+            (Symbol::new(&env, "repaid"), line),
+            (payer, pay_interest, pay_principal, state.drawn),
+        );
+
         applied
     }
 
@@ -678,14 +820,18 @@ impl CreditLine {
         );
 
         // Freeze what the outcome will be measured against: the whole position, the confirmed
-        // price and the debt at this moment (see `LiquidationRecord`).
+        // price and the lender's debt (principal + interest) at this moment (see
+        // `LiquidationRecord`). Unpaid platform fees are excluded so the lender never pockets
+        // protocol fees or reduces the borrower's surplus; `close_liquidated` waives them.
+        let now = env.ledger().timestamp();
+        let lender_debt = state.drawn + state.accrued_interest + interest_delta(&state, now);
         write_liquidation(
             &env,
             line,
             &LiquidationRecord {
                 seized_units: state.pledged_units,
                 price,
-                debt: view.debt,
+                debt: lender_debt,
                 closed: false,
                 recovered: 0,
                 surplus: 0,
@@ -705,6 +851,10 @@ impl CreditLine {
 
     /// Books the outcome of a liquidation and closes the line. Called by the lender once the
     /// keeper has moved the collateral to them in kind (`PledgeVault::liquidate`).
+    ///
+    /// Verifies cross-contract via `PledgeVault::position_units` that the line's collateral has
+    /// actually left the vault (`position_units == 0`). If no vault is configured, close is allowed
+    /// only when zero units were pledged/seized.
     ///
     /// The collateral is valued at the guarded price confirmed when the breach was flagged
     /// (`LiquidationRecord`), not at a price the lender supplies, so the lender cannot understate
@@ -726,6 +876,24 @@ impl CreditLine {
 
         let mut record = read_liquidation(&env, line);
 
+        let vault_opt: Option<Address> = env.storage().instance().get(&DataKey::Vault);
+        match vault_opt {
+            Some(vault) => {
+                let remaining =
+                    PledgeVaultClient::new(&env, &vault).position_units(&line, &state.asset);
+                assert_eq!(
+                    remaining, 0,
+                    "credit-line: collateral has not left the vault"
+                );
+            }
+            None => {
+                assert!(
+                    record.seized_units == 0 && state.pledged_units == 0,
+                    "credit-line: vault not configured"
+                );
+            }
+        }
+
         let recovered = risk::collateral_value(record.seized_units, record.price, 0);
         let surplus = (recovered - record.debt).max(0);
         let shortfall = (record.debt - recovered).max(0);
@@ -742,6 +910,7 @@ impl CreditLine {
         state.funded -= state.drawn;
         state.drawn = 0;
         state.accrued_interest = 0;
+        state.accrued_fee = 0;
         state.pledged_units = 0;
         state.margin_state = MarginState::Healthy;
         state.breach_ledger = None;
@@ -832,6 +1001,45 @@ impl CreditLine {
         read_claimable(&env, line)
     }
 
+    /// Sets the protocol treasury address allowed to withdraw repaid platform fees. Admin only.
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
+        ttl::extend_instance(&env);
+        let _ = admin;
+        access::require_admin(&env);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+    }
+
+    /// Withdraws repaid platform fees to the configured treasury address. Treasury auth only.
+    pub fn claim_fee(env: Env, treasury: Address, line: u64, amount: i128) {
+        ttl::extend_instance(&env);
+        treasury.require_auth();
+        assert!(amount > 0, "credit-line: amount must be positive");
+
+        let stored = read_treasury(&env);
+        assert_eq!(treasury, stored, "credit-line: caller is not the treasury");
+        let claimable = read_fee_claimable(&env, line);
+        assert!(
+            amount <= claimable,
+            "credit-line: withdrawal exceeds claimable fees"
+        );
+
+        write_fee_claimable(&env, line, claimable - amount);
+
+        let state = read_line(&env, line);
+        let config = read_asset_config(&env, &state.asset);
+        token::Client::new(&env, &config.usdc).transfer(
+            &env.current_contract_address(),
+            muxed(&treasury),
+            &amount,
+        );
+    }
+
+    /// Platform fees repaid on `line` and not yet withdrawn by treasury.
+    pub fn claimable_fee(env: Env, line: u64) -> i128 {
+        ttl::extend_instance(&env);
+        read_fee_claimable(&env, line)
+    }
+
     /// The recorded liquidation outcome for `line`, if it was liquidated.
     pub fn liquidation_record(env: Env, line: u64) -> LiquidationRecord {
         ttl::extend_instance(&env);
@@ -851,15 +1059,39 @@ impl CreditLine {
     pub fn debt_of(env: Env, line: u64) -> i128 {
         ttl::extend_instance(&env);
         let state = read_line(&env, line);
-        state.drawn + state.accrued_interest + interest_delta(&state, env.ledger().timestamp())
+        let now = env.ledger().timestamp();
+        state.drawn
+            + state.accrued_interest
+            + interest_delta(&state, now)
+            + state.accrued_fee
+            + fee_delta(&state, now)
     }
 
     /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
     /// the line they're claiming to release collateral from, without decoding this contract's
     /// full `Line` struct on the other side.
+    ///
+    /// Part of the vault-facing getter interface, with `lender_of` and `status_of`. Unknown lines
+    /// panic (`credit-line: unknown line`) like every other `Line` read.
     pub fn borrower_of(env: Env, line: u64) -> Address {
         ttl::extend_instance(&env);
         read_line(&env, line).borrower
+    }
+
+    /// A minimal, dedicated getter for `line`'s lender, so the vault can check a liquidation
+    /// recipient without decoding the whole `Line` struct. Vault-facing, like `borrower_of`;
+    /// unknown lines panic.
+    pub fn lender_of(env: Env, line: u64) -> Address {
+        ttl::extend_instance(&env);
+        read_line(&env, line).lender
+    }
+
+    /// `line`'s status (`Open`, `Liquidating` or `Closed`), so a caller can gate a path on the
+    /// state machine without decoding `Line`. Vault-facing, like `borrower_of`; unknown lines
+    /// panic.
+    pub fn status_of(env: Env, line: u64) -> LineStatus {
+        ttl::extend_instance(&env);
+        read_line(&env, line).status
     }
 
     /// Extends instance TTL and persistent storage TTL for `line` (and its claimable and
@@ -876,6 +1108,10 @@ impl CreditLine {
         let claimable_key = DataKey::Claimable(line);
         if env.storage().persistent().has(&claimable_key) {
             ttl::extend_persistent(&env, &claimable_key);
+        }
+        let fee_claimable_key = DataKey::FeeClaimable(line);
+        if env.storage().persistent().has(&fee_claimable_key) {
+            ttl::extend_persistent(&env, &fee_claimable_key);
         }
         let liq_key = DataKey::Liquidation(line);
         if env.storage().persistent().has(&liq_key) {
@@ -974,12 +1210,41 @@ mod test {
         }
     }
 
+    // A minimal in-crate test vault implementing `position_units` and `set_position_units` — same
+    // hermetic testing pattern as `mock_price_guard` and `mock_token`.
+    mod test_vault {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+        #[contract]
+        pub struct TestVault;
+
+        #[contracttype]
+        enum DataKey {
+            Units(u64, Address),
+        }
+
+        #[contractimpl]
+        impl TestVault {
+            pub fn set_position_units(env: Env, line: u64, asset: Address, units: i128) {
+                env.storage().instance().set(&DataKey::Units(line, asset), &units);
+            }
+
+            pub fn position_units(env: Env, line: u64, asset: Address) -> i128 {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Units(line, asset))
+                    .unwrap_or(0)
+            }
+        }
+    }
+
     struct Harness {
         env: Env,
         credit_line: CreditLineClient<'static>,
         token: mock_token::MockTokenClient<'static>,
         #[allow(dead_code)]
         price_guard: mock_price_guard::MockPriceGuardClient<'static>,
+        vault: test_vault::TestVaultClient<'static>,
         admin: Address,
         keeper: Address,
         lender: Address,
@@ -1001,6 +1266,9 @@ mod test {
         let price_guard = mock_price_guard::MockPriceGuardClient::new(&env, &pg_id);
         price_guard.set_price(&price, &status);
 
+        let vault_id = env.register(test_vault::TestVault, ());
+        let vault = test_vault::TestVaultClient::new(&env, &vault_id);
+
         let admin = Address::generate(&env);
         let pauser = Address::generate(&env);
         let keeper = Address::generate(&env);
@@ -1018,12 +1286,14 @@ mod test {
             liquidation_bps: 9_000,
         };
         credit_line.configure_asset(&admin, &asset, &pg_id, &token_id, &haircut_bps, &thresholds);
+        credit_line.set_vault(&admin, &vault_id);
 
         Harness {
             env,
             credit_line,
             token,
             price_guard,
+            vault,
             admin,
             keeper,
             lender,
@@ -1040,6 +1310,7 @@ mod test {
             &h.asset,
             &limit,
             &1_000,
+            &0,
             &86_400,
             &agreement,
         );
@@ -1068,6 +1339,123 @@ mod test {
         );
     }
 
+    // --- open input bounds ----------------------------------------------------------------
+
+    fn try_open(
+        h: &Harness,
+        lender: &Address,
+        borrower: &Address,
+        asset: &Address,
+        limit: i128,
+        rate_bps: u32,
+        cure_s: u64,
+    ) -> u64 {
+        h.credit_line.open(
+            lender,
+            borrower,
+            asset,
+            &limit,
+            &rate_bps,
+            &0,
+            &cure_s,
+            &BytesN::from_array(&h.env, &[7u8; 32]),
+        )
+    }
+
+    #[test]
+    fn open_assigns_sequential_ids() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let limit = 1_000 * PRICE_SCALE;
+        let first = try_open(&h, &h.lender, &h.borrower, &h.asset, limit, 1_000, 86_400);
+        let second = try_open(&h, &h.lender, &h.borrower, &h.asset, limit, 1_000, 86_400);
+        assert_eq!(first, 0);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: limit must be positive")]
+    fn open_rejects_zero_limit() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(&h, &h.lender, &h.borrower, &h.asset, 0, 1_000, 86_400);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: limit exceeds MAX_LIMIT")]
+    fn open_rejects_limit_above_the_cap() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let too_large = MAX_LIMIT + 1;
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            too_large,
+            1_000,
+            86_400,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: rate_bps exceeds MAX_RATE_BPS")]
+    fn open_rejects_rate_above_the_cap() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            1_000 * PRICE_SCALE,
+            u32::MAX,
+            86_400,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: cure_s is below MIN_CURE_S")]
+    fn open_rejects_cure_window_below_the_minimum() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            1_000 * PRICE_SCALE,
+            1_000,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: lender and borrower must differ")]
+    fn open_rejects_the_lender_as_borrower() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(
+            &h,
+            &h.lender,
+            &h.lender.clone(),
+            &h.asset,
+            1_000 * PRICE_SCALE,
+            1_000,
+            86_400,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: asset not configured")]
+    fn open_rejects_an_unconfigured_asset() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let unconfigured = Address::generate(&h.env);
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &unconfigured,
+            1_000 * PRICE_SCALE,
+            1_000,
+            86_400,
+        );
+    }
+
     #[test]
     fn draw_and_repay_happy_path() {
         // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
@@ -1088,6 +1476,34 @@ mod test {
         // Repay in full.
         h.token.mint(&h.borrower, &(500 * PRICE_SCALE));
         h.credit_line.repay(&h.borrower, &id, &(500 * PRICE_SCALE));
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.drawn, 0);
+    }
+
+    #[test]
+    fn third_party_can_repay_borrowers_draw() {
+        // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        // Draw 200 to the borrower.
+        h.credit_line
+            .draw(&h.borrower, &id, &(200 * PRICE_SCALE), &h.borrower.clone());
+        assert_eq!(h.token.balance(&h.borrower), 200 * PRICE_SCALE);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.drawn, 200 * PRICE_SCALE);
+
+        // A third party mints 200 and repays the borrower's line in full.
+        let payer = Address::generate(&h.env);
+        h.token.mint(&payer, &(200 * PRICE_SCALE));
+        let applied = h.credit_line.repay(&payer, &id, &(200 * PRICE_SCALE));
+        assert_eq!(applied, 200 * PRICE_SCALE);
+
+        // The payer — not the borrower — was debited, and the line is clear.
+        assert_eq!(h.token.balance(&payer), 0);
+        assert_eq!(h.token.balance(&h.borrower), 200 * PRICE_SCALE);
         let line = h.credit_line.line(&id);
         assert_eq!(line.drawn, 0);
     }
@@ -1117,6 +1533,57 @@ mod test {
         let to = Address::generate(&h.env);
         h.credit_line
             .draw(&h.borrower, &id, &(10 * PRICE_SCALE), &to);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: price status is not Ok")]
+    fn no_draw_on_halted_price() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Halted);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(10 * PRICE_SCALE), &to);
+    }
+
+    /// `margin::classify` uses `>=` for each threshold band (`ltv_bps >= thresholds.warning_bps`).
+    /// With 0% haircut, $1.00 price, 1,000 units collateral (collateral value $1,000), and thresholds
+    /// 7000/8000/9000:
+    /// - Drawing 699.9999999 produces LTV = 6,999 bps (< 7000 bps warning_bps). Because the boundary
+    ///   is inclusive (`>=`), 6,999 bps is strictly below the warning threshold and classifies as
+    ///   Healthy, allowing the draw to succeed.
+    #[test]
+    fn draw_just_below_warning_threshold_succeeds() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        // 699.9999999 is 1 stroop below 700 * PRICE_SCALE
+        let amount = 700 * PRICE_SCALE - 1;
+        h.credit_line.draw(&h.borrower, &id, &amount, &to);
+        assert_eq!(h.token.balance(&to), amount);
+        assert_eq!(h.credit_line.line(&id).drawn, amount);
+    }
+
+    /// `margin::classify` uses `>=` for each threshold band (`ltv_bps >= thresholds.warning_bps`).
+    /// Drawing 700 against 1,000 collateral at $1.00 produces an LTV of exactly 7,000 bps. Because the
+    /// warning boundary is inclusive (`>= 7000`), 7,000 bps is classified as Warning, and draw
+    /// panics because only MarginState::Healthy is allowed for new draws.
+    #[test]
+    #[should_panic(expected = "credit-line: draw would push the line past a healthy LTV")]
+    fn draw_at_exact_warning_threshold_fails() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(700 * PRICE_SCALE), &to);
     }
 
     #[test]
@@ -1337,6 +1804,73 @@ mod test {
     }
 
     #[test]
+    fn repay_publishes_repaid_with_the_interest_principal_split() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        // One year at 10% on 500 is 50 of interest; repaying 550 clears both parts.
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(550 * PRICE_SCALE));
+
+        let contract_events = || {
+            h.env
+                .events()
+                .all()
+                .events()
+                .into_iter()
+                .filter(|e| e.type_ == ContractEventType::Contract)
+                .cloned()
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        h.credit_line.repay(&h.borrower, &id, &(550 * PRICE_SCALE));
+
+        let events = contract_events();
+        assert_eq!(events.len(), 1, "exactly one event on a successful repayment");
+        let event = events.last().expect("an event must have been published");
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("repaid".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(id);
+        let val: soroban_sdk::Val = (
+            h.borrower.clone(),
+            50 * PRICE_SCALE,
+            500 * PRICE_SCALE,
+            0i128,
+        )
+            .into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+
+        match &event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // A failed repayment (nothing left to pay) reverts, so it publishes nothing.
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.credit_line.repay(&h.borrower, &id, &(1 * PRICE_SCALE));
+        }));
+        assert!(again.is_err(), "repaying a cleared line must fail");
+        assert_eq!(
+            contract_events().len(),
+            0,
+            "no event may be emitted by a reverted repay"
+        );
+    }
+
+    #[test]
     fn repay_of_an_exact_amount_still_applies_in_full() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
@@ -1491,6 +2025,37 @@ mod test {
             record_fields(&h.credit_line.liquidation_record(&id)),
             frozen
         );
+    }
+
+    #[test]
+    fn status_of_and_lender_of_report_each_state() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+
+        let open = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.status_of(&open), LineStatus::Open);
+        assert_eq!(h.credit_line.lender_of(&open), h.lender);
+
+        let liquidating = liquidated_line(&h, PRICE_SCALE / 2);
+        assert_eq!(h.credit_line.status_of(&liquidating), LineStatus::Liquidating);
+        assert_eq!(h.credit_line.lender_of(&liquidating), h.lender);
+
+        h.credit_line.close_liquidated(&h.lender, &liquidating);
+        assert_eq!(h.credit_line.status_of(&liquidating), LineStatus::Closed);
+        assert_eq!(h.credit_line.lender_of(&liquidating), h.lender);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn status_of_panics_for_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.status_of(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn lender_of_panics_for_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.lender_of(&999);
     }
 
     #[test]
@@ -1699,6 +2264,9 @@ mod test {
     #[should_panic(expected = "credit-line: vault not configured")]
     fn nothing_can_report_collateral_before_a_vault_is_configured() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
         let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
         h.credit_line.sync_from_vault(&Address::generate(&h.env), &id, &h.asset, &PRICE_SCALE);
     }
@@ -1859,6 +2427,7 @@ mod test {
             &h.asset,
             &100_000,
             &500,
+            &0,
             &86_400,
             &agreement,
         );
@@ -1935,6 +2504,8 @@ mod test {
             breach_ledger: None,
             breach_ltv_bps: 0,
             unhealthy_since: None,
+            fee_bps: 0,
+            accrued_fee: 0,
         };
 
         let one_day_expected =
@@ -2133,6 +2704,10 @@ mod test {
                 .configure_asset(&impostor, &h.asset, &alt_pg, &alt_usdc, &2_500, &thresholds);
         }));
         assert!(res_cfg.is_err(), "impostor cannot reconfigure asset");
+
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
 
         let impostor_vault = Address::generate(&h.env);
         h.env.mock_auths(&[MockAuth {
@@ -2823,5 +3398,395 @@ mod test {
             .unwrap();
             assert_eq!(data, vault);
         }
+    }
+
+    #[test]
+    fn open_rejects_fee_bps_above_100_percent() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let agreement = BytesN::from_array(&h.env, &[9u8; 32]);
+        assert!(h
+            .credit_line
+            .try_open(
+                &h.lender,
+                &h.borrower,
+                &h.asset,
+                &(1_000 * PRICE_SCALE),
+                &500,
+                &10_001,
+                &86_400,
+                &agreement,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn platform_fee_accrues_repay_waterfall_fee_interest_principal_and_treasury_withdraw_only() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let treasury = Address::generate(&h.env);
+        h.credit_line.set_treasury(&h.admin, &treasury);
+
+        let agreement = BytesN::from_array(&h.env, &[8u8; 32]);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &200,
+            &86_400,
+            &agreement,
+        );
+        h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &to);
+
+        // Advance 1 year -> interest = 10% of 500 = 50; fee = 2% of 500 = 10; total debt = 560.
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        assert_eq!(h.credit_line.debt_of(&id), 560 * PRICE_SCALE);
+
+        // Repay 35: covers all 10 fee + 25 of 50 interest; principal untouched.
+        h.token.mint(&h.borrower, &(35 * PRICE_SCALE));
+        let applied = h.credit_line.repay(&h.borrower, &id, &(35 * PRICE_SCALE));
+        assert_eq!(applied, 35 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_fee(&id), 10 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_interest(&id), 25 * PRICE_SCALE);
+
+        let mid = h.credit_line.line(&id);
+        assert_eq!(mid.accrued_fee, 0);
+        assert_eq!(mid.accrued_interest, 25 * PRICE_SCALE);
+        assert_eq!(mid.drawn, 500 * PRICE_SCALE);
+
+        // Non-treasury (admin / lender) cannot withdraw fees; treasury can.
+        assert!(h
+            .credit_line
+            .try_claim_fee(&h.admin, &id, &(10 * PRICE_SCALE))
+            .is_err());
+        h.credit_line.claim_fee(&treasury, &id, &(10 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&treasury), 10 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_fee(&id), 0);
+
+        // Clear remaining 525 (25 interest + 500 principal).
+        h.token.mint(&h.borrower, &(600 * PRICE_SCALE));
+        let final_applied = h.credit_line.repay(&h.borrower, &id, &(600 * PRICE_SCALE));
+        assert_eq!(final_applied, 525 * PRICE_SCALE);
+        assert_eq!(h.credit_line.debt_of(&id), 0);
+        assert_eq!(h.credit_line.claimable_interest(&id), 50 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn liquidation_excludes_unpaid_fee_from_record_debt_and_preserves_borrower_surplus() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let treasury = Address::generate(&h.env);
+        h.credit_line.set_treasury(&h.admin, &treasury);
+
+        let agreement = BytesN::from_array(&h.env, &[10u8; 32]);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &200,
+            &86_400,
+            &agreement,
+        );
+        h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &to);
+
+        // Year 1: interest = 50, fee = 10. Borrower repays 10 (fully into FeeClaimable).
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        h.token.mint(&h.borrower, &(10 * PRICE_SCALE));
+        h.credit_line.repay(&h.borrower, &id, &(10 * PRICE_SCALE));
+        assert_eq!(h.credit_line.claimable_fee(&id), 10 * PRICE_SCALE);
+
+        // Year 2: +50 interest (100 total) and +10 unpaid fee -> debt_of = 610, lender debt = 600.
+        h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+        assert_eq!(h.credit_line.debt_of(&id), 610 * PRICE_SCALE);
+
+        // Price drops to $ .65 -> 1,000 units = 650 (LTV 610/650 = 9,384 bps -> Liquidation).
+        h.price_guard
+            .set_price(&(65 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+        h.env
+            .ledger()
+            .set_sequence_number(h.env.ledger().sequence() + 1);
+        h.credit_line
+            .liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+
+        // Unpaid fee (10) is excluded from LiquidationRecord.debt so the lender cannot pocket it.
+        let frozen = h.credit_line.liquidation_record(&id);
+        assert_eq!(frozen.debt, 600 * PRICE_SCALE);
+
+        let borrower_before = h.token.balance(&h.borrower);
+        // Full surplus = 650 - 600 = 50 (not shrunk to 40 by unpaid platform fee).
+        h.token.mint(&h.lender, &(50 * PRICE_SCALE));
+        h.credit_line.close_liquidated(&h.lender, &id);
+
+        let closed = h.credit_line.liquidation_record(&id);
+        assert!(closed.closed);
+        assert_eq!(closed.debt, 600 * PRICE_SCALE);
+        assert_eq!(closed.recovered, 650 * PRICE_SCALE);
+        assert_eq!(closed.surplus, 50 * PRICE_SCALE);
+        assert_eq!(closed.shortfall, 0);
+        assert_eq!(
+            h.token.balance(&h.borrower) - borrower_before,
+            50 * PRICE_SCALE
+        );
+        assert_eq!(h.token.balance(&h.lender), 0);
+
+        let final_line = h.credit_line.line(&id);
+        assert_eq!(final_line.status, LineStatus::Closed);
+        assert_eq!(final_line.accrued_fee, 0);
+
+        // Previously repaid fee (10) remains claimable by treasury; unpaid fee (10) was waived.
+        assert_eq!(h.credit_line.claimable_fee(&id), 10 * PRICE_SCALE);
+        h.credit_line
+            .claim_fee(&treasury, &id, &(10 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&treasury), 10 * PRICE_SCALE);
+        assert_eq!(h.credit_line.claimable_fee(&id), 0);
+
+        // Undrawn principal (500) withdraws cleanly and leaves exact 0 contract balance.
+        h.credit_line
+            .withdraw_undrawn(&h.lender, &id, &(500 * PRICE_SCALE));
+        assert_eq!(h.token.balance(&h.credit_line.address), 0);
+    }
+
+    /// Verifies that `close_liquidated` panics with the exact message
+    /// "credit-line: collateral has not left the vault" when collateral remains,
+    /// and that the line stays in `Liquidating` state (checked via `try_close_liquidated`).
+    #[test]
+    #[should_panic(expected = "credit-line: collateral has not left the vault")]
+    fn close_liquidated_fails_when_collateral_remains_in_vault() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        // Set remaining collateral in vault to 500 units (keeper hasn't swept yet).
+        h.vault.set_position_units(&id, &h.asset, &(500 * PRICE_SCALE));
+
+        // Verify via try_ that the line stays Liquidating on failure.
+        let res = h.credit_line.try_close_liquidated(&h.lender, &id);
+        assert!(res.is_err(), "must fail while collateral remains in vault");
+        assert_eq!(
+            h.credit_line.line(&id).status,
+            LineStatus::Liquidating,
+            "line must remain Liquidating when close_liquidated is blocked"
+        );
+
+        // Now trigger the panic directly so #[should_panic] catches the exact message.
+        h.credit_line.close_liquidated(&h.lender, &id);
+    }
+
+    #[test]
+    fn close_liquidated_succeeds_when_vault_units_are_zero() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        // Explicitly set vault position units to 0
+        h.vault.set_position_units(&id, &h.asset, &0);
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+        let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: vault not configured")]
+    fn close_liquidated_fails_when_vault_unconfigured_and_seized_units_positive() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+
+        // Unconfigure vault
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+    }
+
+    #[test]
+    fn close_liquidated_succeeds_when_vault_unconfigured_and_seized_units_zero() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        // Unconfigure vault
+        h.env.as_contract(&h.credit_line.address, || {
+            h.env.storage().instance().remove(&DataKey::Vault);
+        });
+
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.env.as_contract(&h.credit_line.address, || {
+            let mut line = read_line(&h.env, id);
+            line.status = LineStatus::Liquidating;
+            line.pledged_units = 0;
+            write_line(&h.env, id, &line);
+
+            write_liquidation(
+                &h.env,
+                id,
+                &LiquidationRecord {
+                    seized_units: 0,
+                    price: PRICE_SCALE,
+                    debt: 0,
+                    closed: false,
+                    recovered: 0,
+                    surplus: 0,
+                    shortfall: 0,
+                },
+            );
+        });
+
+        h.credit_line.close_liquidated(&h.lender, &id);
+        assert_eq!(h.credit_line.line(&id).status, LineStatus::Closed);
+        let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
+    }
+
+    #[test]
+    fn draw_publishes_drawn_event_with_expected_topics_and_data() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        // 5% haircut, $1.00 price, 1000 units pledged -> $950 collateral value.
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to1 = Address::generate(&h.env);
+        let amount1 = 300 * PRICE_SCALE;
+        // First draw: $300 debt against $950 collateral -> 3157 bps (<7000 Healthy).
+        h.credit_line.draw(&h.borrower, &id, &amount1, &to1);
+
+        let expected_topic0 = ScVal::Symbol(ScSymbol("drawn".try_into().unwrap()));
+        let expected_topic1 = ScVal::U64(id);
+
+        let all_events1 = h.env.events().all();
+        let contract_events1 = all_events1.filter_by_contract(&h.credit_line.address);
+        let drawn_events: std::vec::Vec<_> = contract_events1
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&expected_topic0),
+            })
+            .collect();
+        assert_eq!(
+            drawn_events.len(),
+            1,
+            "exactly 1 drawn event after first draw"
+        );
+
+        let val1: soroban_sdk::Val = (amount1, to1.clone(), amount1, 3157u32).into_val(&h.env);
+        let expected_data1 = ScVal::try_from_val(&h.env, &val1).unwrap();
+        match &drawn_events[0].body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.first(), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data1);
+
+                // Decode and verify topics and payload with TryFromVal and Symbol::new
+                let top0_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.first().unwrap()).unwrap();
+                let top0_sym = Symbol::try_from_val(&h.env, &top0_val).unwrap();
+                assert_eq!(top0_sym, Symbol::new(&h.env, "drawn"));
+
+                let top1_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.get(1).unwrap()).unwrap();
+                let top1_line = u64::try_from_val(&h.env, &top1_val).unwrap();
+                assert_eq!(top1_line, id);
+
+                let data_val = soroban_sdk::Val::try_from_val(&h.env, &v0.data).unwrap();
+                let decoded: (i128, Address, i128, u32) =
+                    TryFromVal::try_from_val(&h.env, &data_val).unwrap();
+                assert_eq!(decoded, (amount1, to1.clone(), amount1, 3157u32));
+            }
+        }
+
+        // Second cumulative draw to a distinct recipient address.
+        let to2 = Address::generate(&h.env);
+        let amount2 = 200 * PRICE_SCALE;
+        // Cumulative debt is $500 against $950 collateral -> 5263 bps (<7000 Healthy).
+        h.credit_line.draw(&h.borrower, &id, &amount2, &to2);
+
+        let all_events2 = h.env.events().all();
+        let contract_events2 = all_events2.filter_by_contract(&h.credit_line.address);
+        let drawn_events2: std::vec::Vec<_> = contract_events2
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&expected_topic0),
+            })
+            .collect();
+        assert_eq!(
+            drawn_events2.len(),
+            1,
+            "exactly 1 drawn event in second draw invocation"
+        );
+
+        let val2: soroban_sdk::Val =
+            (amount2, to2.clone(), amount1 + amount2, 5263u32).into_val(&h.env);
+        let expected_data2 = ScVal::try_from_val(&h.env, &val2).unwrap();
+        match &drawn_events2[0].body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.first(), Some(&expected_topic0));
+                assert_eq!(v0.topics.get(1), Some(&expected_topic1));
+                assert_eq!(v0.data, expected_data2);
+
+                let top0_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.first().unwrap()).unwrap();
+                let top0_sym = Symbol::try_from_val(&h.env, &top0_val).unwrap();
+                assert_eq!(top0_sym, Symbol::new(&h.env, "drawn"));
+
+                let top1_val =
+                    soroban_sdk::Val::try_from_val(&h.env, v0.topics.get(1).unwrap()).unwrap();
+                let top1_line = u64::try_from_val(&h.env, &top1_val).unwrap();
+                assert_eq!(top1_line, id);
+
+                let data_val = soroban_sdk::Val::try_from_val(&h.env, &v0.data).unwrap();
+                let decoded: (i128, Address, i128, u32) =
+                    TryFromVal::try_from_val(&h.env, &data_val).unwrap();
+                assert_eq!(decoded, (amount2, to2.clone(), amount1 + amount2, 5263u32));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_draw_emits_no_drawn_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+
+        let to = Address::generate(&h.env);
+        // Exceeding the line's limit (limit is 1000, drawing 1001)
+        let res = h
+            .credit_line
+            .try_draw(&h.borrower, &id, &(1_001 * PRICE_SCALE), &to);
+        assert!(res.is_err(), "draw exceeding limit must fail");
+
+        let drawn_symbol = ScVal::Symbol(ScSymbol("drawn".try_into().unwrap()));
+        let all_events = h.env.events().all();
+        let contract_events = all_events.filter_by_contract(&h.credit_line.address);
+        let count = contract_events
+            .events()
+            .iter()
+            .filter(|e| match &e.body {
+                ContractEventBody::V0(v0) => v0.topics.first() == Some(&drawn_symbol),
+            })
+            .count();
+        assert_eq!(count, 0, "no drawn event should be emitted on failed draw");
     }
 }
