@@ -107,6 +107,56 @@ stellar contract invoke \
 * `--per_holder_daily_cap`: Maximum 10,000 RWA units per holder per UTC day.
 * `--desk_inventory_cap`: Maximum 1,000,000 RWA units accumulated before operator rebalance is required.
 
+#### Changing an existing asset's configuration (48h timelock)
+
+`configure_asset` applies immediately only when the change cannot make exits pay out more:
+
+| Change | Path |
+|---|---|
+| First listing of the asset | `configure_asset`, immediate |
+| Same values (re-running the script) | `configure_asset`, immediate |
+| Wider spread (`spread_bps` up), lower `per_holder_daily_cap` or `desk_inventory_cap` | `configure_asset`, immediate |
+| Different `price_guard` | `queue_configure_asset`, then `execute_configure_asset` after 48h |
+| Narrower spread (`spread_bps` down) | timelocked, as above |
+| Higher `per_holder_daily_cap` or `desk_inventory_cap` | timelocked, as above |
+
+If a call changes several fields and any one of them loosens, the whole change is timelocked.
+`configure_asset` refuses it with
+`exit-desk: change loosens price_guard, spread or caps; use queue_configure_asset`.
+
+Why: without the delay, an admin key compromise could point `price_guard` at a contract that
+returns an inflated price. An accomplice could then exit RWA units for far more USDC than they
+are worth and drain the float in one transaction. The delay and the `cfg_q` event give operators
+48 hours to notice, `pause` exits and call `cancel_configure_asset`.
+
+```bash
+# Queue (admin). Returns the id.
+stellar contract invoke --id "$EXIT_DESK_CID" --source admin --network "$NETWORK" \
+  -- queue_configure_asset --admin "$ADMIN" --asset "$RWA_SAC" \
+  --price_guard "$NEW_PRICE_GUARD_CID" --spread_bps 25 \
+  --per_holder_daily_cap $((10000 * UNIT)) --desk_inventory_cap $((1000000 * UNIT))
+
+# Inspect while pending (anyone).
+stellar contract invoke --id "$EXIT_DESK_CID" --network "$NETWORK" -- pending_config --id "$ID"
+
+# After 48h (anyone).
+stellar contract invoke --id "$EXIT_DESK_CID" --source admin --network "$NETWORK" \
+  -- execute_configure_asset --id "$ID"
+
+# Or drop it before it executes (admin).
+stellar contract invoke --id "$EXIT_DESK_CID" --source admin --network "$NETWORK" \
+  -- cancel_configure_asset --admin "$ADMIN" --id "$ID"
+```
+
+The queued config is a full replacement. On execution it overwrites whatever the asset has at that
+point, including any tightening applied with `configure_asset` in the meantime. Validation (spread
+below 100%, positive caps) runs when the change is queued.
+
+Residual risk: the **first** listing of an asset is still immediate. There is no previous config to
+compare against, and `scripts/configure-desks.sh` needs the listing to apply at deploy time. The
+float is shared across assets, so a compromised admin key could still list a new asset with a
+hostile `price_guard`. Watch for unexpected first-time `configure_asset` calls.
+
 ### 2. Fund the USDC Float
 
 Supplies USDC liquidity to satisfy exits. The first `fund` call records the canonical USDC token address for the contract:
@@ -206,6 +256,9 @@ All events are emitted during the transaction that executes the state transition
 | `fund` | `(Symbol("fund"), admin_or_keeper: Address)` | `amount: i128` | Emitted when USDC float is topped up |
 | `withdraw` | `(Symbol("withdraw"), token: Address)` | `amount: i128` | Emitted when operator withdraws USDC float or RWA inventory |
 | `exit` | `(Symbol("exit"), holder: Address, asset: Address)` | `usdc_out: i128` | Emitted upon successful atomic exit |
+| `cfg_q` | `(Symbol("cfg_q"), id: u64)` | `(asset: Address, config: AssetConfig, executes_at: u64)` | `queue_configure_asset` |
+| `cfg_exec` | `(Symbol("cfg_exec"), id: u64)` | `(asset: Address, config: AssetConfig)` | `execute_configure_asset` |
+| `cfg_canc` | `(Symbol("cfg_canc"), id: u64)` | `asset: Address` | `cancel_configure_asset` |
 
 ---
 
@@ -224,6 +277,9 @@ All events are emitted during the transaction that executes the state transition
 | Excessive Spread | `"exit-desk: spread must be below 100%"` | Configured `spread_bps >= 10_000`. |
 | Zero payout | `"exit-desk: usdc_out is zero, amount too small to exit"` | `exit` for an amount whose floored payout is `0`. `quote` still returns, with `usdc_out = 0`. |
 | Cap validation | `"...cap must be positive"` | Daily or inventory cap configured with value `0`. |
+| Loosening change | `"exit-desk: change loosens price_guard, spread or caps; use queue_configure_asset"` | `configure_asset` on an already-configured asset with a new `price_guard`, a lower spread or a higher cap. |
+| Unknown queued config | `"exit-desk: no such pending config"` | `execute_configure_asset` / `cancel_configure_asset` with an id that was never queued, already ran or was cancelled. |
+| Early execution | `"exit-desk: timelock has not elapsed"` | `execute_configure_asset` (or `execute_unpause`) before 48h. |
 | Token mismatch | `"exit-desk: usdc address mismatch"` | Subsequent `fund` calls used a different USDC token. |
 | USDC not set | `"exit-desk: usdc not configured"` | `exit` or `fund` called before `set_usdc` recorded the USDC token. |
 | Insufficient float | `"exit-desk: insufficient USDC float"` | `exit` whose payout is larger than the desk's USDC balance. Checked before the holder's RWA moves. |

@@ -92,4 +92,42 @@ export class PledgeVaultClient extends BaseContractClient {
       scBytes(lienRef),
     ]);
   }
+
+  /**
+   * Borrower-only: cancels unconfirmed pending lien units (`IssuerLien` / `CustodianLien`).
+   * Never touches confirmed position units or moves tokens.
+   */
+  cancelPending(
+    source: string,
+    line: bigint,
+    assetAddress: string,
+    units: bigint,
+  ): Promise<string> {
+    return this.invoke(source, "cancel_pending", [
+      scAddress(source),
+      scU64(line),
+      scAddress(assetAddress),
+      scI128(units),
+    ]);
+  }
+
+  /**
+   * Gateway-only: rejects unconfirmed pending lien units (`IssuerLien` / `CustodianLien`) with a reason.
+   * Never touches confirmed position units or moves tokens.
+   */
+  rejectLien(
+    source: string,
+    line: bigint,
+    assetAddress: string,
+    units: bigint,
+    reason: Buffer,
+  ): Promise<string> {
+    return this.invoke(source, "reject_lien", [
+      scAddress(source),
+      scU64(line),
+      scAddress(assetAddress),
+      scI128(units),
+      scBytes(reason),
+    ]);
+  }
 }

@@ -39,6 +39,7 @@ export function registerCreditLineRoutes(
       asset: body.asset,
       limit: body.limit,
       rateBps: body.rateBps,
+      feeBps: body.feeBps,
       cureS: body.cureWindowS,
       agreementHash: body.agreementHash,
     });
@@ -418,6 +419,16 @@ export function registerCreditLineRoutes(
     return reply.code(201).send({ xdr, txHash });
   });
 
+  /**
+   * POST /v1/credit-lines/:id/repayments
+   *
+   * Note on semantics:
+   * On-chain `CreditLine::repay` treats `amount` as a cap rather than an exact
+   * amount, applying `min(amount, owed)` (interest first, then principal) and
+   * transferring only what was applied. This allows borrowers to specify a higher
+   * cap to fully clear the line without stranding dust or panicking when interest
+   * accrues between transaction creation and inclusion.
+   */
   app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/repayments", async (request, reply) => {
     const body = createRepaymentSchema.parse(request.body);
     let line;
