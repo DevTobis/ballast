@@ -54,15 +54,15 @@
 //! that sum via `transfer_from`; a defaulted trade's unconsumed share stays in the live
 //! allowance only until the next settle re-approves the accurate sum or the allowance expires.
 //!
-//! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
-//! `default_close` gives the cash lender full title to the pledged RWA units and closes the
-//! trade. It does **not** attempt to net the collateral's current market value against the
-//! outstanding cash exposure (principal + accrued interest) and settle any residual USDC in
-//! either direction — a real implementation would need `call_margin`'s guarded-price read here
-//! too, plus a place for a shortfall (lender under-recovered) or an excess (borrower is owed
-//! change) to be booked. That accounting is left to the off-chain `ledger`/`margin-monitor`
-//! services (PRD §6.5); on-chain, "lender keeps the collateral, trade closed" is the full
-//! outcome.
+//! **Margin default path (PRD §5 Phase 3 "Fail path"):**
+//! If the cash borrower has not cured an outstanding margin call by `cure_deadline`, the trade
+//! can be closed via `default_close` (keeper-only). The position is re-evaluated at default
+//! time: if the price has recovered since the call, the borrower has cured and this refuses.
+//! The collateral is valued at the guarded price with no haircut; the cash lender receives
+//! `ceil(exposure / price)` units, capped at what is pledged, and any surplus units above that
+//! return to the borrower. If the collateral is worth less than the exposure, the lender takes
+//! all pledged units and bears the shortfall. No USDC moves on default.
+//!
 //! **Maturity default path (PRD §5 Phase 3 "Fail path"):**
 //! If the cash borrower fails to fund leg 2 at maturity, `unwind` reverts. Once the trade remains
 //! unpaid past `maturity_at + maturity_grace` (default 24h, admin-configurable with a 60s floor),
@@ -211,6 +211,8 @@ pub struct RepoAssetConfig {
     pub price_guard: Address,
     pub haircut_bps: u32,
     pub thresholds: MarginThresholds,
+    pub max_cash_per_trade: i128,
+    pub max_term_seconds: u64,
 }
 
 #[contracttype]
@@ -503,7 +505,7 @@ fn clear_margin_call(trade: &mut RepoTrade) {
 
 /// Reads the guarded price and returns `(exposure, collateral_value, margin_state, price)` for a
 /// settled trade, or `None` when the price is not one the guard stands behind (`Degraded` or
-/// `Halted`). `exposure` is principal plus interest accrued so far; `collateral_value` has the
+/// `Halted`). `exposure` is principal plus interest accrued up to `maturity_at`; `collateral_value` has the
 /// asset's haircut applied.
 fn evaluate_margin(
     env: &Env,
@@ -518,7 +520,12 @@ fn evaluate_margin(
     let collateral_value = risk::collateral_value(trade.units, guarded.value, config.haircut_bps);
     let now = env.ledger().timestamp();
     let settled_at = trade.settled_at.unwrap_or(now);
-    let accrued = accrue_interest(trade.cash_amount, trade.rate_bps, now.saturating_sub(settled_at));
+    let accrual_end = now.min(trade.maturity_at);
+    let accrued = accrue_interest(
+        trade.cash_amount,
+        trade.rate_bps,
+        accrual_end.saturating_sub(settled_at),
+    );
     let exposure = trade
         .cash_amount
         .checked_add(accrued)
@@ -680,6 +687,8 @@ impl RepoDvp {
         price_guard: Address,
         haircut_bps: u32,
         thresholds: MarginThresholds,
+        max_cash_per_trade: i128,
+        max_term_seconds: u64,
     ) {
         require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
@@ -688,14 +697,30 @@ impl RepoDvp {
             "repo-dvp: haircut exceeds 100%"
         );
         thresholds.validate();
+        assert!(
+            max_cash_per_trade > 0,
+            "repo-dvp: max_cash_per_trade must be positive"
+        );
+        assert!(
+            max_term_seconds > 0,
+            "repo-dvp: max_term_seconds must be positive"
+        );
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
             &RepoAssetConfig {
                 price_guard,
                 haircut_bps,
                 thresholds,
+                max_cash_per_trade,
+                max_term_seconds,
             },
         );
+    }
+
+    /// Reads the active configuration for an asset.
+    pub fn asset_config(env: Env, asset: Address) -> RepoAssetConfig {
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset)
     }
 
     /// Disables an asset so that new proposals and settlements are refused. Admin only.
@@ -761,12 +786,22 @@ impl RepoDvp {
             rate_bps <= MAX_RATE_BPS,
             "repo-dvp: rate_bps exceeds the maximum rate"
         );
-        require_term_fits_kind(&kind, maturity_at - env.ledger().timestamp());
+        let term_seconds = maturity_at - env.ledger().timestamp();
+        require_term_fits_kind(&kind, term_seconds);
+
         // Refuse before any allowance is granted: a trade in an asset that was never
         // passed to `configure_asset` would settle leg 1 and then strand the lender
         // with no margin protection — `call_margin` and `default_close` read this
         // config and would revert until maturity.
-        read_asset_config(&env, &asset);
+        let config = read_asset_config(&env, &asset);
+        assert!(
+            cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        assert!(
+            term_seconds <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         // Pre-authorize leg 1 (see the module docs): the lender signs this call, not the
         // borrower's later `accept_and_settle`.
@@ -871,7 +906,16 @@ impl RepoDvp {
         }
         // Belt and braces for proposals that predate the check in `propose`: never
         // move either leg for an asset with no margin parameters.
-        read_asset_config(&env, &trade.asset);
+        let config = read_asset_config(&env, &trade.asset);
+        assert!(
+            trade.cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        let now = env.ledger().timestamp();
+        assert!(
+            trade.maturity_at.saturating_sub(now) <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         let asset_client = token::Client::new(&env, &trade.asset);
         asset_client.transfer(
@@ -979,6 +1023,7 @@ impl RepoDvp {
             &trade.units,
         );
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Unwound;
         write_trade(&env, &trade);
         release_borrower_due(&env, &trade);
@@ -1147,6 +1192,7 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
         release_borrower_due(&env, &trade);
@@ -1222,6 +1268,7 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
 
