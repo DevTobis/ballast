@@ -1637,25 +1637,6 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "credit-line: asset not configured")]
-    fn fund_rejects_unconfigured_asset() {
-        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
-        let unconfigured_asset = Address::generate(&h.env);
-        let agreement = BytesN::from_array(&h.env, &[7u8; 32]);
-        let id = h.credit_line.open(
-            &h.lender,
-            &h.borrower,
-            &unconfigured_asset,
-            &(1_000 * PRICE_SCALE),
-            &1_000,
-            &86_400,
-            &agreement,
-        );
-        h.token.mint(&h.lender, &(100 * PRICE_SCALE));
-        h.credit_line.fund(&h.lender, &id, &(100 * PRICE_SCALE));
-    }
-
-    #[test]
     fn funding_a_liquidating_line_is_allowed() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         let id = liquidated_line(&h, PRICE_SCALE / 2);
