@@ -13,9 +13,22 @@ interface EtherfuseTokenCost {
   sources?: Record<string, { token_cost_in_usd: string; updated_at: number }>;
 }
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
+/**
+ * Computes median unix timestamp from provider update times.
+ * Filters out null, undefined, NaN, or non-finite entries.
+ * For even counts, returns the mean of the two middle values (floored to integer seconds),
+ * which is never later than the true median (conservative for a freshness signal).
+ * For odd counts, returns the middle element.
+ */
+export function median(values: (number | undefined | null)[]): number {
+  const valid = values.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  if (valid.length === 0) return NaN;
+  const sorted = [...valid].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return Math.floor((sorted[mid - 1] + sorted[mid]) / 2);
+  }
+  return sorted[mid];
 }
 
 /**
@@ -35,10 +48,28 @@ export class EtherfuseNavAdapter implements IssuerNavAdapter {
 
   async fetchNav(assetCode: string): Promise<{ value: bigint; ts: number }> {
     const url = `${this.baseUrl}/lookup/tokens/cost/${encodeURIComponent(assetCode.toUpperCase())}`;
-    const body = await getJson<EtherfuseTokenCost>(url, this.fetchImpl);
+    const body = await getJson<EtherfuseTokenCost>(url, this.fetchImpl, "etherfuse");
 
-    const updates = Object.values(body.sources ?? {}).map((s) => s.updated_at);
-    const ts = updates.length > 0 ? median(updates) : Math.floor(Date.parse(body.current_time) / 1000);
+    if (!body || typeof body !== "object") {
+      throw new Error(`etherfuseNavAdapter: invalid response body for ${assetCode}: expected object`);
+    }
+    if (typeof body.token_cost_in_usd !== "string" || !body.token_cost_in_usd.trim()) {
+      throw new Error(`etherfuseNavAdapter: missing or invalid field "token_cost_in_usd" for ${assetCode}`);
+    }
+    if (body.sources !== undefined && (typeof body.sources !== "object" || body.sources === null)) {
+      throw new Error(`etherfuseNavAdapter: missing or invalid field "sources" for ${assetCode}`);
+    }
+    if (typeof body.current_time !== "string" || !body.current_time.trim()) {
+      if (!body.sources || Object.keys(body.sources).length === 0) {
+        throw new Error(`etherfuseNavAdapter: missing or invalid field "current_time" for ${assetCode}`);
+      }
+    }
+
+    const updates = Object.values(body.sources ?? {})
+      .map((s) => s?.updated_at)
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+    const med = updates.length > 0 ? median(updates) : NaN;
+    const ts = Number.isFinite(med) ? med : Math.floor(Date.parse(body.current_time) / 1000);
     if (!Number.isFinite(ts)) {
       throw new Error(`etherfuseNavAdapter: no usable timestamp in response for ${assetCode}`);
     }

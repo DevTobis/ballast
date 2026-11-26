@@ -7,18 +7,24 @@
  * The on-chain trade id comes from `repo_trade.contract_trade_id`, which `services/api` fills in
  * when the propose transaction settles. A trade without one never reached the chain through this
  * API and is skipped (counted, not errored).
+ *
+ * Counts as: processed = `unwind` submitted, or an on-chain Unwound reconciled into the books.
+ * skipped = no on-chain id, or the trade is Defaulted (reconciled) or otherwise not Settled.
+ * error = the trade threw.
  */
 import { and, eq, lte } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
-import { loadNetworkConfig } from "@ballast/network-config";
 import type { RepoDvpClient } from "@ballast/contract-clients";
-import { submitSignedTx, type KmsSigner } from "@ballast/operator-signing";
+import type { KmsSigner } from "@ballast/operator-signing";
+import { signAndSubmit, type NetworkSubmissionConfig } from "./submit.js";
 import { emptyResult, type JobResult } from "./types.js";
 
 export async function runRepoUnwindJob(
   db: Database,
   repoDvpClient: RepoDvpClient,
   signer: KmsSigner,
+  /** RPC URL and passphrase from the keeper's startup config; omitted, the environment is read. */
+  network?: NetworkSubmissionConfig,
 ): Promise<JobResult> {
   const result = emptyResult();
   const now = new Date();
@@ -58,13 +64,11 @@ export async function runRepoUnwindJob(
       }
 
       const unsignedXdr = await repoDvpClient.unwind(signer.publicKey(), contractId);
-      const signedXdr = await signer.sign(unsignedXdr);
-      const network = loadNetworkConfig();
-      const submitted = await submitSignedTx(network.rpcUrl, network.networkPassphrase, signedXdr);
+      const hash = await signAndSubmit(signer, unsignedXdr, network);
 
       await db
         .update(schema.repoTrade)
-        .set({ status: "unwound", leg2Tx: submitted.hash })
+        .set({ status: "unwound", leg2Tx: hash })
         .where(eq(schema.repoTrade.id, trade.id));
 
       result.processed++;

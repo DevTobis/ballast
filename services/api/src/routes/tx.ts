@@ -72,6 +72,23 @@ export function registerTxRoutes(
     return reply.code(202).send({ txHash, kind: intent.kind, refId: intent.refId, status: "pending", ledger: null });
   });
 
+  app.get<{ Params: { hash: string } }>("/v1/tx/:hash", async (request, reply) => {
+    const intent = await findIntent(db, request.params.hash);
+    if (!intent || intent.partyId !== request.partyId) {
+      return reply.code(404).send({ error: "not a transaction this API built for you" });
+    }
+    return {
+      txHash: intent.txHash,
+      kind: intent.kind,
+      refId: intent.refId,
+      status: intent.status,
+      ledger: intent.ledger,
+      ...(intent.error !== null && intent.error !== undefined ? { error: intent.error } : {}),
+      createdAt: intent.createdAt,
+      settledAt: intent.settledAt,
+    };
+  });
+
   app.post<{ Params: { hash: string } }>("/v1/tx/:hash/settle", async (request, reply) => {
     const intent = await findIntent(db, request.params.hash);
     if (!intent || intent.partyId !== request.partyId) {

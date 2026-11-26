@@ -49,11 +49,48 @@ function oracleNetwork(env: NodeJS.ProcessEnv): NetworkConfig {
   };
 }
 
+export const DEFAULT_DECIMALS_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+interface CachedDecimals {
+  decimals: number;
+  cachedAt: number;
+}
+
 export class RedstoneAdapter implements IndependentFeedAdapter {
+  private readonly decimalsCache = new Map<string, CachedDecimals>();
+  private readonly decimalsTtlMs: number;
+  private readonly now: () => number;
+
   constructor(
     private readonly feedContractIds: Record<string, string>,
     private readonly env: NodeJS.ProcessEnv = process.env,
-  ) {}
+    options?: {
+      decimalsTtlMs?: number;
+      now?: () => number;
+    },
+  ) {
+    this.decimalsTtlMs = options?.decimalsTtlMs ?? DEFAULT_DECIMALS_TTL_MS;
+    this.now = options?.now ?? Date.now;
+  }
+
+  private async getDecimals(
+    network: NetworkConfig,
+    caller: string,
+    contractId: string,
+  ): Promise<number> {
+    const cached = this.decimalsCache.get(contractId);
+    const now = this.now();
+    if (cached && now - cached.cachedAt < this.decimalsTtlMs) {
+      return cached.decimals;
+    }
+    const raw = await simulateRead<bigint | number>(network, caller, contractId, "decimals", []);
+    const decimals = Number(raw);
+    if (!Number.isFinite(decimals) || decimals < 0) {
+      throw new Error(`redstoneAdapter: invalid decimals ${decimals} returned for contract ${contractId}`);
+    }
+    this.decimalsCache.set(contractId, { decimals, cachedAt: now });
+    return decimals;
+  }
 
   async fetchPrice(assetCode: string): Promise<{ value: bigint; ts: number }> {
     const contractId = this.feedContractIds[assetCode];
@@ -69,11 +106,11 @@ export class RedstoneAdapter implements IndependentFeedAdapter {
 
     const [data, decimals] = await Promise.all([
       simulateRead<OnChainPriceData>(network, caller, contractId, "read_price_data", []),
-      simulateRead<bigint | number>(network, caller, contractId, "decimals", []),
+      this.getDecimals(network, caller, contractId),
     ]);
 
     return {
-      value: rescalePrice(BigInt(data.price), Number(decimals)),
+      value: rescalePrice(BigInt(data.price), decimals),
       ts: Math.floor(Number(data.packageTimestamp) / 1000),
     };
   }
