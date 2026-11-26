@@ -90,7 +90,7 @@ The credit line has two independent dimensions:
 - `LineStatus`: `Open`, `Liquidating`, or `Closed`
 - `MarginState`: `Healthy`, `Warning`, `MarginCall`, or `Liquidation`
 
-Status and margin state are orthogonal: an `Open` line can be `Warning`, `MarginCall`, or `Liquidation`; only `liquidate` changes `Open` to `Liquidating`. A line reaches `Closed` in one of two ways: `close_liquidated` from `Liquidating`, or `close` from `Open` once the line is fully repaid and the lender has withdrawn all funding (#130).
+Status and margin state are orthogonal: an `Open` line can be `Warning`, `MarginCall`, or `Liquidation`; only `liquidate` changes `Open` to `Liquidating`. A line reaches `Closed` from `Liquidating` through `close_liquidated` (lender) or, once `CLOSE_GRACE_S` (7 days) has passed since `liquidate`, `close_expired` (borrower or keeper, #133); or from `Open` through `close` once the line is fully repaid and the lender has withdrawn all funding (#130).
 
 ```mermaid
 stateDiagram-v2
@@ -124,6 +124,7 @@ stateDiagram-v2
 
     Open --> Liquidating: liquidate / breach armed and later-ledger Ok liquidation
     Liquidating --> Closed: close_liquidated / lender auth; Liquidating status; vault position empty
+    Liquidating --> Closed: close_expired / borrower or keeper auth; 7 days after liquidate; vault position empty
     Open --> Closed: close / lender or borrower auth; Open status; nothing owed; funded == 0
     Closed --> [*]
 
@@ -161,6 +162,7 @@ This is why `Warning` can remain `Open`: status is the lifecycle state, while ma
 | `poke` — clear | No explicit guard; permissionless. Applies when fresh state is not `Liquidation`, or when fresh price status is not `Ok` | Unchanged (no status guard; applies to `Open`, `Liquidating`, and `Closed`) | Refreshed to the fresh state: `Healthy`, `Warning`, `MarginCall`, or `Liquidation` (including `Liquidation` with a non-`Ok` price) | Cleared to `None` |
 | `liquidate` | Keeper authorization; breach exists: `credit-line: no confirmed breach flagged; call poke(line) first`; current ledger sequence is greater than `breach_ledger`: `credit-line: liquidation needs a later ledger than the flagged breach`; status is `Open`: `credit-line: line is not open`; fresh guarded price status: `credit-line: price status is not Ok`; fresh state: `credit-line: breach is no longer confirmed` | `Liquidating` | `Liquidation` | Preserved unchanged |
 | `close_liquidated` | Lender authorization; lender matches line: `credit-line: not this line's lender`; status is `Liquidating`: `credit-line: line is not being liquidated`; the vault position is empty (`PledgeVault::position_units == 0`): `credit-line: collateral has not left the vault`, or with no vault configured, zero seized and pledged units: `credit-line: vault not configured` | `Closed` | `Healthy` | Cleared to `None` |
+| `close_expired` | Caller authorization; status is `Liquidating`: `credit-line: line is not being liquidated`; caller is the borrower or the keeper: `credit-line: caller must be the borrower or the keeper`; `now >= liquidated_at + CLOSE_GRACE_S`: `credit-line: close grace period has not elapsed`; then the same checks and booking as `close_liquidated` (vault position empty: `credit-line: collateral has not left the vault`) | `Closed` | `Healthy` | `None` |
 | `close` | Caller authorization; caller is the line's lender or borrower: `credit-line: not this line's lender or borrower`; status is `Open`: `credit-line: line is not open`; no principal: `credit-line: line has outstanding principal`; no accrued interest: `credit-line: line has outstanding interest`; no accrued fee: `credit-line: line has outstanding fees`; no funding left: `credit-line: line has undrawn funds` | `Closed` | Unchanged | Unchanged |
 | `sync_from_vault` | Configured vault authorization; configured vault check: `credit-line: caller is not the configured vault`; vault not configured: `credit-line: vault not configured`; `units >= 0`: `credit-line: units cannot be negative`; matching line asset: `credit-line: not this line's collateral asset` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
 | `sync_collateral` | Caller authorization and caller is stored admin or keeper: `ballast-common: caller is neither admin nor keeper`; `units >= 0`: `credit-line: units cannot be negative` | Unchanged | Unchanged (cache is not refreshed) | Unchanged |
@@ -292,7 +294,9 @@ To migrate an existing deployment:
 - Testnet/local: run `scripts/redeploy-price-guard.sh [network]`. It deploys and initializes a new
   PriceGuard, configures `RWA1`, registers the NAV attestor key and requires signatures
   (`scripts/configure-nav-key.sh`), and repoints PledgeVault, CreditLine, ExitDesk and RepoDvp at it.
-- Any other asset on the old contract: run `configure_asset`, `configure_issuer_key` and
+- Any other asset on the old contract: run `configure_asset`, `configure_issuer_key` (with its
+  hex-encoded `--asset_code`; signatures are bound to the new contract id, so the publisher must
+  sign for the new id too) and
   `configure_signature_requirement --required true` for it on the new contract, and repoint each
   consumer's `configure_asset` at the new id.
 - The price history (`LastGood`, rolling reference, status) is rebuilt by the next publishes. If an
@@ -324,7 +328,8 @@ stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin
 #    `publish_nav` verifies `sig` against the registered issuer key, not the price_publisher role,
 #    so the new publisher cannot publish NAV until this call lands.
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
-  configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
+  configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --asset_code "$ASSET_CODE_HEX" \
+  --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
   configure_signature_requirement --admin "$ADMIN" --asset "$RWA_SAC" --required true
 ```
@@ -397,7 +402,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 | `cancel_upgrade` | Admin | Immediate | Intended | Aborts a proposed contract bytecode upgrade. |
 | `execute_upgrade` | Anyone | 48h after queue | Intended | Applies bytecode upgrade after the 48h delay has elapsed. |
 | `configure_asset` | Admin | Dynamic | Intended | Initial asset onboarding and tightening safety bands (narrower price band, shorter max staleness) take effect immediately to enhance security. Loosening bands requires 48h timelock via `queue_config` to prevent stealth weakening of outlier defenses. |
-| `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. |
+| `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. Since #90 it also binds the asset's `asset_code`, which every signed NAV message includes together with the contract id; the code is bound once and a different code is refused, because rebinding would let a signature made for another asset verify immediately. |
 | `configure_signature_requirement` | Admin | Dynamic | Intended | Per asset since #95 (`configure_signature_requirement(admin, asset, required)`), so one transaction cannot switch checks off for every asset; an asset never configured defaults to `true`. Requiring signatures (`required = true`) takes effect immediately. Turning a requirement off relaxes security and must go through the 48h timelock via `queue_config(RequireNavSignature(asset, false))`. Exception: while an asset is being brought up (flag never set and no reading published yet), `required = false` applies immediately. |
 | `configure_source` | Admin | Immediate | Intended | Source allowlist (#84): `publish_source` rejects any name not enabled for the asset, so one feed cannot be counted twice under two spellings. Enabling or disabling a name applies at once and re-evaluates the price; `issuer` is reserved for `publish_nav`. |
 | `remove_source` | Admin | Immediate | Intended | Drops a source's reading, its allowlist entry and any staleness override at once, so an exploited, manipulated or failing feed stops counting in the median immediately. |

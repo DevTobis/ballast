@@ -65,7 +65,8 @@ consumer changes and a redeploy, and this file has to be updated in the same PR.
 | `repaid` | `line: u64` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` (any payer) | indexer (stored only) |
 | `margin_state_changed` | `line: u64` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke`, only when the state changes | indexer (stored only) |
 | `liquidation_started` | `line: u64` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` (keeper) | indexer (stored only) |
-| `line_closed` | `line: u64` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` (lender) | indexer (stored only) |
+| `line_closed` | `line: u64` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` (lender), or `close_expired` (borrower or keeper, after 7 days) | indexer (stored only) |
+| `surplus_claimed` | `line: u64` | `(borrower: Address, lender: Address, amount: i128)` | `claim_surplus` (borrower) | indexer (stored only) |
 | `line_closed_repaid` | `line: u64` | `caller: Address` (bare value) | `close` (lender or borrower) on a fully repaid `Open` line | indexer (stored only) |
 | `undrawn_withdrawn` | `line: u64` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` (lender) | indexer (stored only) |
 | `interest_withdrawn` | `line: u64` | `(lender: Address, amount: i128, claimable_after: i128)` | `withdraw_interest` (lender) | indexer (stored only) |
@@ -92,7 +93,7 @@ Field notes:
 | `lien_recorded` | `line: u64` | `(asset: Address, units: i128, lien_ref: Bytes)` | `record_lien` (gateway) | indexer (stored only) |
 | `lien_rejected` | `line: u64` | `(asset: Address, units: i128, reason: Bytes)` | `reject_lien` (gateway) | indexer (stored only) |
 | `pending_cancelled` | `line: u64` | `(asset: Address, units: i128)` | `cancel_pending` (borrower) | indexer (stored only) |
-| `asset_configured` | `asset: Address` | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` (admin) | indexer (stored only) |
+| `asset_configured` | `asset: Address` | `(credit_line: Address, custody_mode: CustodyMode)` | `configure_asset` (admin) | indexer (stored only) |
 | `gateway_set` | none (topic is the 1-tuple `(Symbol,)`) | `gateway: Address` (bare value, not a tuple) | `set_gateway` (admin) | indexer (stored only) |
 | `released` | `line: u64` | `(asset: Address, units: i128)` | `release` (borrower) | indexer; **ledger reconciler** (`-units`) |
 | `liquidated` | `line: u64` | `(asset: Address, units: i128, to: Address)` | `liquidate` (keeper) | indexer; **ledger reconciler** (`-units`); off-chain custodian/issuer delivery in lien modes (see the crate README) |
@@ -131,12 +132,16 @@ longer pause names use `Symbol::new`. Both decode to the same plain string in `c
 | `mcall` | `id: u64` | `margin_call_amount: i128` (bare value) | `call_margin` (keeper) | Position at `MarginCall` or worse. Emitted on every such call, including repeats that only update the amount; the cure deadline does not move |
 | `cured` | `id: u64` | `0: i128` (always zero) | `call_margin` (keeper) | A call was open and the position is back under the margin-call threshold (the price recovered) |
 | `topup` | `id: u64` | `(extra_units: i128, cured: bool)` | `top_up` (cash borrower; not pause-gated) | Borrower added collateral. `cured` is true when this cleared an open call |
+| `release` | `id: u64` | `units: i128` (bare value) | `release_excess` (cash borrower; refused while `Repos` is paused) | Borrower took back `units` of excess collateral; the post-release LTV is under `warning_bps` |
 | `default` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_close` (keeper) | Cure deadline passed without a cure: lender takes `lender_units`, the rest goes back to the borrower |
 | `mat_def` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` (cash lender or keeper) | Leg 2 not repaid by `maturity_at + maturity_grace`; same split as `default` |
 | `usdc` | none (topic is the 1-tuple `(Symbol,)`) | `(old_usdc: Option<Address>, new_usdc: Address)` | `set_usdc` (admin) | Cash-leg token set or changed; `old_usdc` is `None` on the first call |
 | `curegrace` | none | `(old_seconds: u64, new_seconds: u64)` | `set_cure_grace` (admin) | Cure window for margin calls opened from now on |
 | `matgrace` | none | `(old_seconds: u64, new_seconds: u64)` | `set_maturity_grace` (admin) | Grace past maturity before `default_at_maturity` |
 | `cfgasset` | `asset: Address` | `(price_guard: Address, haircut_bps: u32, thresholds: MarginThresholds, max_cash_per_trade: i128, max_term_seconds: u64)` | `configure_asset` (admin) | Asset risk config set; the payload is the full new config |
+| `cfg_q` | `id: u64` (timelock id) | `(asset: Address, config: RepoAssetConfig, executes_at: u64)` | `queue_asset_config` (admin) | Config change queued behind the 48h timelock |
+| `cfg_exec` | `id: u64` | `asset: Address` (bare value) | `execute_asset_config` (anyone) | Queued config applied; a `cfgasset` with the new config precedes it in the same call |
+| `cfg_canc` | `id: u64` | `asset: Address` (bare value) | `cancel_asset_config` (admin) | Queued config dropped |
 | `disable` | `asset: Address` | `()` | `disable_asset` (admin) | `propose` and `accept_and_settle` for `asset` refused; open trades can still unwind, top up and default |
 | `enable` | `asset: Address` | `()` | `enable_asset` (admin) | `asset` re-enabled |
 | `paused` | `scope: PauseScope` | `true: bool` | `pause` (pauser) | Scope paused |
@@ -153,6 +158,9 @@ Field notes:
   signal.
 - `cfgasset` shares no name with CreditLine's `asset_configured`; filter on `chain_event.contract`
   as well as `topic`.
+- `cfg_q`, `cfg_exec` and `cfg_canc` also exist on ExitDesk with a different payload shape (ExitDesk's
+  `cfg_exec` carries `(asset, config)`); filter on the contract before decoding. `tighten_asset_config`
+  (risk) publishes `cfgasset` too.
 
 ## ExitDesk (`contracts/exit-desk`)
 

@@ -1,11 +1,16 @@
 # services/api
 
-REST API for the console and for institutions. Two ways to authenticate; everything except `/healthz`,
+REST API for the console and for institutions. Two ways to authenticate; everything except `/healthz`, `/readyz`,
 `/v1/openapi.json`, `GET /v1/assets*` and `GET /v1/public/markets` needs one of them.
 
 ## OpenAPI specification
 
 An OpenAPI 3.1 document is served at `GET /v1/openapi.json` (unauthenticated). It describes all transaction-building POST routes (`/v1/credit-lines`, `/v1/exit`, `/v1/repo`), documenting request body shapes, 201 response envelopes (`{ xdr, txHash, ... }`), and field formats. All monetary amounts are documented as decimal strings (representing 7-decimal fixed-point integers scaled by 10^7, matching Stellar stroop format).
+
+## Health and readiness
+
+- `GET /healthz`: Public, unauthenticated liveness check. Always returns `{ ok: true }`.
+- `GET /readyz`: Public, unauthenticated readiness check with a short timeout. Checks Postgres (`SELECT 1`) and the Stellar RPC (`getLatestLedger`). Returns 200 `{ ok: true, dependencies: { database: "ok", rpc: "ok" } }` only when both checks pass. Returns 503 `{ ok: false, dependencies: { database: "ok" | "failed", rpc: "ok" | "failed" } }` on failure without exposing connection strings or internal credentials.
 
 ## Session (SEP-10)
 
@@ -76,6 +81,8 @@ A non-2xx answer is retried after 30s, 2m, 10m, 1h and 6h. After the sixth faile
 dead-lettered; see it under `GET /v1/webhooks/subscriptions/:id/deliveries` and requeue it with
 `POST /v1/webhooks/deliveries/:id/redeliver`. Delivery is at least once, so dedupe on
 `x-ballast-delivery`. Redirects are not followed, and URLs that resolve to private addresses are refused.
+
+An active subscription can be updated with `PATCH /v1/webhooks/subscriptions/:id` accepting optional `url` (re-validated against the private address filter) and `events`. Only the owning party can patch its subscription. The signing secret is retained unchanged and is omitted from the response.
 
 ## Compliance gate
 
@@ -326,7 +333,15 @@ Decimal strings appear only where routes return raw database rows without going 
 
 | Endpoint | Request Field(s) | Internal Handling | Response Fields & Format |
 | --- | --- | --- | --- |
-| `GET /v1/reports/daily` | `date` (`YYYY-MM-DD`, required), `format` (`"json"` \| `"csv"`, optional) | Queries caller's `marginEvent`, `liquidation`, `draw`, `repayment`, and public `priceSnapshot` for UTC day; returns raw DB rows with no conversion; CSV flattens with leading `kind` column | `draws.amount`, `repayments.amount`, `liquidations.{units, proceeds, shortfall}` (**decimal strings**); `priceSnapshots.guardedValue` (raw DB); `marginEvents.ltvBps` (bps) |
+| `GET /v1/reports/daily` | `date` (`YYYY-MM-DD`, optional) or `from`/`to` (`YYYY-MM-DD`, max 31 days), `format` (`"json"` \| `"csv"`, optional) | Queries caller's `marginEvent`, `liquidation`, `draw`, `repayment`, and public `priceSnapshot` for UTC date/range; returns raw DB rows with no conversion; CSV sets `content-type: text/csv; charset=utf-8` and `content-disposition: attachment; filename="ballast-daily-<date>.csv"`, flattening rows with leading `kind` column | `draws.amount`, `repayments.amount`, `liquidations.{units, proceeds, shortfall}` (**decimal strings**); `priceSnapshots.guardedValue` (raw DB); `marginEvents.ltvBps` (bps) |
+
+### Transactions
+
+| Endpoint | Request Field(s) | Description |
+| --- | --- | --- |
+| `GET /v1/tx/:hash` | `hash` in path | Read-only status of a built transaction (`{ txHash, kind, refId, status, ledger, error?, createdAt, settledAt }`) without touching the chain. Returns 404 for foreign or unknown transactions. |
+| `POST /v1/tx/:hash/settle` | `hash` in path | Settles an intent by checking the chain outcome and updating internal status. |
+| `POST /v1/tx/submit` | `signedXdr` in body | Submits a signed transaction envelope and waits for settlement. |
 
 ### Webhook event payloads
 

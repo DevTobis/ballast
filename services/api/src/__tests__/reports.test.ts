@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
+import { schema } from "@ballast/db";
+import type { ApiConfig } from "../config.js";
+import type { ContractClients } from "../contract-clients.js";
+import { buildServer } from "../server.js";
+import { signSessionToken } from "../session-token.js";
+import { createFakeDb } from "./fake-db.js";
 import { REPORT_CSV_FALLBACK_COLUMNS, toCsv } from "../routes/reports.js";
+
+const config: ApiConfig = {
+  port: 0,
+  jwtSigningSecret: "test-signing-key",
+  sep10ServerSecret: "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  sep10HomeDomain: "localhost",
+  sep10WebAuthDomain: "localhost",
+  networkPassphrase: "Public Global Stellar Network ; September 2015",
+  webhookSecretKey: "00".repeat(32),
+  apiKeySecretKey: "00".repeat(32),
+  complianceEnforced: false,
+  consoleOrigin: "http://localhost:5173",
+};
+
+const PARTY = "11111111-1111-1111-1111-111111111111";
+const ACCOUNT = "GCLIENT11111111111111111111111111111111111111111111111111";
+const authed = { authorization: `Bearer ${signSessionToken(ACCOUNT, config.jwtSigningSecret)}` };
 
 describe("toCsv", () => {
   it("emits the header line only for an empty row set", () => {
@@ -66,5 +89,76 @@ describe("toCsv", () => {
     expect(lines[0]).toBe("a,b,c");
     expect(lines[1]).toBe('1,2,""');
     expect(lines[2]).toBe('"",3,4');
+  });
+});
+
+describe("GET /v1/reports/daily", () => {
+  const line = { id: "line-1", lenderId: PARTY, borrowerId: "borrower-1" };
+  const draw = {
+    id: "draw-1",
+    creditLineId: "line-1",
+    amount: "100.0000000",
+    createdAt: new Date("2026-10-03T10:00:00Z"),
+  };
+  const app = buildServer({
+    config,
+    contracts: {} as ContractClients,
+    db: createFakeDb(
+      new Map<unknown, unknown[]>([
+        [schema.partyAccount, [{ partyId: PARTY, stellarAccount: ACCOUNT, role: "lender" }]],
+        [schema.creditLine, [line]],
+        [schema.draw, [draw]],
+        [schema.marginEvent, []],
+        [schema.liquidation, []],
+        [schema.repayment, []],
+        [schema.priceSnapshot, []],
+      ]),
+    ),
+  });
+
+  it("returns all rows within a 7-day range", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reports/daily?from=2026-10-01&to=2026-10-07",
+      headers: authed,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.from).toBe("2026-10-01");
+    expect(body.to).toBe("2026-10-07");
+    expect(body.draws).toHaveLength(1);
+    expect(body.draws[0].id).toBe("draw-1");
+  });
+
+  it("rejects date range exceeding 31 days with 400", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reports/daily?from=2026-10-01&to=2026-11-05",
+      headers: authed,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("31 days");
+  });
+
+  it("sets CSV download headers for format=csv", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reports/daily?from=2026-10-01&to=2026-10-07&format=csv",
+      headers: authed,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toBe("text/csv; charset=utf-8");
+    expect(res.headers["content-disposition"]).toBe(
+      'attachment; filename="ballast-daily-2026-10-01-to-2026-10-07.csv"',
+    );
+  });
+
+  it("rejects date combined with from/to instead of silently ignoring the range", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reports/daily?date=2026-10-01&from=2026-10-01&to=2026-10-07",
+      headers: authed,
+    });
+    expect(res.statusCode).toBe(400);
   });
 });

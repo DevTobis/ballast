@@ -16,11 +16,16 @@ This document describes the canonical message grammar, key derivation, test vect
 The canonical NAV message is constructed identically on-chain (`contracts/price-guard/src/lib.rs:build_nav_message`) and off-chain (`services/price-guard/src/navSignature.ts:canonicalNavMessage`):
 
 ```text
-{asset_code}:{ts}:{value}
+ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}
 ```
 
-- `{asset_code}`: The asset ticker symbol (raw UTF-8 bytes, e.g. `"SPIKO"` or `"CETES28"`).
-- `:`: ASCII colon delimiter (`0x3a`).
+- `ballast-nav-v1`: fixed, versioned domain tag.
+- `{contract}`: the verifying PriceGuard's own address as its `C...` strkey. A signature is only
+  valid on that deployment, so it cannot be replayed on a redeployed PriceGuard (#90).
+- `{asset_code}`: The asset ticker symbol (raw UTF-8 bytes, e.g. `"SPIKO"` or `"CETES28"`). It is
+  bound on-chain once by `configure_issuer_key` and is no longer an argument of `publish_nav`, so a
+  signature made for one asset's code does not verify for another asset sharing the key.
+- `:`: ASCII colon delimiter (`0x3a`) between every field.
 - `{ts}`: The Unix epoch timestamp in seconds, represented as an unsigned integer in decimal ASCII (e.g. `1700000000`).
 - `:`: ASCII colon delimiter (`0x3a`).
 - `{value}`: The NAV price in 7 decimal fixed-point units ($10^7$ scale), represented as a signed integer in decimal ASCII with no decimal point (e.g. `10234567` for $1.0234567$, or `170141183460469231731687303715884105727` for $2^{127} - 1$).
@@ -55,25 +60,27 @@ The following vectors are verified against both the Rust contract crypto (`env.c
 - **Raw Public Key (Base64)**: `/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=`
 
 ### Vector 1: SPIKO Standard NAV
+- **Contract**: `CA66MNFKUT2SJDXOCZFTUNW6OGE5T5IVGUNZL53QR5PSMFWB4VJIZ4CC`
 - **Asset Code**: `SPIKO`
 - **Timestamp (`ts`)**: `1700000000`
 - **Value**: `10234567` ($1.0234567$)
-- **Canonical Message**: `SPIKO:1700000000:10234567`
-- **Message Bytes (Hex)**: `5350494b4f3a313730303030303030303a3130323334353637`
+- **Canonical Message**: `ballast-nav-v1:CA66MNFKUT2SJDXOCZFTUNW6OGE5T5IVGUNZL53QR5PSMFWB4VJIZ4CC:SPIKO:1700000000:10234567`
+- **Message Bytes (Hex)**: `62616c6c6173742d6e61762d76313a434136364d4e464b555432534a44584f435a4654554e57364f4745355435495647554e5a4c353351523550534d46574234564a495a3443433a5350494b4f3a313730303030303030303a3130323334353637`
 - **Detached Signature (Hex)**:
   ```text
-  234bd254088c736541fe363aa4d7163004ece797b6dfc6d58d3e796987cfc20501ae42a42e9db5d1a026294b755e3c98943fdce037cff1bacfd578e749a7ba0e
+  b825b28dbbc233291612d673a6241e3d437cf706ff8170574ee29ffb4698c2e52287348566bbff6f6f9acd0718f9a48ba2badef453eccae3216ad350855ebb09
   ```
 
 ### Vector 2: CETES28 High-Value NAV
+- **Contract**: `CD4TZ6XYKNTBLXJP23XSZFMDMDYEG6WNOCCFM3A757YM6IGLXEQBF2RY`
 - **Asset Code**: `CETES28`
 - **Timestamp (`ts`)**: `4102444800`
 - **Value**: `170141183460469231731687303715884105727` (`i128::MAX`)
-- **Canonical Message**: `CETES28:4102444800:170141183460469231731687303715884105727`
-- **Message Bytes (Hex)**: `434554455332383a343130323434343830303a313730313431313833343630343639323331373331363837333033373135383834313035373237`
+- **Canonical Message**: `ballast-nav-v1:CD4TZ6XYKNTBLXJP23XSZFMDMDYEG6WNOCCFM3A757YM6IGLXEQBF2RY:CETES28:4102444800:170141183460469231731687303715884105727`
+- **Message Bytes (Hex)**: `62616c6c6173742d6e61762d76313a434434545a3658594b4e54424c584a50323358535a464d444d4459454736574e4f4343464d3341373537594d3649474c58455142463252593a434554455332383a343130323434343830303a313730313431313833343630343639323331373331363837333033373135383834313035373237`
 - **Detached Signature (Hex)**:
   ```text
-  8d3d74080eedf829ec37883108d114c7430729a98d904561c05f1c09280c5ace0632377afafe85061421bee92cc6de6bf6e4cacf2b82aef39d4a2333d8294c0c
+  be2908255296c8b80747766cb744d698616596a34a83c0c41db25037b51faed72605e1879ec94c167104027a1af7484f827db3f4b069eead381cedebc8c4be0b
   ```
 
 ---
@@ -96,8 +103,13 @@ stellar contract invoke \
   -- configure_issuer_key \
   --admin "$ADMIN" \
   --asset "$RWA_SAC" \
+  --asset_code "$ASSET_CODE_HEX" \
   --issuer_pubkey "$PUBLISHER_KEY_HEX"
 ```
+
+`asset_code` is a `Bytes` argument, which the CLI takes as hex:
+`ASSET_CODE_HEX=$(printf %s "$ASSET_CODE" | od -An -tx1 | tr -d ' \n')` ("RWA1" -> `52574131`). The
+code is bound once; calling `configure_issuer_key` again with a different code panics.
 
 ### 3. Require NAV Signatures (Admin only)
 The requirement is per asset (#95) and defaults to `true` for an asset that was never configured.
@@ -117,15 +129,12 @@ stellar contract invoke \
 ### 4. Publishing NAV
 The publisher signs the canonical message using `scripts/sign-nav.mjs` and submits.
 
-`asset_code` is a `Bytes` argument. The stellar CLI takes `Bytes` (and `BytesN`) arguments as a hex
-string, not as text, so encode the ticker first. `sign-nav.mjs` takes the plain ticker, because the
-signed message contains its raw UTF-8 bytes:
+`publish_nav` no longer takes `asset_code`: the contract uses the code bound in step 2.
+`sign-nav.mjs` takes the PriceGuard id and the plain ticker, because the signed message contains
+both as text:
 
 ```bash
-ASSET_CODE=SPIKO
-ASSET_CODE_HEX=$(printf %s "$ASSET_CODE" | od -An -tx1 | tr -d ' \n')   # "SPIKO" -> 5350494b4f
-
-NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" "$ASSET_CODE" "$TS" "$VALUE")
+NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" "$PRICE_GUARD_CID" "$ASSET_CODE" "$TS" "$VALUE")
 
 stellar contract invoke \
   --id "$PRICE_GUARD_CID" \
@@ -134,7 +143,6 @@ stellar contract invoke \
   -- publish_nav \
   --publisher "$PRICE_PUBLISHER" \
   --asset "$RWA_SAC" \
-  --asset_code "$ASSET_CODE_HEX" \
   --value "$VALUE" \
   --ts "$TS" \
   --sig "$NAV_SIG"

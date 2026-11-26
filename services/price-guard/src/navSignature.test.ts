@@ -26,25 +26,27 @@ describe("canonicalNavMessage", () => {
   });
 
   it("verifies golden vector signatures against test keypair", () => {
+    // Seed [9u8; 32]; the same signatures are checked on-chain in
+    // `build_nav_message_matches_golden_vectors` and listed in docs/nav-signing.md.
     const pubkeyBase64 = "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=";
-    const sig1 = Buffer.from(
-      "234bd254088c736541fe363aa4d7163004ece797b6dfc6d58d3e796987cfc20501ae42a42e9db5d1a026294b755e3c98943fdce037cff1bacfd578e749a7ba0e",
-      "hex",
-    );
-    expect(verifyNavSignature("SPIKO", 1700000000, 10234567n, sig1, pubkeyBase64)).toBe(true);
+    const sigs = [
+      "b825b28dbbc233291612d673a6241e3d437cf706ff8170574ee29ffb4698c2e52287348566bbff6f6f9acd0718f9a48ba2badef453eccae3216ad350855ebb09",
+      "be2908255296c8b80747766cb744d698616596a34a83c0c41db25037b51faed72605e1879ec94c167104027a1af7484f827db3f4b069eead381cedebc8c4be0b",
+    ];
+    vectors.forEach(({ contract, assetCode, ts, value }, i) => {
+      const sig = Buffer.from(sigs[i], "hex");
+      expect(verifyNavSignature(contract, assetCode, ts, BigInt(value), sig, pubkeyBase64)).toBe(true);
+    });
+  });
 
-    const sig2 = Buffer.from(
-      "8d3d74080eedf829ec37883108d114c7430729a98d904561c05f1c09280c5ace0632377afafe85061421bee92cc6de6bf6e4cacf2b82aef39d4a2333d8294c0c",
+  it("rejects a vector signature checked against another deployment or asset code", () => {
+    const pubkeyBase64 = "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=";
+    const sig = Buffer.from(
+      "b825b28dbbc233291612d673a6241e3d437cf706ff8170574ee29ffb4698c2e52287348566bbff6f6f9acd0718f9a48ba2badef453eccae3216ad350855ebb09",
       "hex",
     );
-    expect(
-      verifyNavSignature(
-        "CETES28",
-        4102444800,
-        170141183460469231731687303715884105727n,
-        sig2,
-        pubkeyBase64,
-      ),
-    ).toBe(true);
+    const [v] = vectors;
+    expect(verifyNavSignature(vectors[1].contract, v.assetCode, v.ts, BigInt(v.value), sig, pubkeyBase64)).toBe(false);
+    expect(verifyNavSignature(v.contract, "CETES28", v.ts, BigInt(v.value), sig, pubkeyBase64)).toBe(false);
   });
 });

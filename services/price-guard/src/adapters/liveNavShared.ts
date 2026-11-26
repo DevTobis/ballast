@@ -9,7 +9,11 @@ const ATTEMPTS = 2;
  * or network error is retried once (Etherfuse's public endpoint times out intermittently); an
  * HTTP error status is not.
  */
-export async function getJson<T>(url: string, fetchImpl: typeof fetch = fetch): Promise<T> {
+export async function getJson<T>(
+  url: string,
+  fetchImpl: typeof fetch = fetch,
+  adapterLabel = "issuer",
+): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     let res: Response;
     try {
@@ -24,13 +28,17 @@ export async function getJson<T>(url: string, fetchImpl: typeof fetch = fetch): 
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`issuer NAV request failed: GET ${url} -> ${res.status} ${res.statusText}: ${text}`);
+      const singleLine = text.replace(/[\r\n]+/g, " ").trim();
+      const truncated = singleLine.length > 200 ? singleLine.slice(0, 200) : singleLine;
+      throw new Error(
+        `${adapterLabel} NAV request failed: GET ${url} -> ${res.status} ${res.statusText}${truncated ? `: ${truncated}` : ""}`,
+      );
     }
     try {
       return (await res.json()) as T;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`issuer NAV request failed to parse JSON from GET ${url}: ${message}`);
+      throw new Error(`${adapterLabel} NAV request failed to parse JSON from GET ${url}: ${message}`);
     }
   }
 }

@@ -11,6 +11,11 @@
 # re-runs the PledgeVault, CreditLine, ExitDesk and RepoDvp asset configuration with the new address
 # (each stores the PriceGuard it consults). It rewrites PRICE_GUARD_CID in `.env.<network>-deploy`
 # and PRICE_GUARD_CONTRACT_ID in `.env`; restart the services afterwards so they pick it up.
+#
+# ExitDesk and RepoDvp treat a new PriceGuard as a loosening change (#214, #215): on an existing
+# deployment configure-desks.sh queues their switch behind the 48h timelock instead of applying it,
+# and prints the `execute_configure_asset` / `execute_asset_config` command to run after 48h. Until
+# then both desks keep pricing off the old PriceGuard, so leave it running.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -73,10 +78,9 @@ if [[ -f .env ]]; then set_var .env PRICE_GUARD_CONTRACT_ID "$NEW"; fi
 log "Registering the NAV attestor key and requiring signatures"
 scripts/configure-nav-key.sh "$NETWORK"
 
-log "Pointing PledgeVault and CreditLine at it"
-inv --id "$PLEDGE_VAULT_CID" -- configure_asset \
-  --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$NEW" --credit_line "$CREDIT_LINE_CID" \
-  --haircut_bps 500 --thresholds "$THRESHOLDS" --custody_mode '"Escrow"' >/dev/null
+# PledgeVault holds no PriceGuard address (#180): release reads the price through CreditLine, so
+# pointing CreditLine at the new guard covers both.
+log "Pointing CreditLine at it"
 inv --id "$CREDIT_LINE_CID" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "$NEW" --usdc "$USDC_SAC" \
   --haircut_bps 500 --thresholds "$THRESHOLDS" >/dev/null

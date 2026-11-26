@@ -36,5 +36,6 @@ export function createFakeDb(fixtures: Map<unknown, unknown[]>): Database {
         set: () => query,
       };
     },
+    execute: async () => [{ "?column?": 1 }],
   } as unknown as Database;
 }

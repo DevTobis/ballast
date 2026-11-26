@@ -153,6 +153,7 @@ struct Harness {
     admin: Address,
     pauser: Address,
     keeper: Address,
+    risk: Address,
     price_guard: Address,
     rwa: Address,
     usdc: Address,
@@ -211,6 +212,7 @@ fn setup() -> Harness {
         admin,
         pauser,
         keeper,
+        risk,
         price_guard,
         rwa,
         usdc,
@@ -1348,10 +1350,12 @@ fn configure_asset_accepts_valid_thresholds() {
         &(30 * 24 * 3_600u64),
     );
 
-    // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling
+    // Tightest strictly increasing thresholds, with liquidation at the 100% ceiling. A fresh
+    // asset, because raising an existing asset's thresholds is a loosening change (#215).
+    let other_asset = Address::generate(&h.env);
     repo.configure_asset(
         &h.admin,
-        &new_asset,
+        &other_asset,
         &h.price_guard,
         &500u32,
         &MarginThresholds {
@@ -1825,6 +1829,7 @@ mod sac {
             admin,
             pauser,
             keeper,
+            risk,
             price_guard,
             rwa,
             usdc,
@@ -2801,6 +2806,173 @@ mod storage_lifetime {
             assert_eq!(data.1, 7_200);
         }
     }
+
+    #[test]
+    fn release_excess_happy_path_reduces_units_and_transfers_tokens() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup();
+        // 50 cash against 100 units at $1 with a 5% haircut: about 53% LTV (warning 70%).
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let borrower_before = MockTokenClient::new(&h.env, &h.rwa).balance(&h.cash_borrower);
+
+        // Price doubles to $2.00
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(2 * PRICE_SCALE),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+
+        // Release 40 units (100 -> 60 remaining).
+        // 60 units * $2 * 0.95 = $114 collateral value against ~50 exposure => LTV ~43.8% < 70%.
+        let release_amt = 40 * PRICE_SCALE;
+        repo.release_excess(&h.cash_borrower, &id, &release_amt);
+
+        // Verify event (symbol_short!("release"), id), release_amt immediately before subsequent calls reset event log
+        let all_events = h.env.events().all();
+        let events = all_events.filter_by_contract(&h.repo);
+        let items = events.events();
+        let last = items.last().expect("must have event");
+        let body = match &last.body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0, symbol_short!("release"));
+        assert_eq!(topic1, id);
+        let data: i128 = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data, release_amt);
+
+        let trade = repo.trade(&id);
+        assert_eq!(trade.units, 60 * PRICE_SCALE);
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.rwa).balance(&h.cash_borrower) - borrower_before,
+            release_amt
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: price is not usable")]
+    fn release_excess_refused_on_unusable_price() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &PRICE_SCALE,
+            &PriceStatus::Degraded,
+            &h.env.ledger().timestamp(),
+        );
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: cannot release with an open margin call")]
+    fn release_excess_refused_with_open_margin_call() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        repo.release_excess(&h.cash_borrower, &id, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: post-release LTV exceeds warning threshold")]
+    fn release_excess_refused_when_post_ltv_reaches_or_exceeds_warning() {
+        let h = setup();
+        // 50 cash against 100 units at $1 with 5% haircut => LTV ~52.6%, warning is 70% (7_000 bps).
+        // If borrower tries to release 30 units, rem = 70 => post collateral = 66.5, LTV = 50 / 66.5 = 75.18% >= 70%.
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(30 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: only the cash borrower can release excess")]
+    fn release_excess_refused_for_non_borrower() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_lender, &id, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: trade is not settled")]
+    fn release_excess_refused_on_unsettled_trade() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(10 * PRICE_SCALE));
+    }
+
+    /// Settled 50 cash against 100 units at $1 with a 5% haircut, so the post-release LTV is
+    /// `50e7 * 10_000 / (remaining * 0.95)`, floored. 751_800_000 units remaining value at
+    /// 714_210_000, which is exactly 7_000 bps: the warning threshold, so refused (#212).
+    #[test]
+    #[should_panic(expected = "repo-dvp: post-release LTV exceeds warning threshold")]
+    fn release_excess_refused_when_post_ltv_lands_exactly_on_warning() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        RepoDvpClient::new(&h.env, &h.repo).release_excess(
+            &h.cash_borrower,
+            &id,
+            &(UNITS - 751_800_000),
+        );
+    }
+
+    /// 752_000_000 units remaining value at 714_400_000: 6_998 bps, one step under warning.
+    #[test]
+    fn release_excess_allowed_just_under_warning() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(UNITS - 752_000_000));
+        assert_eq!(repo.trade(&id).units, 752_000_000);
+        assert_eq!(repo.margin_view(&id).ltv_bps, 6_998);
+    }
+
+    /// Releasing collateral adds risk, so it stops with new repo activity when `Repos` is paused.
+    #[test]
+    fn release_excess_is_refused_while_repos_are_paused() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.pause(&h.pauser, &PauseScope::Repos);
+        assert!(repo
+            .try_release_excess(&h.cash_borrower, &id, &PRICE_SCALE)
+            .is_err());
+        assert_eq!(repo.trade(&id).units, UNITS);
+    }
 }
 
 /// Contract event assertions serving as the formal contract between RepoDvp and off-chain
@@ -2974,5 +3146,195 @@ mod indexer_events {
         let borrower_units = rwa_balance(&h, &h.cash_borrower) - borrower_before;
 
         assert_event(&h, &events, symbol_short!("mat_def"), id, (lender_units, borrower_units));
+    }
+}
+
+// --- #215: loosening an asset config is timelocked; tightening is immediate -----------------
+
+mod config_timelock {
+    use super::*;
+
+    const MAX_CASH: i128 = 1_000_000_000_000;
+    const MAX_TERM: u64 = 30 * 24 * 3_600;
+
+    fn bands(w: u32, m: u32, l: u32) -> MarginThresholds {
+        MarginThresholds {
+            warning_bps: w,
+            margin_call_bps: m,
+            liquidation_bps: l,
+        }
+    }
+
+    fn reconfigure(h: &Harness, guard: &Address, haircut: u32, t: MarginThresholds, cash: i128, term: u64) {
+        RepoDvpClient::new(&h.env, &h.repo).configure_asset(
+            &h.admin, &h.rwa, guard, &haircut, &t, &cash, &term,
+        );
+    }
+
+    fn queue(h: &Harness, guard: &Address, haircut: u32, t: MarginThresholds, cash: i128, term: u64) -> u64 {
+        RepoDvpClient::new(&h.env, &h.repo).queue_asset_config(
+            &h.admin, &h.rwa, guard, &haircut, &t, &cash, &term,
+        )
+    }
+
+    fn advance(h: &Harness, seconds: u64) {
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + seconds);
+    }
+
+    #[test]
+    fn first_listing_and_tightening_apply_immediately() {
+        let h = setup();
+        // setup() listed the asset at 5% / 7000-8000-9500. A higher haircut, lower bands and lower
+        // caps all tighten, so they apply at once.
+        reconfigure(&h, &h.price_guard, 800, bands(6_000, 7_000, 9_000), MAX_CASH / 2, MAX_TERM / 2);
+        let cfg = RepoDvpClient::new(&h.env, &h.repo).asset_config(&h.rwa);
+        assert_eq!(cfg.haircut_bps, 800);
+        assert_eq!(cfg.thresholds.liquidation_bps, 9_000);
+        assert_eq!(cfg.max_cash_per_trade, MAX_CASH / 2);
+        // Re-running with identical values (as configure-desks.sh does) is accepted.
+        reconfigure(&h, &h.price_guard, 800, bands(6_000, 7_000, 9_000), MAX_CASH / 2, MAX_TERM / 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_new_price_guard_is_refused() {
+        let h = setup();
+        let other = Address::generate(&h.env);
+        reconfigure(&h, &other, 500, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_lower_haircut_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 400, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_higher_threshold_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 500, bands(7_000, 8_500, 9_500), MAX_CASH, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_higher_cash_cap_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 500, bands(7_000, 8_000, 9_500), MAX_CASH + 1, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "use queue_asset_config")]
+    fn a_longer_term_cap_is_refused() {
+        let h = setup();
+        reconfigure(&h, &h.price_guard, 500, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM + 1);
+    }
+
+    #[test]
+    fn a_queued_loosening_applies_only_after_48h() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let new_guard = env_guard(&h);
+        let id = queue(&h, &new_guard, 300, bands(7_500, 8_500, 9_600), MAX_CASH * 2, MAX_TERM);
+        let pending = repo.pending_asset_config(&id).expect("queued");
+        assert_eq!(pending.executes_at, h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS);
+
+        advance(&h, timelock::TIMELOCK_DELAY_SECONDS - 1);
+        assert!(repo.try_execute_asset_config(&id).is_err(), "too early");
+        assert_eq!(repo.asset_config(&h.rwa).price_guard, h.price_guard);
+
+        advance(&h, 1);
+        repo.execute_asset_config(&id);
+        let cfg = repo.asset_config(&h.rwa);
+        assert_eq!(cfg.price_guard, new_guard);
+        assert_eq!(cfg.haircut_bps, 300);
+        assert_eq!(cfg.thresholds.margin_call_bps, 8_500);
+        assert_eq!(cfg.max_cash_per_trade, MAX_CASH * 2);
+        assert!(repo.pending_asset_config(&id).is_none());
+        assert!(repo.try_execute_asset_config(&id).is_err(), "single use");
+    }
+
+    fn env_guard(h: &Harness) -> Address {
+        Address::generate(&h.env)
+    }
+
+    #[test]
+    fn a_cancelled_change_never_applies() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let id = queue(&h, &h.price_guard, 300, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+        repo.cancel_asset_config(&h.admin, &id);
+        advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+        assert!(repo.try_execute_asset_config(&id).is_err());
+        assert_eq!(repo.asset_config(&h.rwa).haircut_bps, 500);
+    }
+
+    #[test]
+    fn queue_validates_and_needs_an_existing_asset() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let bad = repo.try_queue_asset_config(
+            &h.admin, &h.rwa, &h.price_guard, &500, &bands(8_000, 8_000, 9_000), &MAX_CASH, &MAX_TERM,
+        );
+        assert!(bad.is_err(), "unordered thresholds refused at queue time");
+        let unknown = Address::generate(&h.env);
+        let missing = repo.try_queue_asset_config(
+            &h.admin, &unknown, &h.price_guard, &500, &bands(7_000, 8_000, 9_000), &MAX_CASH, &MAX_TERM,
+        );
+        assert!(missing.is_err(), "first listing goes through configure_asset");
+    }
+
+    #[test]
+    fn non_admins_cannot_queue_or_cancel() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let stranger = Address::generate(&h.env);
+        assert!(repo
+            .try_queue_asset_config(
+                &stranger, &h.rwa, &h.price_guard, &300, &bands(7_000, 8_000, 9_500), &MAX_CASH, &MAX_TERM,
+            )
+            .is_err());
+        let id = queue(&h, &h.price_guard, 300, bands(7_000, 8_000, 9_500), MAX_CASH, MAX_TERM);
+        assert!(repo.try_cancel_asset_config(&stranger, &id).is_err());
+    }
+
+    #[test]
+    fn risk_tightens_immediately_and_keeps_guard_and_caps() {
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.tighten_asset_config(&h.risk, &h.rwa, &900, &bands(6_000, 7_000, 8_000));
+        let cfg = repo.asset_config(&h.rwa);
+        assert_eq!(cfg.haircut_bps, 900);
+        assert_eq!(cfg.thresholds.warning_bps, 6_000);
+        assert_eq!(cfg.price_guard, h.price_guard);
+        assert_eq!(cfg.max_cash_per_trade, MAX_CASH);
+        assert_eq!(cfg.max_term_seconds, MAX_TERM);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot loosen")]
+    fn risk_cannot_loosen() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).tighten_asset_config(
+            &h.risk,
+            &h.rwa,
+            &400,
+            &bands(7_000, 8_000, 9_500),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "risk argument mismatch")]
+    fn only_the_risk_role_uses_the_fast_path() {
+        let h = setup();
+        RepoDvpClient::new(&h.env, &h.repo).tighten_asset_config(
+            &h.admin,
+            &h.rwa,
+            &900,
+            &bands(6_000, 7_000, 8_000),
+        );
     }
 }

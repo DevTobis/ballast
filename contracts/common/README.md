@@ -26,7 +26,7 @@ The table below summarizes each module in `ballast-common` and which protocol co
 | [`margin`](#margin) | Margin state machine (`Healthy`, `Warning`, `MarginCall`, `Liquidation`), thresholds, and route types | `credit-line`, `pledge-vault`, `repo-dvp`, `ltv-view-wire-shape`, `integration-tests` |
 | [`pause`](#pause) | Emergency circuit breaker scopes (`Pledges`, `Draws`, `Exits`, `Repos`, `All`) and enforcement gates | `credit-line`, `exit-desk`, `pledge-vault`, `registry`, `repo-dvp` |
 | [`price`](#price) | Fixed-point scale (`PRICE_SCALE`), price status enum, and `GuardedPrice` structure | `price-guard`, `credit-line`, `exit-desk`, `pledge-vault`, `repo-dvp`, `ltv-view-wire-shape`, `integration-tests` |
-| [`risk`](#risk) | Collateral valuation math, haircut application, and LTV calculation | `credit-line`, `pledge-vault`, `repo-dvp`, `asset` (internal) |
+| [`risk`](#risk) | Collateral valuation math, haircut application, and LTV calculation | `credit-line`, `repo-dvp`, `asset` (internal) |
 | [`timelock`](#timelock) | 48-hour timelock delay math, monotonic ID generation, and entry TTL extensions | `registry`, `price-guard`, `exit-desk`, `repo-dvp`, `access` (internal), `upgrade` (internal) |
 | [`ttl`](#ttl) | Standardized instance (~30 days) and persistent (~30 days) storage TTL extension helpers | `credit-line`, `pledge-vault`, `price-guard`, `registry`, `repo-dvp` |
 | [`upgrade`](#upgrade) | 48-hour timelocked in-place contract upgrades via `update_current_contract_wasm` | `price-guard`, `registry` |
@@ -209,8 +209,9 @@ Provides core mathematical risk calculations: collateral haircut deduction and l
   - `validate_haircut_bps`: `"risk: haircut_bps cannot exceed 10000 bps (100%)"`.
 - **Consuming Contracts:**
   - `contracts/credit-line`
-  - `contracts/pledge-vault`
   - `contracts/repo-dvp`
+  - (`contracts/pledge-vault` no longer values collateral itself; its `release` asks
+    `CreditLine::ltv_after`, #180)
 
 ---
 

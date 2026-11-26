@@ -21,6 +21,7 @@ mod mock_token {
     #[contracttype]
     enum DataKey {
         Balance(Address),
+        Allowance(Address, Address),
     }
 
     #[contractimpl]
@@ -40,17 +41,42 @@ mod mock_token {
 
         pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
             from.require_auth();
-            let to_addr = to.address();
-            let from_key = DataKey::Balance(from);
-            let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
-            assert!(from_bal >= amount, "mock-token: insufficient balance");
-            let to_key = DataKey::Balance(to_addr);
-            let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+            move_balance(&env, &from, &to.address(), amount);
+        }
+
+        pub fn approve(env: Env, from: Address, spender: Address, amount: i128) {
+            from.require_auth();
             env.storage()
                 .instance()
-                .set(&from_key, &(from_bal - amount));
-            env.storage().instance().set(&to_key, &(to_bal + amount));
+                .set(&DataKey::Allowance(from, spender), &amount);
         }
+
+        pub fn transfer_from(
+            env: Env,
+            spender: Address,
+            from: Address,
+            to: Address,
+            amount: i128,
+        ) {
+            spender.require_auth();
+            let key = DataKey::Allowance(from.clone(), spender);
+            let allowance: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(allowance >= amount, "mock-token: insufficient allowance");
+            env.storage().instance().set(&key, &(allowance - amount));
+            move_balance(&env, &from, &to, amount);
+        }
+    }
+
+    fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) {
+        let from_key = DataKey::Balance(from.clone());
+        let from_bal: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
+        assert!(from_bal >= amount, "mock-token: insufficient balance");
+        let to_key = DataKey::Balance(to.clone());
+        let to_bal: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&from_key, &(from_bal - amount));
+        env.storage().instance().set(&to_key, &(to_bal + amount));
     }
 }
 
@@ -148,10 +174,7 @@ fn setup_harness() -> TestHarness {
     pledge_vault.configure_asset(
         &admin,
         &rwa_id,
-        &pg_id,
         &cl_id,
-        &1_000,
-        &thresholds,
         &CustodyMode::Escrow,
     );
 
@@ -396,20 +419,98 @@ fn test_real_credit_line_and_pledge_vault_liquidation_with_surplus() {
     // Close liquidated:
     // Recovered = 1,000 units * $0.95 = $950.
     // Debt = $900.
-    // Surplus = $50 ($950 - $900), which lender pays to borrower in USDC!
+    // Surplus = $50 ($950 - $900). It is booked, not paid, so the lender needs no balance to
+    // close; the borrower pulls it with claim_surplus against the lender's allowance.
     let borrower_usdc_before = h.usdc.balance(&h.borrower);
-    h.usdc.mint(&h.lender, &(50 * PRICE_SCALE)); // Ensure lender has USDC for surplus payout
     h.credit_line.close_liquidated(&h.lender, &line_id);
+    assert_eq!(h.credit_line.surplus_owed(&line_id), 50 * PRICE_SCALE);
+    assert_eq!(h.usdc.balance(&h.borrower), borrower_usdc_before);
+
+    h.usdc.mint(&h.lender, &(50 * PRICE_SCALE));
+    h.usdc
+        .approve(&h.lender, &h.credit_line.address, &(50 * PRICE_SCALE));
+    h.credit_line.claim_surplus(&h.borrower, &line_id);
 
     let borrower_usdc_after = h.usdc.balance(&h.borrower);
     assert_eq!(
         borrower_usdc_after - borrower_usdc_before,
         50 * PRICE_SCALE,
-        "lender must pay surplus to borrower in USDC upon close_liquidated"
+        "the borrower must be able to pull the surplus after close_liquidated"
     );
+    assert_eq!(h.credit_line.surplus_owed(&line_id), 0);
 
     let record = h.credit_line.liquidation_record(&line_id);
     assert!(record.closed);
     assert_eq!(record.surplus, 50 * PRICE_SCALE);
     assert_eq!(record.shortfall, 0);
+}
+
+/// #180: `PledgeVault::release` judges a release with `CreditLine::ltv_after`, so it agrees with
+/// the `ltv` CreditLine reports afterwards, and it follows a change to CreditLine's haircut with
+/// no matching change on the vault (the vault no longer holds a haircut at all).
+#[test]
+fn test_release_check_uses_credit_line_risk_config() {
+    let h = setup_harness();
+    let line_id = h.credit_line.open(
+        &h.lender,
+        &h.borrower,
+        &h.rwa_id,
+        &(5_000 * PRICE_SCALE),
+        &0,
+        &0,
+        &86_400,
+        &BytesN::from_array(&h.env, &[2u8; 32]),
+    );
+    h.usdc.mint(&h.lender, &(5_000 * PRICE_SCALE));
+    h.credit_line
+        .fund(&h.lender, &line_id, &(5_000 * PRICE_SCALE));
+    h.rwa.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+    h.pledge_vault
+        .pledge(&h.borrower, &line_id, &h.rwa_id, &(1_000 * PRICE_SCALE));
+    h.credit_line.draw(
+        &h.borrower,
+        &line_id,
+        &(900 * PRICE_SCALE),
+        &Address::generate(&h.env),
+    );
+
+    // What CreditLine says the line would look like with 900 units: $900 debt against
+    // 900 * $2.00 * 0.90 = $1,620, ~5,555 bps, Healthy.
+    let preview = h.credit_line.ltv_after(&line_id, &(900 * PRICE_SCALE));
+    assert_eq!(preview.debt, 900 * PRICE_SCALE);
+    assert_eq!(preview.collateral_value, 1_620 * PRICE_SCALE);
+    assert_eq!(preview.state, MarginState::Healthy);
+
+    // The vault approves that release, and CreditLine's own view afterwards is the preview.
+    h.pledge_vault
+        .release(&h.borrower, &line_id, &h.rwa_id, &(100 * PRICE_SCALE));
+    let after = h.credit_line.ltv(&line_id);
+    assert_eq!(after.debt, preview.debt);
+    assert_eq!(after.collateral_value, preview.collateral_value);
+    assert_eq!(after.ltv_bps, preview.ltv_bps);
+    assert_eq!(after.state, preview.state);
+
+    // CreditLine alone moves to a 50% haircut: 899 units are then worth $899 against $900 debt.
+    // The vault, which has no haircut of its own, refuses even a one-unit release.
+    let thresholds = MarginThresholds {
+        warning_bps: 7_000,
+        margin_call_bps: 8_000,
+        liquidation_bps: 9_000,
+    };
+    h.credit_line.configure_asset(
+        &h.admin,
+        &h.rwa_id,
+        &h.price_guard.address,
+        &h.usdc_id,
+        &5_000,
+        &thresholds,
+    );
+    let refused = h
+        .pledge_vault
+        .try_release(&h.borrower, &line_id, &h.rwa_id, &PRICE_SCALE);
+    assert!(refused.is_err(), "release must follow CreditLine's haircut");
+    assert_eq!(
+        h.pledge_vault.position_units(&line_id, &h.rwa_id),
+        900 * PRICE_SCALE
+    );
 }

@@ -346,6 +346,53 @@ describe("webhook routes", () => {
     expect(redeliver.statusCode).toBe(404);
   });
 
+  it("patches subscription url and events without changing or exposing secret", async () => {
+    const sub = {
+      id: "sub-patch",
+      partyId: PARTY,
+      url: "https://93.184.216.34/old",
+      events: ["margin.call_issued"],
+      secretCiphertext: "secret-ciphertext",
+      active: true,
+      createdAt: new Date(),
+    };
+    const app = server(config, [[schema.webhookSubscription, [sub]]]);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/sub-patch",
+      headers: authed,
+      payload: { url: "https://93.184.216.34/new", events: ["margin.cured"] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const json = res.json();
+    expect(json.id).toBe("sub-patch");
+    expect(json.url).toBe("https://93.184.216.34/new");
+    expect(json.events).toEqual(["margin.cured"]);
+    expect(json.active).toBe(true);
+    expect(json).not.toHaveProperty("secret");
+    expect(json).not.toHaveProperty("secretCiphertext");
+
+    // Unsafe URL is rejected with 400
+    const unsafeRes = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/sub-patch",
+      headers: authed,
+      payload: { url: "https://127.0.0.1/unsafe" },
+    });
+    expect(unsafeRes.statusCode).toBe(400);
+
+    // Patch on non-existent or other party's subscription returns 404
+    const otherRes = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/other-id",
+      headers: authed,
+      payload: { url: "https://93.184.216.34/new" },
+    });
+    expect(otherRes.statusCode).toBe(404);
+  });
+
   it("answers 409 when redelivering for a deactivated subscription", async () => {
     const inactive = { id: "sub-1", partyId: PARTY, url: "https://93.184.216.34/h", events: [], secretCiphertext: "x", active: false, createdAt: new Date() };
     const app = server(config, [

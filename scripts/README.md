@@ -208,6 +208,8 @@ The flag names were originally derived offline from `stellar contract info inter
 two real bugs surfaced that way and are now fixed: `deploy.sh` was missing a TUSD trustline for
 the borrower (needed for `CreditLine.draw` to reach them), and `e2e-smoke.sh`'s `publish_nav` call
 needed an `--asset_code` argument after `contracts/price-guard`'s on-chain issuer-signature
-verification change (see `contracts/README.md`). If a contract changes again and a flag stops
+verification change. Since #90 the code is bound once by `configure_issuer_key --asset_code <hex>`
+(`configure-nav-key.sh`) and `publish_nav` no longer takes it; `sign-nav.mjs` signs
+`ballast-nav-v1:<contract>:<asset code>:<ts>:<value>` (see `contracts/README.md`). If a contract changes again and a flag stops
 matching, `stellar contract invoke --id <CID> --source admin --network local -- <fn> --help`
 against your own deployment shows the current one.
