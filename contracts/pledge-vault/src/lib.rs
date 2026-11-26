@@ -865,16 +865,22 @@ mod test {
         h.vault.release(&h.borrower, &1, &h.asset, &PRICE_SCALE);
     }
 
-    // ── #190: release at Warning and MarginCall boundaries ─────────────────
+    // ── #190: release around the Warning threshold, using the issue's numbers ─────────────
+    //
+    // `release` only succeeds when the line stays Healthy (#1116 / #181); Warning is never allowed.
+    // `main` already covers the same boundary under the default thresholds
+    // (`release_leaving_ltv_exactly_at_the_warning_threshold_panics` and its one-bp-under twin).
+    // These tests use the issue's 700 debt / 1,000 pledge figures, so they are a worked example
+    // of #190 rather than new coverage.
 
     #[test]
-    fn release_passes_at_7990_bps_warning_allowed_boundary() {
+    fn release_passes_at_7990_bps_when_still_healthy() {
         // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
         // Releasing 124 leaves 876 collateral units.
         // Collateral value = 876 * 1.0 = 876 (haircut 0).
         // LTV bps = 700 * 10_000 / 876 = 7,990 bps.
-        // With warning_bps configured at 8,000 (Warning boundary allowed), 7,990 bps is
-        // classified as Healthy (< 8,000 bps) and the release succeeds.
+        // With warning_bps moved to 8,000, 7,990 bps is still Healthy (< 8,000 bps), so the
+        // release succeeds. It would fail under the default 7,000 warning threshold (see below).
         let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
         reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
         h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
@@ -887,13 +893,13 @@ mod test {
 
     #[test]
     #[should_panic(expected = "pledge-vault: release would leave the credit line unhealthy")]
-    fn release_panics_at_exactly_8000_bps_margin_call_boundary() {
+    fn release_panics_at_exactly_8000_bps_at_the_warning_threshold() {
         // Issue #190: With haircut 0, price 1.0, debt 700, pledge 1000:
         // Releasing 125 leaves 875 collateral units.
         // Collateral value = 875 * 1.0 = 875 (haircut 0).
         // LTV bps = 700 * 10_000 / 875 = exactly 8,000 bps.
-        // At 8,000 bps, the line reaches the threshold (classified as Warning/MarginCall)
-        // and panics.
+        // With `bands(8_000, 8_500, 9_000)`, 8,000 bps is exactly the Warning threshold, so the
+        // line would no longer be Healthy and the release panics.
         let h = setup(0, 700 * PRICE_SCALE, PRICE_SCALE);
         reconfigure(&h, 0, &bands(8_000, 8_500, 9_000));
         h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
