@@ -45,7 +45,10 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
-  good value is a sticky `Halted` that only `risk` clears.
+  good value is a sticky `Halted` that only `risk` clears. The on-call procedure for a halt —
+  detection, independent-source checks, the `risk`-signed `confirm_halt_cleared` command,
+  verification and escalation — is [`docs/runbooks/price-halt.md`](../docs/runbooks/price-halt.md).
+  Confirming promotes the value that tripped the halt, so re-check it has not reverted first.
 - **`LastGood` carries its own timestamp.** `DataKey::LastGood` stores `LastGood { value, ts }`.
   When `guarded_price` returns `Ok`, `GuardedPrice::ts` is the current evaluation timestamp (`now`);
   when it returns `Degraded` or `Halted`, `GuardedPrice::ts` is `last_good.ts` (`0` if there was no
