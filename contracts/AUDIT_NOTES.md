@@ -45,7 +45,10 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 - The guarded price is the median of fresh sources. Fewer than two fresh sources is `Degraded`;
   disagreement beyond `band_bps` is `Degraded`; a move beyond `daily_move_band_bps` against the last
-  good value is a sticky `Halted` that only `risk` clears.
+  good value is a sticky `Halted` that only `risk` clears. The on-call procedure for a halt —
+  detection, independent-source checks, the `risk`-signed `confirm_halt_cleared` command,
+  verification and escalation — is [`docs/runbooks/price-halt.md`](../docs/runbooks/price-halt.md).
+  Confirming promotes the value that tripped the halt, so re-check it has not reverted first.
 - **`LastGood` carries its own timestamp.** `DataKey::LastGood` stores `LastGood { value, ts }`.
   When `guarded_price` returns `Ok`, `GuardedPrice::ts` is the current evaluation timestamp (`now`);
   when it returns `Degraded` or `Halted`, `GuardedPrice::ts` is `last_good.ts` (`0` if there was no
@@ -101,6 +104,14 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
   Both are lender-only and not pause-gated.
+- **Platform fees & invariant 6 (`fee_bps`)**: `open` takes `fee_bps <= 10_000` (simple
+  non-compounding annual rate on `drawn`, included in `debt_of` and LTV). `repay` allocates
+  `fee -> interest -> principal`; repaid fees accumulate in `FeeClaimable(line)` and can only be
+  withdrawn by the configured `Treasury` address via `claim_fee` (not pause-gated). On
+  liquidation, unpaid platform fees are left out of `LiquidationRecord.debt` and waived in
+  `close_liquidated` so the lender never pockets protocol fees or shrinks the borrower's surplus
+  (any fees already repaid before liquidation remain in `FeeClaimable`). Adding `fee_bps` and
+  `accrued_fee` changes the `Line` storage layout and requires a fresh contract redeploy.
 - `draw` enforces `limit` (it previously only checked `funded`). `fund` is refused on a closed line.
 - Interest is simple, non-compounding, accrued on principal per second.
 - **Collateral is reported by the vault, in the same transaction.** `PledgeVault` calls
@@ -166,7 +177,8 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 - **Margin.** `call_margin` opens a call at `MarginCall` or worse, never moves an open call's
   deadline, and clears the call when the position is back under the band. `top_up` (borrower)
   adds collateral and clears the call in the same transaction if that is enough; it is not
-  pause-gated. `margin_view` is a free read.
+  pause-gated. `margin_view` is a free read. Accrued interest in `evaluate_margin` is capped at
+  `maturity_at`, ensuring post-maturity exposure matches what `unwind` collects and what `default_close` covers (#218).
 - **Default.** `default_close` is keeper-only, needs the cure window to have passed, re-evaluates
   the position and refuses a cured one. The lender receives `ceil(exposure / price)` units at the
   guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the

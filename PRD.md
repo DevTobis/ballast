@@ -668,7 +668,7 @@ All ASSUMPTION until the Phase 0 legal memo.
 | Testing | Unit and property tests for every invariant in §8; fork tests against mainnet state; Price Guard fuzzing with adversarial price paths, including a replay of the USTRY manipulation |
 | Drills | Monthly: margin call → cure; liquidation via redemption; price source outage; pauser use; key rotation |
 | Bug bounty | From mainnet launch; scope: contracts and Price Guard |
-| Monitoring | Alerts: price `Degraded`/`Halted`, any line in margin call, keeper balance low, reconciliation break, RPC lag > 60s |
+| Monitoring | Alerts: price `Degraded`/`Halted`, any line in margin call, keeper balance low, reconciliation break, RPC lag > 60s. A `Halted` alert is handled with the [PriceGuard halt runbook](docs/runbooks/price-halt.md) |
 
 ---
 

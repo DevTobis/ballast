@@ -73,6 +73,7 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|
+| `drawn` | `(Symbol("drawn"), line: u64)` | `(amount: i128, to: Address, drawn_total: i128, ltv_bps: u32)` | `draw` |
 | `repaid` | `(Symbol("repaid"), line: u64)` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` |
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
