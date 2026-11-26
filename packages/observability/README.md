@@ -12,7 +12,7 @@ Logging, metrics and alerting shared by all services, so each one wires them up 
   logs to stderr and, when `ALERT_WEBHOOK_URL` is set, also POSTs JSON (`text`, `content`, `kind`,
   `context`) so Slack and Discord both render it. The alert kinds are `price_degraded`,
   `price_halted`, `margin_call`, `keeper_balance_low`, `operator_balance_low`,
-  `reconciliation_break` and `rpc_lag_high`.
+  `reconciliation_break`, `event_gap_skipped` and `rpc_lag_high`.
 - `checkOperatorBalance(alerter, { horizonUrl, account, label, minXlm? })` and `nativeBalanceXlm`:
   fire `operator_balance_low` when an operator account holds less than `OPERATOR_MIN_XLM` (default
   `DEFAULT_MIN_XLM`, 20).

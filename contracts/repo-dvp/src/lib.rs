@@ -40,31 +40,66 @@
 //!
 //! One live proposal per (lender, token) at a time: an allowance is a single number per
 //! owner/spender pair, so a lender's second `propose` replaces the first one's allowance.
+//! If a proposal is cancelled via `cancel_proposal` by the lender, the allowance is reset to 0
+//! if this was the lender's latest proposal. When a proposal is cancelled by the borrower,
+//! the trade status moves to `Cancelled` preventing acceptance, but the lender's allowance
+//! remains unchanged as the borrower does not hold authorization to modify the lender's allowance.
 //!
-//! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
-//! `default_close` gives the cash lender full title to the pledged RWA units and closes the
-//! trade. It does **not** attempt to net the collateral's current market value against the
-//! outstanding cash exposure (principal + accrued interest) and settle any residual USDC in
-//! either direction — a real implementation would need `call_margin`'s guarded-price read here
-//! too, plus a place for a shortfall (lender under-recovered) or an excess (borrower is owed
-//! change) to be booked. That accounting is left to the off-chain `ledger`/`margin-monitor`
-//! services (PRD §6.5); on-chain, "lender keeps the collateral, trade closed" is the full
-//! outcome.
+//! The borrower side has the same replace semantics but a different answer: a borrower may have
+//! several settled trades at once, and each one's keeper/lender `unwind` must stay collectable.
+//! `accept_and_settle` therefore approves the **sum** of the borrower's outstanding leg-2 due
+//! ceilings (tracked per borrower in contract storage, added on settle, released on
+//! `unwind`/`default_close`), with the allowance expiry never shortened below what an
+//! earlier-settled trade still needs. A non-borrower `unwind` consumes its own trade's share of
+//! that sum via `transfer_from`; a defaulted trade's unconsumed share stays in the live
+//! allowance only until the next settle re-approves the accurate sum or the allowance expires.
+//!
+//! **Margin default path (PRD §5 Phase 3 "Fail path"):**
+//! If the cash borrower has not cured an outstanding margin call by `cure_deadline`, the trade
+//! can be closed via `default_close` (keeper-only). The position is re-evaluated at default
+//! time: if the price has recovered since the call, the borrower has cured and this refuses.
+//! The collateral is valued at the guarded price with no haircut; the cash lender receives
+//! `ceil(exposure / price)` units, capped at what is pledged, and any surplus units above that
+//! return to the borrower. If the collateral is worth less than the exposure, the lender takes
+//! all pledged units and bears the shortfall. No USDC moves on default.
+//!
+//! **Maturity default path (PRD §5 Phase 3 "Fail path"):**
+//! If the cash borrower fails to fund leg 2 at maturity, `unwind` reverts. Once the trade remains
+//! unpaid past `maturity_at + maturity_grace` (default 24h, admin-configurable with a 60s floor),
+//! the cash lender or keeper can trigger `default_at_maturity`. Like `default_close`, this values
+//! the pledged RWA at the guarded price with no haircut, transfers `ceil(total_due / price)` units
+//! to the cash lender (capped at what is pledged), and returns any surplus units to the borrower.
+//! If collateral value is less than `total_due`, the lender takes all units and bears the shortfall.
 //!
 //! **Skeleton simplification (yield during repo):** PRD §5 Phase 3 "Yield during repo" (passing
 //! manufactured payments on the pledged RWA back to the original owner during the term) is not
 //! implemented. Documented gap, not attempted in this pass.
+//!
+//! **Storage lifetime:** an entry that is written and never extended lives only for the
+//! network's minimum persistent TTL, which is 120,960 ledgers (about 7 days) on testnet and
+//! 2,073,600 (about 120 days) on mainnet, as read from both networks' state-archival settings on
+//! 2026-11-22. A trade is typically written at `propose` and `accept_and_settle` and then left
+//! alone until maturity, so:
+//!
+//! - every entry point extends the contract instance (roles, USDC, cure and maturity grace, asset
+//!   configs, pause flags) with the shared `ttl::extend_instance`;
+//! - every write of a trade extends its entry to outlast `maturity_at` plus
+//!   [`UNWIND_ALLOWANCE_GRACE_LEDGERS`] plus a two-day margin, and never to less than the shared
+//!   ~30 days (see `trade_ttl_ledgers`);
+//! - the borrower's outstanding leg-2 sum is extended to outlast the allowance it describes;
+//! - `extend_ttl` is a permissionless keep-alive for one trade, for a trade longer than the
+//!   network's maximum entry TTL (3,110,400 ledgers, about 180 days, on both networks).
 
 use ballast_common::{
     access::{self, Roles},
     margin::{self, MarginState, MarginThresholds},
     pause::{self, PauseScope},
     price::{GuardedPrice, PRICE_SCALE},
-    risk, timelock,
+    risk, timelock, ttl,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, MuxedAddress,
+    Env, MuxedAddress, Symbol,
 };
 
 /// Grace period after a margin call before `default_close` may act (PRD §5 Phase 1 "Top-up and
@@ -75,12 +110,22 @@ pub const MARGIN_CURE_GRACE_SECONDS: u64 = 24 * 60 * 60;
 /// borrower no real chance to respond, whatever a keeper's schedule.
 pub const MIN_CURE_GRACE_SECONDS: u64 = 60;
 
+/// Grace period past maturity before `default_at_maturity` may act.
+pub const DEFAULT_MATURITY_GRACE_SECONDS: u64 = 24 * 60 * 60;
+
+/// The shortest maturity grace window the admin may configure.
+pub const MIN_MATURITY_GRACE_SECONDS: u64 = 60;
+
 /// How long past maturity the borrower's leg-2 allowance stays spendable (about one week of
 /// ~5s ledgers), so a late keeper run can still unwind.
 pub const UNWIND_ALLOWANCE_GRACE_LEDGERS: u32 = 120_960;
 const SECONDS_PER_LEDGER: u64 = 5;
 /// About one day of ledgers; see [`allowance_expiry`].
 const ALLOWANCE_EXPIRY_BUCKET_LEDGERS: u32 = 17_280;
+/// Ledgers a trade's entry is kept alive beyond its maturity and the unwind grace. The leg-2
+/// allowance that the grace exists for is rounded up by as much as two expiry buckets (see
+/// [`allowance_expiry`]), and the trade must not be archived before that allowance runs out.
+const TRADE_TTL_MARGIN_LEDGERS: u32 = 2 * ALLOWANCE_EXPIRY_BUCKET_LEDGERS;
 
 const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -103,6 +148,53 @@ pub enum RepoKind {
     Term,
 }
 
+/// The longest a [`RepoKind::Intraday`] repo may run, from `propose` to `maturity_at` (PRD §5
+/// Phase 3: "same-day unwind").
+pub const MAX_INTRADAY_TERM_SECONDS: u64 = 24 * 60 * 60;
+
+/// The longest a [`RepoKind::Overnight`] repo may run: out one day and back the next, with room
+/// for a proposal made early on the first day.
+pub const MAX_OVERNIGHT_TERM_SECONDS: u64 = 48 * 60 * 60;
+
+/// The longest a [`RepoKind::Term`] repo may run (PRD §5 Phase 3: "term (up to 30 days)").
+pub const MAX_TERM_REPO_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// The furthest out a [`RepoKind::Open`] repo's `maturity_at` may be. The PRD's open repo is
+/// callable and has no agreed end date, but this contract needs one: `unwind` is gated on
+/// `maturity_at`, and the borrower's leg-2 allowance and the default path are sized from it. So
+/// for an open repo `maturity_at` is the date it must be unwound by, held to the same 30 days as
+/// the longest term repo. Calling an open repo before that date is not implemented.
+pub const MAX_OPEN_TERM_SECONDS: u64 = MAX_TERM_REPO_SECONDS;
+
+/// The highest `rate_bps` that `propose` accepts: 100% a year. Repo rates are money-market rates,
+/// so nothing real comes close. The cap is a guard against a mistyped rate, refused before the
+/// lender's allowance is granted, and it keeps `accrue_interest` far from overflow.
+pub const MAX_RATE_BPS: u32 = 10_000;
+
+/// Panics unless a repo of `kind` may run for `term_seconds`, counted from `propose` to
+/// `maturity_at`. `kind` is what indexers and the console classify a trade by, so a trade whose
+/// term does not fit its kind is refused rather than stored under a label that misdescribes it.
+fn require_term_fits_kind(kind: &RepoKind, term_seconds: u64) {
+    match kind {
+        RepoKind::Intraday => assert!(
+            term_seconds <= MAX_INTRADAY_TERM_SECONDS,
+            "repo-dvp: an intraday repo must mature within 24 hours"
+        ),
+        RepoKind::Overnight => assert!(
+            term_seconds <= MAX_OVERNIGHT_TERM_SECONDS,
+            "repo-dvp: an overnight repo must mature within 48 hours"
+        ),
+        RepoKind::Open => assert!(
+            term_seconds <= MAX_OPEN_TERM_SECONDS,
+            "repo-dvp: an open repo must mature within 30 days"
+        ),
+        RepoKind::Term => assert!(
+            term_seconds <= MAX_TERM_REPO_SECONDS,
+            "repo-dvp: a term repo must mature within 30 days"
+        ),
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepoStatus {
@@ -110,6 +202,7 @@ pub enum RepoStatus {
     Settled,
     Unwound,
     Defaulted,
+    Cancelled,
 }
 
 #[contracttype]
@@ -118,6 +211,8 @@ pub struct RepoAssetConfig {
     pub price_guard: Address,
     pub haircut_bps: u32,
     pub thresholds: MarginThresholds,
+    pub max_cash_per_trade: i128,
+    pub max_term_seconds: u64,
 }
 
 #[contracttype]
@@ -161,12 +256,34 @@ pub struct RepoMarginView {
 }
 
 #[contracttype]
+struct PendingUnpause {
+    scope: PauseScope,
+    executes_at: u64,
+}
+
+#[contracttype]
 enum DataKey {
     Usdc,
     AssetConfig(Address),
     AssetDisabled(Address),
     Trade(u64),
     CureGrace,
+    /// Sum of the leg-2 due ceilings of a borrower's live settled trades. A
+    /// SEP-41 `approve` replaces the (owner, spender) allowance, so each settle
+    /// approves this sum rather than its own trade's figure — otherwise a
+    /// second settled trade would overwrite the first one's allowance and break
+    /// every non-borrower `unwind` of it.
+    BorrowerDue(Address),
+    /// The furthest allowance expiry granted for [`DataKey::BorrowerDue`], so a
+    /// later-settling, earlier-maturing trade can never shorten the window an
+    /// earlier trade's keeper unwind still needs.
+    BorrowerDueExpiry(Address),
+
+    MaturityGrace,
+
+    PendingUnpause(u64),
+
+    LatestProposal(Address),
 }
 
 /// The cure window a margin call opens with: the admin's setting, else the 24h default.
@@ -175,6 +292,14 @@ fn cure_grace(env: &Env) -> u64 {
         .instance()
         .get(&DataKey::CureGrace)
         .unwrap_or(MARGIN_CURE_GRACE_SECONDS)
+}
+
+/// The grace period past maturity before default_at_maturity may act: the admin's setting, else default 24h.
+fn maturity_grace(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaturityGrace)
+        .unwrap_or(DEFAULT_MATURITY_GRACE_SECONDS)
 }
 
 fn read_asset_config(env: &Env, asset: &Address) -> RepoAssetConfig {
@@ -208,6 +333,51 @@ fn write_trade(env: &Env, trade: &RepoTrade) {
     env.storage()
         .persistent()
         .set(&DataKey::Trade(trade.id), trade);
+    // `set()` does not move the expiration ledger; extend explicitly on every write.
+    extend_trade_ttl(env, trade);
+}
+
+/// How many ledgers from now a trade's entry has to stay live: until `maturity_at`, plus the
+/// [`UNWIND_ALLOWANCE_GRACE_LEDGERS`] a late `unwind` is given, plus
+/// [`TRADE_TTL_MARGIN_LEDGERS`]. Never less than the shared ~30-day target, so a short trade, or
+/// one that has just closed, stays readable for the parties and the indexer. Never more than the
+/// network lets an entry live: a trade longer than that is topped up by its later writes or by
+/// `extend_ttl`.
+fn trade_ttl_ledgers(env: &Env, trade: &RepoTrade) -> u32 {
+    let seconds_to_maturity = trade.maturity_at.saturating_sub(env.ledger().timestamp());
+    // Rounded up: a part of a ledger still has to be covered.
+    let ledgers_to_maturity = seconds_to_maturity
+        .div_ceil(SECONDS_PER_LEDGER)
+        .min(u32::MAX as u64) as u32;
+    ledgers_to_maturity
+        .saturating_add(UNWIND_ALLOWANCE_GRACE_LEDGERS)
+        .saturating_add(TRADE_TTL_MARGIN_LEDGERS)
+        .max(ttl::PERSISTENT_EXTEND_TO_LEDGERS)
+        .min(env.storage().max_ttl())
+}
+
+/// Extends a persistent entry to live `ledgers` more ledgers, unless it already has all but a
+/// day of that left. The shared `ttl::extend_persistent` only acts on an entry within a day of
+/// expiring, which is too late here: a trade written once at settlement has to be given its whole
+/// lifetime at that write, because nothing may touch it again before maturity.
+fn extend_entry_to(env: &Env, key: &DataKey, ledgers: u32) {
+    let threshold = ledgers.saturating_sub(ttl::PERSISTENT_LIFETIME_THRESHOLD_LEDGERS);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, threshold, ledgers);
+}
+
+/// Keeps a trade's entry alive for as long as the trade can still be acted on (see
+/// [`trade_ttl_ledgers`]), and the contract instance with it: `unwind`, `top_up` and the default
+/// paths need the instance as much as the trade, so a trade that outlasts the shared ~30-day
+/// instance target must take the instance along.
+fn extend_trade_ttl(env: &Env, trade: &RepoTrade) {
+    let ledgers = trade_ttl_ledgers(env, trade);
+    extend_entry_to(env, &DataKey::Trade(trade.id), ledgers);
+    env.storage().instance().extend_ttl(
+        ledgers.saturating_sub(ttl::INSTANCE_LIFETIME_THRESHOLD_LEDGERS),
+        ledgers,
+    );
 }
 
 fn read_usdc(env: &Env) -> Address {
@@ -241,6 +411,65 @@ fn total_due(trade: &RepoTrade, settled_at: u64) -> i128 {
 /// straight from the current ledger would come out different when the transaction actually
 /// executes a ledger or two later, and the host would reject the `approve` as unauthorized.
 /// Bucketing makes simulation and execution agree unless a bucket boundary falls between them.
+fn read_borrower_due(env: &Env, borrower: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BorrowerDue(borrower.clone()))
+        .unwrap_or(0)
+}
+
+fn read_borrower_due_expiry(env: &Env, borrower: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BorrowerDueExpiry(borrower.clone()))
+        .unwrap_or(0)
+}
+
+fn write_borrower_due(env: &Env, borrower: &Address, due: i128, expiry: u32) {
+    if due > 0 {
+        env.storage()
+            .persistent()
+            .set(&DataKey::BorrowerDue(borrower.clone()), &due);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BorrowerDueExpiry(borrower.clone()), &expiry);
+        extend_borrower_due_ttl(env, borrower, expiry);
+    } else {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BorrowerDue(borrower.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BorrowerDueExpiry(borrower.clone()));
+    }
+}
+
+/// Keeps a borrower's outstanding leg-2 sum, and the expiry recorded with it, alive until the
+/// allowance they describe has run out at ledger `expiry`. If the sum were archived while a
+/// settled trade was still open, the next settle would start again from zero and approve too
+/// little, which is the failure the sum exists to prevent.
+fn extend_borrower_due_ttl(env: &Env, borrower: &Address, expiry: u32) {
+    let ledgers = expiry
+        .saturating_sub(env.ledger().sequence())
+        .saturating_add(TRADE_TTL_MARGIN_LEDGERS)
+        .max(ttl::PERSISTENT_EXTEND_TO_LEDGERS)
+        .min(env.storage().max_ttl());
+    extend_entry_to(env, &DataKey::BorrowerDue(borrower.clone()), ledgers);
+    extend_entry_to(env, &DataKey::BorrowerDueExpiry(borrower.clone()), ledgers);
+}
+
+/// Takes a closed trade's ceiling back out of the borrower's outstanding leg-2
+/// sum. The live token allowance is untouched — shrinking it would need the
+/// borrower's own signature — but a non-borrower `unwind` has already consumed
+/// this trade's share via `transfer_from`, and a default's unconsumed share is
+/// simply replaced by the next settle's accurate sum (or dies at expiry).
+fn release_borrower_due(env: &Env, trade: &RepoTrade) {
+    let ceiling = total_due(trade, trade.proposed_at);
+    let remaining = (read_borrower_due(env, &trade.cash_borrower) - ceiling).max(0);
+    let expiry = read_borrower_due_expiry(env, &trade.cash_borrower);
+    write_borrower_due(env, &trade.cash_borrower, remaining, expiry);
+}
+
 fn allowance_expiry(env: &Env, seconds_ahead: u64, grace_ledgers: u32) -> u32 {
     let ledgers_ahead = (seconds_ahead / SECONDS_PER_LEDGER).min(u32::MAX as u64) as u32;
     let sequence = env.ledger().sequence();
@@ -276,7 +505,7 @@ fn clear_margin_call(trade: &mut RepoTrade) {
 
 /// Reads the guarded price and returns `(exposure, collateral_value, margin_state, price)` for a
 /// settled trade, or `None` when the price is not one the guard stands behind (`Degraded` or
-/// `Halted`). `exposure` is principal plus interest accrued so far; `collateral_value` has the
+/// `Halted`). `exposure` is principal plus interest accrued up to `maturity_at`; `collateral_value` has the
 /// asset's haircut applied.
 fn evaluate_margin(
     env: &Env,
@@ -291,7 +520,12 @@ fn evaluate_margin(
     let collateral_value = risk::collateral_value(trade.units, guarded.value, config.haircut_bps);
     let now = env.ledger().timestamp();
     let settled_at = trade.settled_at.unwrap_or(now);
-    let accrued = accrue_interest(trade.cash_amount, trade.rate_bps, now.saturating_sub(settled_at));
+    let accrual_end = now.min(trade.maturity_at);
+    let accrued = accrue_interest(
+        trade.cash_amount,
+        trade.rate_bps,
+        accrual_end.saturating_sub(settled_at),
+    );
     let exposure = trade
         .cash_amount
         .checked_add(accrued)
@@ -314,6 +548,7 @@ impl RepoDvp {
         price_publisher: Address,
         risk: Address,
     ) {
+        ttl::extend_instance(&env);
         if access::has_roles(&env) {
             panic!("repo-dvp: already initialized");
         }
@@ -333,6 +568,7 @@ impl RepoDvp {
     /// read from `Registry`.
     pub fn set_usdc(env: Env, admin: Address, usdc: Address) {
         require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
     }
 
@@ -340,6 +576,7 @@ impl RepoDvp {
     /// least [`MIN_CURE_GRACE_SECONDS`]). Calls already open keep the deadline they were given.
     pub fn set_cure_grace(env: Env, admin: Address, seconds: u64) {
         require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
         assert!(
             seconds >= MIN_CURE_GRACE_SECONDS,
             "repo-dvp: cure window is shorter than the minimum"
@@ -348,7 +585,99 @@ impl RepoDvp {
     }
 
     pub fn cure_grace_seconds(env: Env) -> u64 {
+        ttl::extend_instance(&env);
         cure_grace(&env)
+    }
+
+    /// Sets how long past maturity an unpaid trade must wait before `default_at_maturity` may act
+    /// (default 24h, at least [`MIN_MATURITY_GRACE_SECONDS`]).
+    pub fn set_maturity_grace(env: Env, admin: Address, seconds: u64) {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        assert!(
+            seconds >= MIN_MATURITY_GRACE_SECONDS,
+            "repo-dvp: maturity grace is shorter than the minimum"
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MaturityGrace, &seconds);
+    }
+
+    pub fn maturity_grace_seconds(env: Env) -> u64 {
+        ttl::extend_instance(&env);
+        maturity_grace(&env)
+    }
+
+    /// Immediate, no timelock — the pauser can only ever *stop* things (PRD §6.2).
+    /// Pause flags live in this contract's own instance storage, which is where
+    /// `accept_and_settle`'s `require_not_paused` reads them; `Registry::pause`
+    /// writes Registry's storage and so cannot gate this contract.
+    pub fn pause(env: Env, pauser: Address, scope: PauseScope) {
+        pauser.require_auth();
+        access::require_pauser(&env);
+        ttl::extend_instance(&env);
+        pause::set_paused(&env, &scope, true);
+        env.events().publish((Symbol::new(&env, "paused"), scope), true);
+    }
+
+    /// Queues an unpause, executable after the 48h timelock (PRD §8) — unlike
+    /// `pause`, lifting a stop is not urgent and deserves the same notice period
+    /// as any other risk-loosening change.
+    pub fn queue_unpause(env: Env, admin: Address, scope: PauseScope) -> u64 {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingUnpause(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingUnpause {
+                scope: scope.clone(),
+                executes_at,
+            },
+        );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events()
+            .publish((Symbol::new(&env, "unpause_queued"), id), (scope, executes_at));
+        id
+    }
+
+    /// Cancels a pending unpause and removes its persistent storage entry. Admin only.
+    pub fn cancel_unpause(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingUnpause(id);
+        let pending: PendingUnpause = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending unpause");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "unpause_cancelled"), id), pending.scope);
+    }
+
+    pub fn execute_unpause(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingUnpause(id);
+        let pending: PendingUnpause = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending unpause");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "repo-dvp: timelock has not elapsed"
+        );
+        pause::set_paused(&env, &pending.scope, false);
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "unpause_executed"), id), pending.scope);
+    }
+
+    pub fn is_paused(env: Env, scope: PauseScope) -> bool {
+        ttl::extend_instance(&env);
+        pause::is_paused(&env, &scope)
     }
 
     pub fn configure_asset(
@@ -358,11 +687,23 @@ impl RepoDvp {
         price_guard: Address,
         haircut_bps: u32,
         thresholds: MarginThresholds,
+        max_cash_per_trade: i128,
+        max_term_seconds: u64,
     ) {
         require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
         assert!(
             haircut_bps as i128 <= BPS_DENOMINATOR,
             "repo-dvp: haircut exceeds 100%"
+        );
+        thresholds.validate();
+        assert!(
+            max_cash_per_trade > 0,
+            "repo-dvp: max_cash_per_trade must be positive"
+        );
+        assert!(
+            max_term_seconds > 0,
+            "repo-dvp: max_term_seconds must be positive"
         );
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
@@ -370,13 +711,22 @@ impl RepoDvp {
                 price_guard,
                 haircut_bps,
                 thresholds,
+                max_cash_per_trade,
+                max_term_seconds,
             },
         );
+    }
+
+    /// Reads the active configuration for an asset.
+    pub fn asset_config(env: Env, asset: Address) -> RepoAssetConfig {
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset)
     }
 
     /// Disables an asset so that new proposals and settlements are refused. Admin only.
     pub fn disable_asset(env: Env, admin: Address, asset: Address) {
         require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
         let _ = read_asset_config(&env, &asset);
         env.storage()
             .instance()
@@ -388,6 +738,7 @@ impl RepoDvp {
     /// Re-enables a disabled asset. Admin only.
     pub fn enable_asset(env: Env, admin: Address, asset: Address) {
         require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
         let _ = read_asset_config(&env, &asset);
         env.storage()
             .instance()
@@ -398,6 +749,7 @@ impl RepoDvp {
 
     /// Checks whether an asset is currently enabled.
     pub fn is_asset_enabled(env: Env, asset: Address) -> bool {
+        ttl::extend_instance(&env);
         let _ = read_asset_config(&env, &asset);
         !is_asset_disabled(&env, &asset)
     }
@@ -417,6 +769,7 @@ impl RepoDvp {
         agreement_hash: BytesN<32>,
     ) -> u64 {
         cash_lender.require_auth();
+        ttl::extend_instance(&env);
         require_asset_enabled(&env, &asset);
         if units <= 0 {
             panic!("repo-dvp: units must be positive");
@@ -427,11 +780,28 @@ impl RepoDvp {
         if maturity_at <= env.ledger().timestamp() {
             panic!("repo-dvp: maturity_at must be in the future");
         }
+        // Both checked before the lender's allowance is granted further down: a mistyped rate, or
+        // a term that does not fit `kind`, should cost the lender nothing.
+        assert!(
+            rate_bps <= MAX_RATE_BPS,
+            "repo-dvp: rate_bps exceeds the maximum rate"
+        );
+        let term_seconds = maturity_at - env.ledger().timestamp();
+        require_term_fits_kind(&kind, term_seconds);
+
         // Refuse before any allowance is granted: a trade in an asset that was never
         // passed to `configure_asset` would settle leg 1 and then strand the lender
         // with no margin protection — `call_margin` and `default_close` read this
         // config and would revert until maturity.
-        read_asset_config(&env, &asset);
+        let config = read_asset_config(&env, &asset);
+        assert!(
+            cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        assert!(
+            term_seconds <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         // Pre-authorize leg 1 (see the module docs): the lender signs this call, not the
         // borrower's later `accept_and_settle`.
@@ -443,6 +813,9 @@ impl RepoDvp {
         );
 
         let id = timelock::next_id(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::LatestProposal(cash_lender.clone()), &id);
         let trade = RepoTrade {
             id,
             cash_lender,
@@ -466,6 +839,48 @@ impl RepoDvp {
         id
     }
 
+    /// Cancels a proposal that is still in `Proposed` status. Callable by either the cash lender
+    /// or the cash borrower.
+    ///
+    /// If cancelled by the cash lender, the contract's leg-1 USDC allowance is reset to 0 if this
+    /// was the lender's latest proposal. If cancelled by the cash borrower, the trade status moves
+    /// to `Cancelled` (blocking settlement) without modifying the lender's token allowance, as the
+    /// borrower is not authorized to sign for the lender.
+    pub fn cancel_proposal(env: Env, caller: Address, id: u64) {
+        caller.require_auth();
+        ttl::extend_instance(&env);
+
+        let mut trade = read_trade(&env, id);
+        if trade.status != RepoStatus::Proposed {
+            panic!("repo-dvp: trade is not in proposed status");
+        }
+        if caller != trade.cash_lender && caller != trade.cash_borrower {
+            panic!("repo-dvp: caller is neither lender nor borrower");
+        }
+
+        if caller == trade.cash_lender {
+            let latest: Option<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::LatestProposal(trade.cash_lender.clone()));
+            if latest == Some(id) {
+                let usdc = read_usdc(&env);
+                token::Client::new(&env, &usdc).approve(
+                    &trade.cash_lender,
+                    &env.current_contract_address(),
+                    &0,
+                    &allowance_expiry(&env, 0, 0),
+                );
+            }
+        }
+
+        trade.status = RepoStatus::Cancelled;
+        write_trade(&env, &trade);
+
+        env.events()
+            .publish((symbol_short!("cancel"), id), caller);
+    }
+
     /// Leg 1, atomic (PRD invariant 7): within this single function, `units` of `asset` move from
     /// `cash_borrower` into this contract, and `cash_amount` USDC moves from `cash_lender`
     /// straight to `cash_borrower` (out of the allowance `propose` granted). Both token calls happen unconditionally,
@@ -473,6 +888,7 @@ impl RepoDvp {
     /// invocation and neither leg's storage/token effects apply.
     pub fn accept_and_settle(env: Env, cash_borrower: Address, id: u64) {
         cash_borrower.require_auth();
+        ttl::extend_instance(&env);
         pause::require_not_paused(&env, &PauseScope::Repos);
 
         let mut trade = read_trade(&env, id);
@@ -490,7 +906,16 @@ impl RepoDvp {
         }
         // Belt and braces for proposals that predate the check in `propose`: never
         // move either leg for an asset with no margin parameters.
-        read_asset_config(&env, &trade.asset);
+        let config = read_asset_config(&env, &trade.asset);
+        assert!(
+            trade.cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        let now = env.ledger().timestamp();
+        assert!(
+            trade.maturity_at.saturating_sub(now) <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         let asset_client = token::Client::new(&env, &trade.asset);
         asset_client.transfer(
@@ -515,17 +940,29 @@ impl RepoDvp {
         // doesn't depend on which ledger this call executes in. It's an argument to a nested
         // authorized call, so it has to come out the same at simulation and at execution — see
         // `allowance_expiry`.
+        // Additive across the borrower's settled trades: `approve` replaces the
+        // (owner, spender) allowance, so approving only this trade's ceiling
+        // would strand every earlier settled trade's keeper/lender `unwind`
+        // behind an allowance that is now too small. The sum is tracked in
+        // [`DataKey::BorrowerDue`]; each non-borrower `unwind` consumes its own
+        // trade's share out of it via `transfer_from`.
         let now = env.ledger().timestamp();
+        let outstanding = read_borrower_due(&env, &cash_borrower)
+            .checked_add(total_due(&trade, trade.proposed_at))
+            .expect("repo-dvp: overflow summing the borrower's leg-2 due");
+        let expiry = allowance_expiry(
+            &env,
+            trade.maturity_at.saturating_sub(now),
+            UNWIND_ALLOWANCE_GRACE_LEDGERS,
+        )
+        .max(read_borrower_due_expiry(&env, &cash_borrower));
         usdc_client.approve(
             &cash_borrower,
             &env.current_contract_address(),
-            &total_due(&trade, trade.proposed_at),
-            &allowance_expiry(
-                &env,
-                trade.maturity_at.saturating_sub(now),
-                UNWIND_ALLOWANCE_GRACE_LEDGERS,
-            ),
+            &outstanding,
+            &expiry,
         );
+        write_borrower_due(&env, &cash_borrower, outstanding, expiry);
 
         trade.status = RepoStatus::Settled;
         trade.leg1_ledger = Some(env.ledger().sequence());
@@ -540,6 +977,7 @@ impl RepoDvp {
     /// "someone triggers it if both are absent" path (PRD §5 Phase 3 "Leg 2").
     pub fn unwind(env: Env, caller: Address, id: u64) {
         caller.require_auth();
+        ttl::extend_instance(&env);
 
         let mut trade = read_trade(&env, id);
         if trade.status != RepoStatus::Settled {
@@ -585,8 +1023,10 @@ impl RepoDvp {
             &trade.units,
         );
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Unwound;
         write_trade(&env, &trade);
+        release_borrower_due(&env, &trade);
 
         env.events()
             .publish((symbol_short!("unwind"), id), total_due);
@@ -606,6 +1046,7 @@ impl RepoDvp {
     pub fn call_margin(env: Env, keeper: Address, id: u64) {
         access::require_keeper(&env);
         keeper.require_auth();
+        ttl::extend_instance(&env);
 
         let mut trade = read_trade(&env, id);
         if trade.status != RepoStatus::Settled {
@@ -650,6 +1091,7 @@ impl RepoDvp {
         // Deliberately not pause-gated: adding collateral only reduces risk, and a borrower must
         // be able to cure a call even while the contract is paused.
         cash_borrower.require_auth();
+        ttl::extend_instance(&env);
         assert!(extra_units > 0, "repo-dvp: top-up must be positive");
 
         let mut trade = read_trade(&env, id);
@@ -701,6 +1143,7 @@ impl RepoDvp {
     pub fn default_close(env: Env, keeper: Address, id: u64) {
         access::require_keeper(&env);
         keeper.require_auth();
+        ttl::extend_instance(&env);
 
         let mut trade = read_trade(&env, id);
         if trade.status != RepoStatus::Settled {
@@ -749,15 +1192,93 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
+        release_borrower_due(&env, &trade);
 
         env.events()
             .publish((symbol_short!("default"), id), (lender_units, borrower_units));
     }
 
+    /// If the cash borrower fails to repay leg 2 at maturity, the cash lender or keeper can
+    /// default the trade once `now >= maturity_at + maturity_grace`. The cash lender receives
+    /// units covering `total_due` at the guarded price with no haircut, capped at what is pledged,
+    /// and any surplus units return to the borrower. If the collateral is worth less than `total_due`,
+    /// the lender takes all units and bears the shortfall. No USDC moves.
+    pub fn default_at_maturity(env: Env, caller: Address, id: u64) {
+        caller.require_auth();
+        ttl::extend_instance(&env);
+
+        let mut trade = read_trade(&env, id);
+        if trade.status != RepoStatus::Settled {
+            panic!("repo-dvp: trade is not settled");
+        }
+        let is_lender = caller == trade.cash_lender;
+        if !is_lender {
+            let roles = access::read_roles(&env);
+            if caller != roles.keeper {
+                panic!("repo-dvp: caller is neither lender nor keeper");
+            }
+        }
+        let grace = maturity_grace(&env);
+        let default_after = trade
+            .maturity_at
+            .checked_add(grace)
+            .expect("repo-dvp: overflow computing maturity grace");
+        if env.ledger().timestamp() < default_after {
+            panic!("repo-dvp: maturity grace period has not expired yet");
+        }
+
+        let settled_at = trade
+            .settled_at
+            .expect("repo-dvp: trade has no settlement time");
+        let total_due = total_due(&trade, settled_at);
+
+        let config = read_asset_config(&env, &trade.asset);
+        let guarded = PriceGuardClient::new(&env, &config.price_guard).guarded_price(&trade.asset);
+        if !guarded.is_usable_for_new_risk() {
+            panic!("repo-dvp: price is not Ok, cannot default");
+        }
+        let price = guarded.value;
+        assert!(price > 0, "repo-dvp: guarded price is not positive");
+
+        // Units worth `total_due` at the guarded price, rounded up so the lender is never short by
+        // rounding; ceil(a / b) = (a + b - 1) / b.
+        let owed_units = total_due
+            .checked_mul(PRICE_SCALE)
+            .expect("repo-dvp: overflow valuing total due")
+            .checked_add(price - 1)
+            .expect("repo-dvp: overflow valuing total due")
+            / price;
+        let lender_units = owed_units.min(trade.units);
+        let borrower_units = trade.units - lender_units;
+
+        let asset_client = token::Client::new(&env, &trade.asset);
+        asset_client.transfer(
+            &env.current_contract_address(),
+            to_muxed(&trade.cash_lender),
+            &lender_units,
+        );
+        if borrower_units > 0 {
+            asset_client.transfer(
+                &env.current_contract_address(),
+                to_muxed(&trade.cash_borrower),
+                &borrower_units,
+            );
+        }
+
+        clear_margin_call(&mut trade);
+        trade.status = RepoStatus::Defaulted;
+        write_trade(&env, &trade);
+
+        env.events()
+            .publish((symbol_short!("mat_def"), id), (lender_units, borrower_units));
+    }
+
     /// Pure read: where the trade's margin stands right now. Changes nothing.
     pub fn margin_view(env: Env, id: u64) -> RepoMarginView {
+        ttl::extend_instance(&env);
         let trade = read_trade(&env, id);
         let config = read_asset_config(&env, &trade.asset);
         match evaluate_margin(&env, &trade, &config) {
@@ -779,7 +1300,29 @@ impl RepoDvp {
     }
 
     pub fn trade(env: Env, id: u64) -> RepoTrade {
+        ttl::extend_instance(&env);
         read_trade(&env, id)
+    }
+
+    /// Permissionless keep-alive, as on `PledgeVault`: anyone may pay to extend the instance, one
+    /// trade's entry and, for a settled trade, the borrower's outstanding leg-2 sum. `propose` and
+    /// `accept_and_settle` already give a trade a lifetime that outlasts its maturity and the
+    /// unwind grace. This is for a trade that runs longer than the network lets one extension
+    /// reach, and for a keeper that would rather not depend on that arithmetic.
+    pub fn extend_ttl(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let trade = read_trade(&env, id);
+        extend_trade_ttl(&env, &trade);
+
+        let borrower = &trade.cash_borrower;
+        if trade.status == RepoStatus::Settled
+            && env
+                .storage()
+                .persistent()
+                .has(&DataKey::BorrowerDue(borrower.clone()))
+        {
+            extend_borrower_due_ttl(&env, borrower, read_borrower_due_expiry(&env, borrower));
+        }
     }
 }
 

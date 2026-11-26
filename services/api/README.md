@@ -99,8 +99,10 @@ A manual clear is persistent for the reviewed entity matches (`entNum`s). When s
 
 ## Amount and unit conventions
 
-Request amounts go through `bigintish` (string or number parsed to `BigInt`). Responses that touch
-on-chain values serialise `BigInt` fields as plain integer-digit strings via `bigint-json.ts`.
+Request amounts go through `positiveAmount` (string of digits only or safe positive integer parsed to `BigInt`).
+Zero, negative numbers, empty strings, hex strings, and unsafe floating-point numbers past `Number.MAX_SAFE_INTEGER` are rejected with 400.
+For fields where zero is legal (e.g. `repoTradeActionSchema.contractTradeId`), `nonNegativeAmount` is used.
+Responses that touch on-chain values serialise `BigInt` fields as plain integer-digit strings via `bigint-json.ts`.
 Routes that return raw database rows (positions, reports, webhook payloads) return decimal strings
 instead. The two forms look different and must not be mixed without conversion.
 
@@ -123,9 +125,10 @@ human-readable value = scaled integer / 10_000_000
 
 ### Send amounts as strings, not numbers
 
-**Always send monetary amounts as JSON strings, not bare numbers.** The `bigintish` schema accepts
-both, but JSON numbers are IEEE 754 doubles: integers above 2^53 − 1 (roughly 900 trillion scaled
-units) lose precision silently when the parser reads them. Use the string form in every request:
+**Always send monetary amounts as JSON strings, not bare numbers.** The amount schema accepts
+safe JavaScript integers, but JSON numbers are IEEE 754 doubles: integers above 2^53 − 1 (roughly 900 trillion scaled
+units) lose precision silently when the parser reads them, and numbers exceeding `Number.MAX_SAFE_INTEGER` will be rejected.
+Use the string form in every request:
 
 ```json
 { "amount": "10000000" }
@@ -176,14 +179,14 @@ Decimal strings appear only where routes return raw database rows without going 
 | `POST /v1/credit-lines/:id/pledges` | `units` (`bigintish`, scaled) | Passed to contract as `BigInt`; stored via `scaledToDecimalString` in `pledge.units` | `xdr`, `txHash`, `pledgeId` (no monetary fields) |
 | `DELETE /v1/credit-lines/:id/pledges/:pledgeId` | — | Stored `pledge.units` (decimal string) converted via `decimalStringToScaled` for contract `release` | `projectedLtvBps` (bps; no monetary fields) |
 | `POST /v1/credit-lines/:id/draws` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt`; `amount.toString()` in audit log & intent payload | `xdr`, `txHash` (no monetary fields) |
-| `POST /v1/credit-lines/:id/repayments` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt`; `amount.toString()` in audit log & intent payload | `xdr`, `txHash` (no monetary fields) |
+| `POST /v1/credit-lines/:id/repayments` | `amount` (`bigintish`, scaled) | Passed to contract as `BigInt` (amount acts as a cap: on-chain `repay` applies `min(amount, owed)`); `amount.toString()` in audit log & intent payload | `xdr`, `txHash` (no monetary fields) |
 
 ### Exit endpoints
 
 | Endpoint | Request Amount(s) | Internal Handling | Response Amount(s) & Format |
 | --- | --- | --- | --- |
 | `POST /v1/exit/quotes` | `units` (`bigintish`, scaled) | Passed to contract quote call; on-chain `price` and `usdcOut` returned as `BigInt`; all stored via `scaledToDecimalString` | `units`, `price`, `usdcOut` (scaled-integer strings via `decimalStringToScaled`); `spreadBps` (bps); `expiresAt` (ISO date) |
-| `POST /v1/exit/quotes/:id/execute` | `minUsdcOut` (`bigintish`, scaled), `to` (address) | Passed to contract as `BigInt`; stored `quote.units` converted via `decimalStringToScaled`; `minUsdcOut.toString()` in audit log | `xdr`, `txHash`, `quoteId` (no monetary fields) |
+| `POST /v1/exit/quotes/:id/execute` | `minUsdcOut` (`bigintish`, scaled, optional: defaults to the quoted payout; below 99% of it is a 400), `to` (address). A second execute while one is pending for the quote is a 409. | Passed to contract as `BigInt`; stored `quote.units` converted via `decimalStringToScaled`; `minUsdcOut.toString()` in audit log | `xdr`, `txHash`, `quoteId` (no monetary fields) |
 
 ### Repo endpoints
 

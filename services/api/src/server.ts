@@ -4,6 +4,8 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { ZodError } from "zod";
 import type { Database } from "@ballast/db";
+import { ContractRejectedError } from "@ballast/contract-clients";
+import { isTransientRpcError } from "@ballast/network-config";
 import { loadApiConfig, type ApiConfig } from "./config.js";
 import { registerAuth } from "./auth.js";
 import { getDb } from "./db.js";
@@ -34,6 +36,16 @@ export interface BuildServerOptions {
   screener?: SanctionsScreener;
 }
 
+function sanitizeErrorMessage(message: unknown): string {
+  if (!message) return "";
+  let text = String(message);
+  text = text.replace(/https?:\/\/[^\s"'`]+/g, "[rpc-url]");
+  if (text.includes("\n    at ")) {
+    text = text.split("\n    at ")[0].trim();
+  }
+  return text;
+}
+
 /**
  * Builds (but doesn't start) the Fastify app. Split out from `index.ts` so tests can inject a
  * mocked `db`/`contracts` and call `app.inject(...)` without opening a real port or touching
@@ -49,13 +61,6 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     logger: false,
     // A hop count (TRUST_PROXY=1) is accepted at runtime by Fastify but missing from its typings.
     trustProxy: (config.trustProxy ?? false) as boolean | string,
-  });
-
-  app.setErrorHandler((error, request, reply) => {
-    if (error instanceof ZodError) {
-      return reply.code(400).send({ error: "invalid request", issues: error.issues });
-    }
-    return reply.send(error);
   });
 
   // Registered before auth: this is a pure JSON API (no HTML, so helmet's defaults are fine
@@ -82,6 +87,51 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   void app.register(rateLimit, {
     max: (req: { headers: Record<string, unknown> }) => (req.headers["x-api-key"] ? 1000 : 100),
     timeWindow: "1 minute",
+  });
+
+  app.setErrorHandler((error: any, request, reply) => {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid request", issues: error.issues });
+    }
+
+    const isContractRejected =
+      error instanceof ContractRejectedError ||
+      error?.name === "ContractRejectedError" ||
+      (error as any)?.code === "CONTRACT_REJECTED" ||
+      /simulation of "[^"]+" failed/i.test(error?.message ?? "") ||
+      /contract rejected the request/i.test(error?.message ?? "") ||
+      /HostError|Error\(Contract/i.test(error?.message ?? "");
+
+    if (isContractRejected) {
+      let detail =
+        error?.detail ??
+        (error?.message?.match(/simulation of "[^"]+" failed:\s*(.*)/)?.[1] ?? error?.message);
+      if (typeof detail === "string" && detail.startsWith("contract rejected the request: ")) {
+        detail = detail.slice("contract rejected the request: ".length);
+      }
+      return reply.code(422).send({
+        error: "contract rejected the request",
+        detail: sanitizeErrorMessage(detail),
+      });
+    }
+
+    const isTimeout = /timed? ?out|timeout/i.test(error?.message ?? "");
+    if (isTransientRpcError(error) || isTimeout) {
+      return reply.code(503).send({
+        error: isTimeout ? "rpc request timed out" : "upstream rpc unavailable",
+        detail: isTimeout ? "rpc request timed out" : "rpc connection failed",
+      });
+    }
+
+    if (error.statusCode && error.statusCode < 500) {
+      return reply.code(error.statusCode).send(error);
+    }
+
+    const statusCode = error.statusCode || 500;
+    return reply.code(statusCode).send({
+      statusCode,
+      error: "Internal Server Error",
+    });
   });
 
   registerAuth(app, config, db);

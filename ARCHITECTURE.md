@@ -41,7 +41,7 @@ every amount in a settlement comes from contract state or the PriceGuard (see `A
 | Crate | Role | Calls |
 |---|---|---|
 | `common` | Library, not deployed: roles, timelock, pause, price types, risk and margin maths, custody modes | – |
-| `registry` | Asset configs, haircut parameters, timelocked parameter changes, pause | – |
+| `registry` | Asset configs, haircut parameters, timelocked parameter and role changes, admin transfer, pause | – |
 | `price-guard` | Median / band / staleness / halt over several price sources; verifies the Ed25519 NAV signature | – |
 | `pledge-vault` | One collateral position per `(line, asset)`. Escrow mode holds the token; lien modes only record a reference | `CreditLine` (`sync_from_vault`, `ltv`, `borrower_of`), `PriceGuard` |
 | `credit-line` | Lender commitments, draws, repayments, interest, LTV, the margin state machine, liquidation entry | `PriceGuard` |
@@ -59,6 +59,10 @@ Things that are easy to get wrong:
 - `Registry` is **not** read at runtime by the other contracts today. Haircuts, thresholds and spreads are
   set directly on each contract by the admin (`configure_asset`). Each module doc says so. Syncing them
   from `Registry` is open work.
+- Roles on `Registry` and `PriceGuard` rotate in place without redeploying: non-admin roles (`Pauser`,
+  `Keeper`, `PricePublisher`, `Risk`) rotate through the 48h timelock (`queue_role_change` /
+  `execute_role_change`), and the admin transfers via two-step `propose_admin` / `accept_admin` (see
+  `contracts/README.md`).
 - Rust panic messages are stripped in release wasm. A trapped call shows as
   `VM call trapped: UnreachableCodeReached`; read the contract's state and its tests to learn the cause.
 - A Soroban read is a simulation and stores nothing. `PriceGuard` therefore evaluates and persists on

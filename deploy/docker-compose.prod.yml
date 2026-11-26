@@ -40,6 +40,15 @@ services:
         condition: service_healthy
     command: ["sh", "-c", "pnpm --filter @ballast/db migrate"]
 
+  # One-shot, not started by `up`: `docker compose --profile seed run --rm seed` inserts the assets in
+  # scripts/shadow-assets.json into `asset`, which is where the price-guard reads what to publish.
+  # Safe to repeat (assets already there are skipped). See "Before the first start" in deploy/README.md.
+  seed:
+    <<: *service
+    restart: "no"
+    profiles: ["seed"]
+    command: ["sh", "-c", "pnpm --filter @ballast/service-price-guard shadow:seed"]
+
   api:
     <<: *service
     environment:
@@ -70,6 +79,9 @@ services:
   keeper:
     <<: *service
     profiles: ["lending"]
+    # Allow the keeper to finish its in-flight job before Docker sends SIGKILL.
+    # Must be greater than KEEPER_SHUTDOWN_GRACE_MS (default 60 s) plus teardown overhead.
+    stop_grace_period: 70s
     environment:
       NODE_ENV: production
       DATABASE_URL: postgres://ballast:${POSTGRES_PASSWORD}@postgres:5432/ballast

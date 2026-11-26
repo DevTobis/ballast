@@ -115,6 +115,30 @@ describe("XdrOutput component", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
+  it("shows an expired result instead of a blank status", async () => {
+    vi.mocked(signTransaction).mockResolvedValue({ signedTxXdr: "SIGNED" } as any);
+    vi.mocked(api.submitTx).mockResolvedValue({ status: "expired", ledger: null, txHash: mockTx.txHash } as any);
+
+    render(
+      <AuthProvider>
+        <XdrOutput tx={mockTx} onDismiss={vi.fn()} />
+      </AuthProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "SIGN + SUBMIT" }));
+
+    await waitFor(() => expect(screen.getByText(">>> EXPIRED / NEVER SIGNED")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "DONE" })).toBeTruthy();
+  });
+
+  it("shows the full transaction hash", () => {
+    render(
+      <AuthProvider>
+        <XdrOutput tx={mockTx} onDismiss={vi.fn()} />
+      </AuthProvider>,
+    );
+    expect(screen.getByText(mockTx.txHash)).toBeTruthy();
+  });
+
   it("calls onDismiss when [ X ] is clicked", () => {
     const onDismiss = vi.fn();
 

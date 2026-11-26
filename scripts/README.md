@@ -146,6 +146,19 @@ then update `PRICE_PUBLISHER` in `.env.<network>-deploy` and re-run `scripts/con
 so the new key is the registered NAV attestor. See `contracts/README.md` for the full sequence and
 why the issuer-key step is required.
 
+`Registry` exposes the same role-rotation entry points (`propose_admin`, `accept_admin`,
+`queue_role_change`, `execute_role_change`, `roles`). To rotate the pauser on `Registry` without
+redeploying:
+
+```bash
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  queue_role_change --role '"Pauser"' --new_address "$NEW_PAUSER"
+# After the 48h timelock:
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- \
+  execute_role_change --id "$CHANGE_ID"
+stellar contract invoke --id "$REGISTRY_CID" --network testnet --source admin -- roles
+```
+
 To see the real sources without any contract or database (safe against mainnet):
 
 ```
@@ -172,6 +185,21 @@ Run `scripts/shadow-run.sh` for a week or two first and look at source divergenc
 before sending the first mainnet transaction. The role accounts (`mainnet_admin`, `mainnet_pauser`,
 `mainnet_keeper`, `mainnet_price_publisher`, `mainnet_risk`) must already exist and be funded; the
 script never generates keys on mainnet.
+
+**If the run is interrupted.** Each contract id is appended to `.env.mainnet-deploy.partial`
+(git-ignored) as soon as it is deployed, with a `STEP_` marker after every completed on-chain step,
+and the script prints that file when it stops. A re-run refuses to start while it exists. Read it,
+fix the cause, then continue with `RESUME_PARTIAL=1 CONFIRM_MAINNET=deploy-prices
+scripts/deploy-mainnet-prices.sh`: it reuses the recorded ids, skips the marked steps, and refuses
+if a role identity no longer matches the one recorded. Deleting the file instead starts a new
+deployment and leaves the listed contracts orphaned. `deploy` and `initialize` are sent once and
+never retried: a failed `deploy` stops the script with instructions to check the admin account's
+recent transactions, and `initialize` is checked against the contract's `roles` on chain, so one
+that landed before its marker was written is recognised, and a contract someone else initialized
+first is refused. The remaining steps run again on resume if they were killed before their marker
+was written. The publisher's NAV attestor key is decoded (version and checksum checked) before
+anything is deployed, and the run stops if that fails. On success the partial file is removed and
+`.env.mainnet-deploy` has the same format as before.
 
 ## If a CLI flag doesn't match
 

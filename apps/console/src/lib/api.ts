@@ -1,4 +1,5 @@
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
+import { apiUrl } from "./config.ts";
+import { notifyUnauthorized } from "./unauthorized.ts";
 
 export class ApiError extends Error {
   constructor(
@@ -11,7 +12,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, token: string | null, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, {
+  const res = await fetch(`${apiUrl()}${path}`, {
     ...init,
     headers: {
       // Only with a body: Fastify rejects a JSON content-type on an empty one (e.g. DELETE).
@@ -21,6 +22,10 @@ async function request<T>(path: string, token: string | null, init?: RequestInit
     },
   });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401 && token) {
+    notifyUnauthorized();
+    throw new ApiError(401, "Your session expired. Log in again.", body);
+  }
   if (!res.ok) {
     throw new ApiError(res.status, body.error ?? body.message ?? `request to ${path} failed with ${res.status}`, body);
   }
@@ -235,7 +240,7 @@ export interface TxResult {
   txHash: string;
   kind: string;
   refId: string | null;
-  status: "pending" | "settled" | "failed";
+  status: "pending" | "settled" | "failed" | "expired";
   ledger: number | null;
 }
 

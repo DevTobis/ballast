@@ -126,6 +126,46 @@ describe("BorrowerView page", () => {
     vi.spyOn(api, "assets").mockResolvedValue({ assets: [asset] });
   });
 
+  it("still shows the other lines when one line's detail fails to load", async () => {
+    vi.spyOn(api, "creditLine").mockImplementation(async (_token, id) => {
+      if (id === lineA.id) return lineA;
+      throw new Error("boom");
+    });
+
+    render(<BorrowerView />);
+
+    expect(await screen.findByRole("button", { name: /line-a/i })).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("could not load")).toBeTruthy());
+    expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
+    // The healthy line kept its margin badge.
+    expect(screen.getAllByText(/healthy/i).length).toBeGreaterThan(0);
+  });
+
+  it("enables the pledge button when assets arrive after the detail opened", async () => {
+    let release!: (value: { assets: AssetSummary[] }) => void;
+    vi.spyOn(api, "assets").mockImplementation(
+      () => new Promise((resolve) => (release = resolve)),
+    );
+    // Details are available immediately, only the asset list is late.
+    render(<BorrowerView />);
+    const buttonA = await screen.findByRole("button", { name: /line-a/i });
+    fireEvent.click(buttonA);
+
+    const pledgeSection = (await screen.findByText("[ Pledge collateral ]")).closest("section")!;
+    fireEvent.change(within(pledgeSection).getByPlaceholderText("units"), { target: { value: "10" } });
+    expect((within(pledgeSection).getByRole("button", { name: /build pledge tx/i }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+
+    release({ assets: [asset] });
+
+    await waitFor(() =>
+      expect(
+        (within(pledgeSection).getByRole("button", { name: /build pledge tx/i }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+  });
+
   it("resets form state when switching between credit lines (Draw amount regression test)", async () => {
     render(<BorrowerView />);
 

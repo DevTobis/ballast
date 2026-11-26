@@ -1,4 +1,4 @@
-import type { IssuerAdapter } from "../adapter.js";
+import type { IssuerAdapter, IssuerRequestOptions } from "../adapter.js";
 import { issuerApiRequest, requestSep8ApprovalHttp, requireLiveConfig, type Sep8ApprovalResult } from "./liveShared.js";
 
 /**
@@ -40,12 +40,17 @@ export class EtherfuseAdapter implements IssuerAdapter {
   }
 
   // TODO: confirm against Etherfuse's real API docs once live credentials are available
-  async requestLienFreeze(assetCode: string, holderAddress: string, units: bigint): Promise<{ lienRef: string }> {
+  async requestLienFreeze(
+    assetCode: string,
+    holderAddress: string,
+    units: bigint,
+    options?: IssuerRequestOptions,
+  ): Promise<{ lienRef: string }> {
     return issuerApiRequest("EtherfuseAdapter.requestLienFreeze", "POST", `${this.baseUrl}/v1/liens`, this.apiKey, {
       assetCode,
       holderAddress,
       units: units.toString(),
-    });
+    }, options?.idempotencyKey);
   }
 
   // TODO: confirm against Etherfuse's real API docs once live credentials are available
@@ -64,11 +69,12 @@ export class EtherfuseAdapter implements IssuerAdapter {
     assetCode: string,
     units: bigint,
     destination: string,
+    options?: IssuerRequestOptions,
   ): Promise<{ redemptionRef: string; expectedSettlementAt: number }> {
     return issuerApiRequest("EtherfuseAdapter.requestRedemption", "POST", `${this.baseUrl}/v1/redemptions`, this.apiKey, {
       assetCode,
       units: units.toString(),
       destination,
-    });
+    }, options?.idempotencyKey);
   }
 }

@@ -6,12 +6,17 @@ import { Button } from "../components/Button.tsx";
 import { MarginBadge } from "../components/StatusBadge.tsx";
 import { XdrOutput } from "../components/XdrOutput.tsx";
 import { INPUT } from "../components/Field.tsx";
+import { usePolling } from "../lib/usePolling.ts";
 import { bpsToPercent, formatScaledBigintString, shortAddress, toScaled } from "../lib/format.ts";
+
+/** How often open positions refresh on their own. */
+const REFRESH_MS = 15_000;
 
 export function LenderView() {
   const { session } = useAuth();
   const [positions, setPositions] = useState<PositionsResult | null>(null);
   const [details, setDetails] = useState<Record<string, CreditLineDetail>>({});
+  const [lineErrors, setLineErrors] = useState<Record<string, string>>({});
   const [fundAmounts, setFundAmounts] = useState<Record<string, string>>({});
   const [withdrawAmounts, setWithdrawAmounts] = useState<Record<string, string>>({});
   const [tx, setTx] = useState<BuiltTx | null>(null);
@@ -20,16 +25,30 @@ export function LenderView() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function reload() {
+  // `silent` refreshes in the background without flashing the loading state over the list.
+  async function reload(silent = false) {
     if (!session) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const pos = await api.positions(session.token, session.partyId);
       setPositions(pos);
       const mine = pos.creditLines.filter((l) => l.lenderId === session.partyId);
-      const entries = await Promise.all(mine.map((l) => api.creditLine(session.token, l.id)));
-      setDetails(Object.fromEntries(entries.map((d) => [d.id, d])));
+      // One bad line must not hide the margin status of the rest of the book.
+      const results = await Promise.allSettled(mine.map((l) => api.creditLine(session.token, l.id)));
+      const loaded: Record<string, CreditLineDetail> = {};
+      const failed: Record<string, string> = {};
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") loaded[r.value.id] = r.value;
+        else failed[mine[i].id] = r.reason instanceof Error ? r.reason.message : "could not load";
+      });
+      // A line whose refresh failed keeps its last good detail rather than blanking.
+      setDetails((prev) => ({
+        ...Object.fromEntries(Object.entries(prev).filter(([id]) => id in failed)),
+        ...loaded,
+      }));
+      setLineErrors(failed);
       setAssets((await api.assets(session.token)).assets);
+      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "failed to load positions");
     } finally {
@@ -41,6 +60,8 @@ export function LenderView() {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.partyId]);
+
+  usePolling(() => reload(true), REFRESH_MS, Boolean(session));
 
   if (!session) return null;
   const myLines = positions?.creditLines.filter((l) => l.lenderId === session.partyId) ?? [];
@@ -83,6 +104,12 @@ export function LenderView() {
                   LINE / {line.id.slice(0, 8)} <span className="text-fg">{line.status.toUpperCase()}</span>
                   <br />
                   <span className="text-fg">BORROWER {shortAddress(line.borrowerId)}</span>
+                  {lineErrors[line.id] && (
+                    <span className="mt-1 flex items-center gap-2 text-accent">
+                      could not load details
+                      <Button onClick={() => reload()}>Retry</Button>
+                    </span>
+                  )}
                 </span>
                 <span className="text-xs">
                   LIMIT <span className="text-fg">{d ? formatScaledBigintString(d.limit, d.loanCcy) : "..."}</span>
@@ -107,7 +134,7 @@ export function LenderView() {
                     className="w-24 border border-line bg-bg px-2 py-1 text-xs outline-none focus:border-fg"
                   />
                   <Button
-                    disabled={busyId === line.id || !fundAmounts[line.id] || !line.contractLineId}
+                    disabled={busyId === line.id || tx !== null || !fundAmounts[line.id] || !line.contractLineId}
                     onClick={async () => {
                       setBusyId(line.id);
                       setError(null);
@@ -143,7 +170,7 @@ export function LenderView() {
                   {(["undrawn", "interest"] as const).map((kind) => (
                     <Button
                       key={kind}
-                      disabled={busyId === line.id || !withdrawAmounts[line.id] || !line.contractLineId}
+                      disabled={busyId === line.id || tx !== null || !withdrawAmounts[line.id] || !line.contractLineId}
                       onClick={async () => {
                         setBusyId(line.id);
                         setError(null);
@@ -168,7 +195,7 @@ export function LenderView() {
                       difference to the borrower in USDC in the same transaction.
                     </p>
                     <Button
-                      disabled={busyId === line.id}
+                      disabled={busyId === line.id || tx !== null}
                       onClick={async () => {
                         setBusyId(line.id);
                         setError(null);
@@ -197,7 +224,7 @@ export function LenderView() {
                     ).map(([label, value]) => (
                       <div key={label} className="bg-bg-raised p-2">
                         <dt className="uppercase tracking-wider text-fg-dim">{label}</dt>
-                        <dd className={label.startsWith("Shortfall") && BigInt(value) > 0n ? "text-accent" : "text-fg"}>
+                        <dd className={label.startsWith("Shortfall") && /^\d+$/.test(value) && BigInt(value) > 0n ? "text-accent" : "text-fg"}>
                           {formatScaledBigintString(value, d.loanCcy)}
                         </dd>
                       </div>

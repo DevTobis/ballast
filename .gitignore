@@ -25,3 +25,6 @@ contracts/**/test_snapshots/
 
 # Local data
 .pgdata/
+
+# An interrupted scripts/deploy-mainnet-prices.sh run: contract ids on mainnet, not yet in the final file
+.env.*-deploy.partial
