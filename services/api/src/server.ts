@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { ZodError } from "zod";
+import { sql } from "drizzle-orm";
 import type { Database } from "@ballast/db";
 import { ContractRejectedError } from "@ballast/contract-clients";
 import { isTransientRpcError } from "@ballast/network-config";
@@ -26,6 +27,7 @@ import { registerPositionRoutes } from "./routes/positions.js";
 import { registerReportRoutes } from "./routes/reports.js";
 import { registerPartyRoutes } from "./routes/parties.js";
 import { registerTxRoutes } from "./routes/tx.js";
+import { getOpenApiDocument } from "./openapi.js";
 
 export interface BuildServerOptions {
   config?: ApiConfig;
@@ -140,6 +142,42 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   // GET /v1/assets and /v1/assets/:id/price are public per PRD §9 (no auth required to browse
   // supported assets/prices); everything else needs a resolved partyId.
   app.get("/healthz", { config: { public: true, rateLimit: false } }, async () => ({ ok: true }));
+  // The document is built from the route descriptions in openapi.ts, which a test keeps in step with
+  // the zod schemas the handlers parse with. Route options carry no JSON schema, so Fastify does no
+  // validation of its own and the zod error responses stay as they are.
+  app.get("/v1/openapi.json", { config: { public: true, rateLimit: false } }, async () => getOpenApiDocument());
+
+  // Readiness, separate from `/healthz` liveness: 200 only when Postgres answers `SELECT 1` and the
+  // RPC answers `getLatestLedger`, each within a short timeout. A dependency this process cannot
+  // check counts as failed, never as ok. The body names the failed dependency and nothing else.
+  app.get("/readyz", { config: { public: true, rateLimit: false } }, async (_request, reply) => {
+    const TIMEOUT_MS = 3000;
+    const check = async (label: string, run: (() => Promise<unknown>) | undefined): Promise<boolean> => {
+      if (!run) return false;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          run(),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} check timed out`)), TIMEOUT_MS);
+          }),
+        ]);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const execute = (db as { execute?: (query: unknown) => Promise<unknown> }).execute;
+    const [dbOk, rpcOk] = await Promise.all([
+      check("database", execute ? () => execute.call(db, sql`SELECT 1`) : undefined),
+      check("rpc", chain.getLatestLedger ? () => chain.getLatestLedger!() : undefined),
+    ]);
+    const dependencies = { database: dbOk ? "ok" : "failed", rpc: rpcOk ? "ok" : "failed" };
+    return reply.code(dbOk && rpcOk ? 200 : 503).send({ ok: dbOk && rpcOk, dependencies });
+  });
 
   registerAuthRoutes(app, db, config);
 

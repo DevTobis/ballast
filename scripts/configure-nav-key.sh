@@ -35,4 +35,4 @@ retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "
 
 echo ">>> Requiring NAV signatures"
 retry stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
-  --admin "$ADMIN" --required true >/dev/null
+  --admin "$ADMIN" --asset "$RWA_SAC" --required true >/dev/null

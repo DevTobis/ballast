@@ -54,15 +54,15 @@
 //! that sum via `transfer_from`; a defaulted trade's unconsumed share stays in the live
 //! allowance only until the next settle re-approves the accurate sum or the allowance expires.
 //!
-//! **Skeleton simplification (default-close bookkeeping, PRD §5 Phase 3 "Fail path"):
-//! `default_close` gives the cash lender full title to the pledged RWA units and closes the
-//! trade. It does **not** attempt to net the collateral's current market value against the
-//! outstanding cash exposure (principal + accrued interest) and settle any residual USDC in
-//! either direction — a real implementation would need `call_margin`'s guarded-price read here
-//! too, plus a place for a shortfall (lender under-recovered) or an excess (borrower is owed
-//! change) to be booked. That accounting is left to the off-chain `ledger`/`margin-monitor`
-//! services (PRD §6.5); on-chain, "lender keeps the collateral, trade closed" is the full
-//! outcome.
+//! **Margin default path (PRD §5 Phase 3 "Fail path"):**
+//! If the cash borrower has not cured an outstanding margin call by `cure_deadline`, the trade
+//! can be closed via `default_close` (keeper-only). The position is re-evaluated at default
+//! time: if the price has recovered since the call, the borrower has cured and this refuses.
+//! The collateral is valued at the guarded price with no haircut; the cash lender receives
+//! `ceil(exposure / price)` units, capped at what is pledged, and any surplus units above that
+//! return to the borrower. If the collateral is worth less than the exposure, the lender takes
+//! all pledged units and bears the shortfall. No USDC moves on default.
+//!
 //! **Maturity default path (PRD §5 Phase 3 "Fail path"):**
 //! If the cash borrower fails to fund leg 2 at maturity, `unwind` reverts. Once the trade remains
 //! unpaid past `maturity_at + maturity_grace` (default 24h, admin-configurable with a 60s floor),
@@ -89,6 +89,25 @@
 //! - the borrower's outstanding leg-2 sum is extended to outlast the allowance it describes;
 //! - `extend_ttl` is a permissionless keep-alive for one trade, for a trade longer than the
 //!   network's maximum entry TTL (3,110,400 ledgers, about 180 days, on both networks).
+//!
+//! ## Contract Events
+//!
+//! The trade-lifecycle entry points publish events with the shape `((Symbol, id), payload)`, listed
+//! below. `disable`/`enable` (keyed by the asset) and the pause events are in `contracts/EVENTS.md`.
+//! The admin setters publish `usdc`, `curegrace` and `matgrace` with `(old, new)`, and
+//! `configure_asset` publishes `cfgasset` keyed by the asset with the full new config (see README).
+//!
+//! | Event | Topics | Data | Emitted by | Description |
+//! |---|---|---|---|---|
+//! | `propose` | `(Symbol("propose"), id: u64)` | `(cash_lender: Address, cash_borrower: Address, asset: Address, units: i128, cash_amount: i128, maturity_at: u64)` | `propose` | Published when a new repo trade proposal is created. |
+//! | `cancel` | `(Symbol("cancel"), id: u64)` | `caller: Address` | `cancel_proposal` | Published when a proposal is cancelled by the lender or borrower. |
+//! | `settle` | `(Symbol("settle"), id: u64)` | `units: i128` | `accept_and_settle` | Published when the borrower accepts and settles leg 1 of the trade. |
+//! | `unwind` | `(Symbol("unwind"), id: u64)` | `total_due: i128` | `unwind` | Published when leg 2 unwinds successfully at or past maturity. |
+//! | `mcall` | `(Symbol("mcall"), id: u64)` | `margin_call_amount: i128` | `call_margin` | Published when a trade's collateral breaches the margin call threshold. |
+//! | `cured` | `(Symbol("cured"), id: u64)` | `0i128` | `call_margin` | Published when an open margin call is cured via price recovery. |
+//! | `topup` | `(Symbol("topup"), id: u64)` | `(units: i128, cured: bool)` | `top_up` | Published when the borrower adds collateral to top up a trade. |
+//! | `default` | `(Symbol("default"), id: u64)` | `(lender_units: i128, borrower_units: i128)` | `default_close` | Published when an uncured margin call is defaulted by the keeper. |
+//! | `mat_def` | `(Symbol("mat_def"), id: u64)` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` | Published when an unpaid trade past maturity grace is defaulted. |
 
 use ballast_common::{
     access::{self, Roles},
@@ -211,6 +230,8 @@ pub struct RepoAssetConfig {
     pub price_guard: Address,
     pub haircut_bps: u32,
     pub thresholds: MarginThresholds,
+    pub max_cash_per_trade: i128,
+    pub max_term_seconds: u64,
 }
 
 #[contracttype]
@@ -253,6 +274,16 @@ pub struct RepoMarginView {
     pub price_ok: bool,
 }
 
+/// A configuration change queued by `queue_asset_config`, applied by `execute_asset_config` once
+/// `executes_at` has passed. The queued config is a full replacement.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingAssetConfig {
+    pub asset: Address,
+    pub config: RepoAssetConfig,
+    pub executes_at: u64,
+}
+
 #[contracttype]
 struct PendingUnpause {
     scope: PauseScope,
@@ -280,6 +311,7 @@ enum DataKey {
     MaturityGrace,
 
     PendingUnpause(u64),
+    PendingAssetConfig(u64),
 
     LatestProposal(Address),
 }
@@ -383,6 +415,52 @@ fn read_usdc(env: &Env) -> Address {
         .instance()
         .get(&DataKey::Usdc)
         .expect("repo-dvp: usdc not configured")
+}
+
+fn validate_asset_config(config: &RepoAssetConfig) {
+    assert!(
+        config.haircut_bps as i128 <= BPS_DENOMINATOR,
+        "repo-dvp: haircut exceeds 100%"
+    );
+    config.thresholds.validate();
+    assert!(
+        config.max_cash_per_trade > 0,
+        "repo-dvp: max_cash_per_trade must be positive"
+    );
+    assert!(
+        config.max_term_seconds > 0,
+        "repo-dvp: max_term_seconds must be positive"
+    );
+}
+
+/// Whether moving from `current` to `next` could hide a margin call, delay a default, make a
+/// default seize more, or let larger or longer repos in: a different price source, a lower
+/// haircut, any higher threshold, or a higher per-trade cash or term cap. Such changes are
+/// timelocked (#215).
+fn loosens(current: &RepoAssetConfig, next: &RepoAssetConfig) -> bool {
+    next.price_guard != current.price_guard
+        || next.haircut_bps < current.haircut_bps
+        || next.thresholds.warning_bps > current.thresholds.warning_bps
+        || next.thresholds.margin_call_bps > current.thresholds.margin_call_bps
+        || next.thresholds.liquidation_bps > current.thresholds.liquidation_bps
+        || next.max_cash_per_trade > current.max_cash_per_trade
+        || next.max_term_seconds > current.max_term_seconds
+}
+
+fn write_asset_config(env: &Env, asset: &Address, config: &RepoAssetConfig) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetConfig(asset.clone()), config);
+    env.events().publish(
+        (symbol_short!("cfgasset"), asset.clone()),
+        (
+            config.price_guard.clone(),
+            config.haircut_bps,
+            config.thresholds.clone(),
+            config.max_cash_per_trade,
+            config.max_term_seconds,
+        ),
+    );
 }
 
 fn require_admin_is(env: &Env, admin: &Address) {
@@ -503,7 +581,7 @@ fn clear_margin_call(trade: &mut RepoTrade) {
 
 /// Reads the guarded price and returns `(exposure, collateral_value, margin_state, price)` for a
 /// settled trade, or `None` when the price is not one the guard stands behind (`Degraded` or
-/// `Halted`). `exposure` is principal plus interest accrued so far; `collateral_value` has the
+/// `Halted`). `exposure` is principal plus interest accrued up to `maturity_at`; `collateral_value` has the
 /// asset's haircut applied.
 fn evaluate_margin(
     env: &Env,
@@ -518,7 +596,12 @@ fn evaluate_margin(
     let collateral_value = risk::collateral_value(trade.units, guarded.value, config.haircut_bps);
     let now = env.ledger().timestamp();
     let settled_at = trade.settled_at.unwrap_or(now);
-    let accrued = accrue_interest(trade.cash_amount, trade.rate_bps, now.saturating_sub(settled_at));
+    let accrual_end = now.min(trade.maturity_at);
+    let accrued = accrue_interest(
+        trade.cash_amount,
+        trade.rate_bps,
+        accrual_end.saturating_sub(settled_at),
+    );
     let exposure = trade
         .cash_amount
         .checked_add(accrued)
@@ -562,7 +645,10 @@ impl RepoDvp {
     pub fn set_usdc(env: Env, admin: Address, usdc: Address) {
         require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
+        let old_usdc: Option<Address> = env.storage().instance().get(&DataKey::Usdc);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
+        env.events()
+            .publish((symbol_short!("usdc"),), (old_usdc, usdc));
     }
 
     /// Sets how long a borrower has to cure a margin call opened from now on (default 24h, at
@@ -574,7 +660,10 @@ impl RepoDvp {
             seconds >= MIN_CURE_GRACE_SECONDS,
             "repo-dvp: cure window is shorter than the minimum"
         );
+        let old_grace = cure_grace(&env);
         env.storage().instance().set(&DataKey::CureGrace, &seconds);
+        env.events()
+            .publish((symbol_short!("curegrace"),), (old_grace, seconds));
     }
 
     pub fn cure_grace_seconds(env: Env) -> u64 {
@@ -591,9 +680,12 @@ impl RepoDvp {
             seconds >= MIN_MATURITY_GRACE_SECONDS,
             "repo-dvp: maturity grace is shorter than the minimum"
         );
+        let old_grace = maturity_grace(&env);
         env.storage()
             .instance()
             .set(&DataKey::MaturityGrace, &seconds);
+        env.events()
+            .publish((symbol_short!("matgrace"),), (old_grace, seconds));
     }
 
     pub fn maturity_grace_seconds(env: Env) -> u64 {
@@ -673,6 +765,12 @@ impl RepoDvp {
         pause::is_paused(&env, &scope)
     }
 
+    /// Sets an asset's risk config. The first listing applies immediately, and so does any
+    /// change that cannot loosen risk (same price guard, haircut not lower, no threshold or cap
+    /// higher). Anything else panics here and must go through `queue_asset_config` and the 48h
+    /// timelock (#215): repointing `price_guard` at a contract that returns a low price would let a
+    /// keeper `default_close` an open call into a total seizure, and a lower haircut or higher
+    /// thresholds would hide a margin call. The risk role tightens with `tighten_asset_config`.
     pub fn configure_asset(
         env: Env,
         admin: Address,
@@ -680,22 +778,149 @@ impl RepoDvp {
         price_guard: Address,
         haircut_bps: u32,
         thresholds: MarginThresholds,
+        max_cash_per_trade: i128,
+        max_term_seconds: u64,
     ) {
         require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
+        let config = RepoAssetConfig {
+            price_guard,
+            haircut_bps,
+            thresholds,
+            max_cash_per_trade,
+            max_term_seconds,
+        };
+        validate_asset_config(&config);
+        let current: Option<RepoAssetConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetConfig(asset.clone()));
+        if let Some(current) = current {
+            assert!(
+                !loosens(&current, &config),
+                "repo-dvp: change loosens the asset config; use queue_asset_config"
+            );
+        }
+        write_asset_config(&env, &asset, &config);
+    }
+
+    /// The risk role's emergency brake (#215): raises the haircut and/or lowers the margin
+    /// thresholds of an already-configured asset immediately, keeping its price guard and caps.
+    /// Refuses anything that would loosen. Like `configure_asset`, it publishes `cfgasset`.
+    pub fn tighten_asset_config(
+        env: Env,
+        risk: Address,
+        asset: Address,
+        haircut_bps: u32,
+        thresholds: MarginThresholds,
+    ) {
+        ttl::extend_instance(&env);
+        let stored_risk = access::require_risk(&env);
+        assert_eq!(stored_risk, risk, "repo-dvp: risk argument mismatch");
+        let current = read_asset_config(&env, &asset);
+        let config = RepoAssetConfig {
+            price_guard: current.price_guard.clone(),
+            haircut_bps,
+            thresholds,
+            max_cash_per_trade: current.max_cash_per_trade,
+            max_term_seconds: current.max_term_seconds,
+        };
+        validate_asset_config(&config);
         assert!(
-            haircut_bps as i128 <= BPS_DENOMINATOR,
-            "repo-dvp: haircut exceeds 100%"
+            !loosens(&current, &config),
+            "repo-dvp: tighten_asset_config cannot loosen the asset config"
         );
-        thresholds.validate();
-        env.storage().instance().set(
-            &DataKey::AssetConfig(asset.clone()),
-            &RepoAssetConfig {
-                price_guard,
-                haircut_bps,
-                thresholds,
+        write_asset_config(&env, &asset, &config);
+    }
+
+    /// Queues a full replacement config for an already-configured asset, applied by
+    /// `execute_asset_config` after the 48h timelock. This is the only path for changes
+    /// `configure_asset` refuses (a new price guard, a lower haircut, a higher threshold or cap).
+    /// Validation runs here, when the change is queued. Returns the id.
+    pub fn queue_asset_config(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        price_guard: Address,
+        haircut_bps: u32,
+        thresholds: MarginThresholds,
+        max_cash_per_trade: i128,
+        max_term_seconds: u64,
+    ) -> u64 {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset);
+        let config = RepoAssetConfig {
+            price_guard,
+            haircut_bps,
+            thresholds,
+            max_cash_per_trade,
+            max_term_seconds,
+        };
+        validate_asset_config(&config);
+        let id = timelock::next_id(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let executes_at = timelock::executes_at(&env);
+        env.storage().persistent().set(
+            &key,
+            &PendingAssetConfig {
+                asset: asset.clone(),
+                config: config.clone(),
+                executes_at,
             },
         );
+        timelock::extend_entry_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("cfg_q"), id), (asset, config, executes_at));
+        id
+    }
+
+    /// Applies a queued config once its timelock has elapsed. Permissionless, like
+    /// `execute_unpause`: the change was authorised and published when it was queued.
+    pub fn execute_asset_config(env: Env, id: u64) {
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending asset config");
+        assert!(
+            timelock::is_ready(&env, pending.executes_at),
+            "repo-dvp: timelock has not elapsed"
+        );
+        env.storage().persistent().remove(&key);
+        write_asset_config(&env, &pending.asset, &pending.config);
+        env.events()
+            .publish((symbol_short!("cfg_exec"), id), pending.asset);
+    }
+
+    /// Drops a queued config before it executes. Admin only.
+    pub fn cancel_asset_config(env: Env, admin: Address, id: u64) {
+        require_admin_is(&env, &admin);
+        ttl::extend_instance(&env);
+        let key = DataKey::PendingAssetConfig(id);
+        let pending: PendingAssetConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("repo-dvp: no such pending asset config");
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((symbol_short!("cfg_canc"), id), pending.asset);
+    }
+
+    pub fn pending_asset_config(env: Env, id: u64) -> Option<PendingAssetConfig> {
+        ttl::extend_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAssetConfig(id))
+    }
+
+    /// Reads the active configuration for an asset.
+    pub fn asset_config(env: Env, asset: Address) -> RepoAssetConfig {
+        ttl::extend_instance(&env);
+        read_asset_config(&env, &asset)
     }
 
     /// Disables an asset so that new proposals and settlements are refused. Admin only.
@@ -761,12 +986,22 @@ impl RepoDvp {
             rate_bps <= MAX_RATE_BPS,
             "repo-dvp: rate_bps exceeds the maximum rate"
         );
-        require_term_fits_kind(&kind, maturity_at - env.ledger().timestamp());
+        let term_seconds = maturity_at - env.ledger().timestamp();
+        require_term_fits_kind(&kind, term_seconds);
+
         // Refuse before any allowance is granted: a trade in an asset that was never
         // passed to `configure_asset` would settle leg 1 and then strand the lender
         // with no margin protection — `call_margin` and `default_close` read this
         // config and would revert until maturity.
-        read_asset_config(&env, &asset);
+        let config = read_asset_config(&env, &asset);
+        assert!(
+            cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        assert!(
+            term_seconds <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         // Pre-authorize leg 1 (see the module docs): the lender signs this call, not the
         // borrower's later `accept_and_settle`.
@@ -783,9 +1018,9 @@ impl RepoDvp {
             .set(&DataKey::LatestProposal(cash_lender.clone()), &id);
         let trade = RepoTrade {
             id,
-            cash_lender,
-            cash_borrower,
-            asset,
+            cash_lender: cash_lender.clone(),
+            cash_borrower: cash_borrower.clone(),
+            asset: asset.clone(),
             units,
             cash_amount,
             rate_bps,
@@ -801,6 +1036,17 @@ impl RepoDvp {
             cure_deadline: None,
         };
         write_trade(&env, &trade);
+        env.events().publish(
+            (symbol_short!("propose"), id),
+            (
+                cash_lender,
+                cash_borrower,
+                asset,
+                units,
+                cash_amount,
+                maturity_at,
+            ),
+        );
         id
     }
 
@@ -871,7 +1117,16 @@ impl RepoDvp {
         }
         // Belt and braces for proposals that predate the check in `propose`: never
         // move either leg for an asset with no margin parameters.
-        read_asset_config(&env, &trade.asset);
+        let config = read_asset_config(&env, &trade.asset);
+        assert!(
+            trade.cash_amount <= config.max_cash_per_trade,
+            "repo-dvp: cash_amount exceeds asset max_cash_per_trade"
+        );
+        let now = env.ledger().timestamp();
+        assert!(
+            trade.maturity_at.saturating_sub(now) <= config.max_term_seconds,
+            "repo-dvp: term exceeds asset max_term_seconds"
+        );
 
         let asset_client = token::Client::new(&env, &trade.asset);
         asset_client.transfer(
@@ -979,6 +1234,7 @@ impl RepoDvp {
             &trade.units,
         );
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Unwound;
         write_trade(&env, &trade);
         release_borrower_due(&env, &trade);
@@ -1147,6 +1403,7 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
         release_borrower_due(&env, &trade);
@@ -1222,6 +1479,7 @@ impl RepoDvp {
             );
         }
 
+        clear_margin_call(&mut trade);
         trade.status = RepoStatus::Defaulted;
         write_trade(&env, &trade);
 

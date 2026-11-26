@@ -88,11 +88,14 @@ export const openCreditLineSchema = z.object({
   limit: positiveAmount,
   /** Annual interest rate in basis points (non-negative integer); stored in `credit_line.rate_bps` and forwarded to contract open(). */
   rateBps: z.number().int().nonnegative(),
-  /** Upfront commitment fee in basis points (non-negative integer, defaults to 0); stored in `credit_line.fee_bps` and forwarded to contract open(). */
-  feeBps: z.number().int().nonnegative().default(0),
+  /** Annual platform fee in basis points (0-10,000, default 0), accrued on drawn principal alongside interest and paid to the treasury; stored in `credit_line.fee_bps` and forwarded to contract open(). */
+  feeBps: z.number().int().nonnegative().max(10_000).default(0),
   /** Margin cure period duration in seconds (positive integer); stored in `credit_line.cure_window_s` and forwarded to contract open(). */
   cureWindowS: z.number().int().positive(),
-  /** Primary collateral asset contract address or symbol; forwarded to contract open(), not stored in credit_line DB table. */
+  /**
+   * Collateral asset contract address (C...), passed to `CreditLineClient.open()`. Not stored on the
+   * `credit_line` row: a line's collateral is recorded per pledge (`pledge.asset_id`).
+   */
   asset: z.string(),
   /** 32-byte hex hash of the off-chain legal credit agreement; stored in `credit_line.agreement_hash` and forwarded to contract open(). */
   agreementHash: hexBuffer,
@@ -113,21 +116,21 @@ export const fundCreditLineSchema = z.object({
 });
 
 export const withdrawSchema = z.object({
-  /** Withdrawal kind ("undrawn" committed capital or "interest" repaid earnings); forwarded to contract withdraw(). */
+  /** `undrawn` returns committed USDC not currently drawn (including repaid principal) via `withdraw_undrawn`; `interest` returns repaid interest via `withdraw_interest`. */
   kind: z.enum(["undrawn", "interest"]),
   /** Amount to withdraw as a 7-decimal scaled integer (> 0); forwarded to contract withdraw() and recorded in tx intent payload. */
   amount: positiveAmount,
 });
 
 export const createDrawSchema = z.object({
-  /** Draw amount in loan currency as a 7-decimal scaled integer (> 0); stored in `draw.amount` and forwarded to contract draw(). */
+  /** Draw amount as a 7-decimal scaled integer (> 0); forwarded to contract draw(), and written to `draw.amount` when the transaction settles. */
   amount: positiveAmount,
-  /** Destination Stellar account address receiving drawn funds; stored in `draw.to_account` and forwarded to contract draw(). */
+  /** Stellar account (G...) that receives the drawn USDC; forwarded to contract draw() and kept in the tx intent payload (the `draw` row has no recipient column). */
   to: z.string(),
 });
 
 export const createRepaymentSchema = z.object({
-  /** Repayment amount in loan currency as a 7-decimal scaled integer (> 0); stored in `repayment.amount` and forwarded to contract repay(). */
+  /** Repayment amount as a 7-decimal scaled integer (> 0); forwarded to contract repay(). When it settles, the applied amount is booked as `repayment.interest` and `repayment.principal` (interest first). */
   amount: positiveAmount,
 });
 
@@ -139,14 +142,19 @@ export const exitQuoteRequestSchema = z.object({
 });
 
 export const exitExecuteSchema = z.object({
-  /** Minimum USDC payout accepted as a 7-decimal scaled integer (optional, >= 99% of quote); forwarded to contract execute(). */
+  /** Minimum USDC payout as a 7-decimal scaled integer, forwarded to contract execute(). Optional: omitted means "no worse than the quote"; a value below 99% of the quote (`EXIT_MIN_OUT_FLOOR_BPS` in routes/exit.ts) is refused. */
   minUsdcOut: positiveAmount.optional(),
   /** Destination Stellar account address receiving USDC proceeds; forwarded to contract execute(). */
   to: z.string(),
 });
 
 export const repoTradeActionSchema = z.object({
-  /** Optional contract-level trade ID (non-negative integer); forwarded to contract accept() or unwind(). */
+  /**
+   * On-chain trade id, forwarded to contract accept_and_settle() / unwind(). Optional:
+   * `repo_trade.contract_trade_id` is filled in when the propose transaction settles (see
+   * `intents.ts`), so a trade proposed through this API needs no body. Pass it for a trade proposed
+   * outside this API.
+   */
   contractTradeId: nonNegativeAmount.optional(),
 });
 

@@ -26,8 +26,16 @@ export function createFakeDb(fixtures: Map<unknown, unknown[]>): Database {
         returning: async () => [{ id: "fixture-id", ...values }],
       }),
     }),
-    update: (_table: unknown) => ({
-      set: () => ({ where: async () => [] }),
-    }),
+    update: (_table: unknown) => {
+      const query: any = {
+        where: () => query,
+        returning: async () => [{ id: "fixture-id" }],
+        then: (resolve: any, reject: any) => Promise.resolve([{ id: "fixture-id" }]).then(resolve, reject),
+      };
+      return {
+        set: () => query,
+      };
+    },
+    execute: async () => [{ "?column?": 1 }],
   } as unknown as Database;
 }

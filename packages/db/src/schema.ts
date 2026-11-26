@@ -148,6 +148,7 @@ export const creditLine = pgTable("credit_line", {
   rateBps: integer("rate_bps").notNull(),
   feeBps: integer("fee_bps").notNull(),
   cureWindowS: integer("cure_window_s").notNull(),
+  /** `pending_open` | `open` | `liquidating` | `closed` | `failed` */
   status: text("status").notNull().default("open"),
   contractLineId: text("contract_line_id"),
   agreementHash: text("agreement_hash"),
@@ -167,6 +168,7 @@ export const pledge = pgTable("pledge", {
   custodyMode: custodyModeEnum("custody_mode").notNull(),
   contractPositionId: text("contract_position_id"),
   lienRef: text("lien_ref"),
+  /** `pending` | `active` | `pending_release` | `released` | `failed` */
   status: text("status").notNull().default("active"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -236,6 +238,7 @@ export const exitQuote = pgTable("exit_quote", {
   spreadBps: integer("spread_bps").notNull(),
   usdcOut: money("usdc_out").notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  /** `open` | `expired` | `filled` */
   status: text("status").notNull().default("open"),
 });
 
@@ -270,6 +273,7 @@ export const repoTrade = pgTable("repo_trade", {
   startLedger: integer("start_ledger").notNull(),
   maturityAt: timestamp("maturity_at", { withTimezone: true }).notNull(),
   agreementHash: text("agreement_hash").notNull(),
+  /** `proposed` | `settled` | `unwound` | `defaulted` | `failed` */
   status: text("status").notNull().default("proposed"),
   /** On-chain `RepoDvp` trade id (the u64 `propose` returns), set once the propose tx settles —
    * mirrors `credit_line.contract_line_id`. */
