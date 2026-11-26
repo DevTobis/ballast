@@ -7,6 +7,7 @@ import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { schema, type Database } from "@ballast/db";
 import { eq, sql } from "drizzle-orm";
 import { createLogger, createConsoleMetricsSink, type Alerter } from "@ballast/observability";
+import { shouldAlertLag, LEDGER_CLOSE_SECONDS } from "./lag.js";
 import type { RpcClient } from "./rpc.js";
 
 export interface IndexerLogger {
@@ -32,7 +33,7 @@ const PAGE_SIZE = 100;
 const MAX_CONTRACT_IDS_PER_FILTER = 5;
 
 /** Approximate ledger close time in seconds on Stellar. */
-export const LEDGER_CLOSE_SECONDS = 5;
+export { LEDGER_CLOSE_SECONDS };
 
 /** Default threshold (in ledgers) before rpc_lag_high alert is raised (60s / 5s). */
 export const DEFAULT_LAG_ALERT_LEDGERS = 12;
@@ -113,7 +114,7 @@ export function computeRpcLag(
   const lagLedgers = Math.max(0, rpcTip - lastScannedLedger);
   return {
     lagLedgers,
-    isLagging: lagLedgers > thresholdLedgers,
+    isLagging: shouldAlertLag(rpcTip, lastScannedLedger, thresholdLedgers * LEDGER_CLOSE_SECONDS),
   };
 }
 

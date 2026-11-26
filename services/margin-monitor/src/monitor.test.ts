@@ -153,6 +153,90 @@ describe("recomputeLine", () => {
     expect(db.values).toHaveBeenCalledWith(expect.objectContaining({ fromState: "Healthy", toState: "Warning" }));
   });
 
+  it("fires a margin_recovered alert when recovering from MarginCall to Healthy", async () => {
+    const db = makeDb([
+      [{ toState: "MarginCall" }], // last margin_event
+      [{ assetId: "asset-1" }],
+      [{ id: "snapshot-1" }],
+    ]);
+    const creditLineClient = {
+      ltv: vi.fn().mockResolvedValue({
+        debt: 200n,
+        collateralValue: 1000n,
+        ltvBps: 2000,
+        state: "Healthy",
+        priceStatus: "Ok",
+      }),
+    };
+
+    const result = await recomputeLine(db, creditLineClient as any, { id: "line-1", contractLineId: "42" });
+
+    expect(result.changed).toBe(true);
+    expect(result.fromState).toBe("MarginCall");
+    expect(result.toState).toBe("Healthy");
+    expect(fireSpy).toHaveBeenCalledTimes(1);
+    expect(fireSpy).toHaveBeenCalledWith("margin_recovered", {
+      creditLineId: "line-1",
+      fromState: "MarginCall",
+      toState: "Healthy",
+      ltvBps: 2000,
+    });
+  });
+
+  it("fires a margin_recovered alert when recovering from Liquidation to Warning", async () => {
+    const db = makeDb([
+      [{ toState: "Liquidation" }], // last margin_event
+      [{ assetId: "asset-1" }],
+      [{ id: "snapshot-1" }],
+    ]);
+    const creditLineClient = {
+      ltv: vi.fn().mockResolvedValue({
+        debt: 600n,
+        collateralValue: 1000n,
+        ltvBps: 6000,
+        state: "Warning",
+        priceStatus: "Ok",
+      }),
+    };
+
+    const result = await recomputeLine(db, creditLineClient as any, { id: "line-1", contractLineId: "42" });
+
+    expect(result.changed).toBe(true);
+    expect(result.fromState).toBe("Liquidation");
+    expect(result.toState).toBe("Warning");
+    expect(fireSpy).toHaveBeenCalledTimes(1);
+    expect(fireSpy).toHaveBeenCalledWith("margin_recovered", {
+      creditLineId: "line-1",
+      fromState: "Liquidation",
+      toState: "Warning",
+      ltvBps: 6000,
+    });
+  });
+
+  it("does not fire an alert when transitioning between Healthy and Warning", async () => {
+    const db = makeDb([
+      [{ toState: "Healthy" }], // last margin_event
+      [{ assetId: "asset-1" }],
+      [{ id: "snapshot-1" }],
+    ]);
+    const creditLineClient = {
+      ltv: vi.fn().mockResolvedValue({
+        debt: 500n,
+        collateralValue: 1000n,
+        ltvBps: 5000,
+        state: "Warning",
+        priceStatus: "Ok",
+      }),
+    };
+
+    const result = await recomputeLine(db, creditLineClient as any, { id: "line-1", contractLineId: "42" });
+
+    expect(result.changed).toBe(true);
+    expect(result.fromState).toBe("Healthy");
+    expect(result.toState).toBe("Warning");
+    expect(fireSpy).not.toHaveBeenCalled();
+  });
+
   describe("priceSnapshotId linking", () => {
     it("copies the newest snapshot id when both pledge and snapshot are present", async () => {
       const db = makeDb([
@@ -223,7 +307,7 @@ describe("recomputeLine", () => {
     });
   });
 
-  it("records a margin_event on recovery to Healthy without firing an alert", async () => {
+  it("records a margin_event on recovery to Healthy and fires a margin_recovered alert", async () => {
     const db = makeDb([
       [{ toState: "MarginCall" }], // last margin_event
       [{ assetId: "asset-1" }], // pledge lookup
@@ -255,6 +339,11 @@ describe("recomputeLine", () => {
         priceSnapshotId: "snapshot-1",
       }),
     );
-    expect(fireSpy).not.toHaveBeenCalled();
+    expect(fireSpy).toHaveBeenCalledWith("margin_recovered", {
+      creditLineId: "line-1",
+      fromState: "MarginCall",
+      toState: "Healthy",
+      ltvBps: 2000,
+    });
   });
 });

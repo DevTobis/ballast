@@ -6,6 +6,7 @@ import { checkOperatorBalance, createConsoleAlerter, createLogger } from "@balla
 import { PriceGuardClient } from "@ballast/contract-clients";
 import type { AssetConfig } from "@ballast/domain-types";
 import { createOperatorSigner } from "@ballast/operator-signing";
+import { createGuardedRunner, shouldRunOnStart } from "./cycleGuard.js";
 import { runPriceUpdateCycle } from "./pipeline.js";
 import { decimalStringToScaled } from "./scaled.js";
 
@@ -49,16 +50,20 @@ function toAssetConfig(row: typeof schema.asset.$inferSelect): AssetConfig {
   };
 }
 
-cron.schedule(CRON_EXPR, async () => {
-  try {
-    const rows = await db.select().from(schema.asset).where(eq(schema.asset.status, "active"));
-    const assets = rows.map(toAssetConfig);
-    await runPriceUpdateCycle(db, priceGuardClient, signer, assets);
-    logger.info({ count: assets.length }, "price-guard: cycle complete");
-  } catch (err) {
-    logger.error({ err }, "price-guard: cycle failed");
-  }
+const triggerGuardedCycle = createGuardedRunner(async () => {
+  const rows = await db.select().from(schema.asset).where(eq(schema.asset.status, "active"));
+  const assets = rows.map(toAssetConfig);
+  await runPriceUpdateCycle(db, priceGuardClient, signer, assets);
+  logger.info({ count: assets.length }, "price-guard: cycle complete");
+}, logger);
+
+cron.schedule(CRON_EXPR, () => {
+  void triggerGuardedCycle();
 });
+
+if (shouldRunOnStart()) {
+  void triggerGuardedCycle();
+}
 
 // The publisher pays the fee on every price it pushes; a dry account freezes the on-chain price
 // and, once it goes stale, every draw with it. Checked every 30 minutes (not in shadow mode, where
