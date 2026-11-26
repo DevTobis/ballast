@@ -26,7 +26,12 @@ export async function getJson<T>(url: string, fetchImpl: typeof fetch = fetch): 
       const text = await res.text().catch(() => "");
       throw new Error(`issuer NAV request failed: GET ${url} -> ${res.status} ${res.statusText}: ${text}`);
     }
-    return (await res.json()) as T;
+    try {
+      return (await res.json()) as T;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`issuer NAV request failed to parse JSON from GET ${url}: ${message}`);
+    }
   }
 }
 
