@@ -94,7 +94,7 @@ impl AssetConfig {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParamChange {
     HaircutBaseBps(u32),
     HaircutFxBps(u32),

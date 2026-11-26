@@ -49,6 +49,29 @@ export class PriceGuardClient extends BaseContractClient {
     return this.invoke(source, "configure_signature_requirement", [scAddress(source), scBool(required)]);
   }
 
+  /** Admin-only. Allows or disallows a price source name for an asset (PRD §6.4, issue #84). */
+  configureSource(
+    source: string,
+    assetAddress: string,
+    sourceName: string,
+    enabled: boolean,
+  ): Promise<string> {
+    return this.invoke(source, "configure_source", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+      scBool(enabled),
+    ]);
+  }
+
+  /** Read-only; returns whether `sourceName` is currently allowlisted for `assetAddress`. */
+  isSourceAllowed(assetAddress: string, sourceName: string): Promise<boolean> {
+    return this.read<boolean>("is_source_allowed", [
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+    ]);
+  }
+
   /**
    * Pushes an independent-feed or last-redemption-price reading. The on-chain function is named
    * `publish_source` (contracts/price-guard/src/lib.rs) — kept as `publishFeed` here for the

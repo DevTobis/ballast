@@ -14,6 +14,7 @@ export interface OpenCreditLineArgs {
   asset: string;
   limit: bigint;
   rateBps: number;
+  feeBps: number;
   cureS: number;
   agreementHash: Buffer;
 }
@@ -40,6 +41,9 @@ export interface Owed {
   principal: bigint;
   accruedInterest: bigint;
   pendingInterest: bigint;
+  accruedFee: bigint;
+  pendingFee: bigint;
+  /** principal + accrued/pending interest + accrued/pending fee; equals `debtOf`. */
   total: bigint;
   asOf: bigint;
 }
@@ -53,7 +57,9 @@ export interface OnChainLine {
   funded: bigint;
   drawn: bigint;
   pledgedUnits: bigint;
+  feeBps?: number;
   accruedInterest: bigint;
+  accruedFee?: bigint;
   status: "Open" | "Liquidating" | "Closed";
   /** Ledger at which `poke` first saw a liquidation-level breach; unset while there is none. */
   breachLedger?: number | null;
@@ -78,6 +84,7 @@ export class CreditLineClient extends BaseContractClient {
       scAddress(args.asset),
       scI128(args.limit),
       scU32(args.rateBps),
+      scU32(args.feeBps),
       scU64(args.cureS),
       scBytes(args.agreementHash),
     ]);
@@ -96,8 +103,18 @@ export class CreditLineClient extends BaseContractClient {
     ]);
   }
 
+  /**
+   * Repay drawn balance and accrued interest. `amount` acts as a cap: on-chain `repay`
+   * applies `min(amount, owed)` (interest first, then principal) and transfers only
+   * what was applied, returning the applied amount.
+   */
   repay(source: string, line: bigint, amount: bigint): Promise<string> {
     return this.invoke(source, "repay", [scAddress(source), scU64(line), scI128(amount)]);
+  }
+
+  /** Read-only: what the borrower owes right now (principal plus interest accrued to this ledger). */
+  debtOf(line: bigint): Promise<bigint> {
+    return this.read<bigint>("debt_of", [scU64(line)]);
   }
 
   /**
@@ -168,6 +185,21 @@ export class CreditLineClient extends BaseContractClient {
   /** Read-only: interest repaid on the line and not yet withdrawn. */
   claimableInterest(line: bigint): Promise<bigint> {
     return this.read<bigint>("claimable_interest", [scU64(line)]);
+  }
+
+  /** Configures the protocol treasury address allowed to claim repaid platform fees. */
+  setTreasury(source: string, treasury: string): Promise<string> {
+    return this.invoke(source, "set_treasury", [scAddress(source), scAddress(treasury)]);
+  }
+
+  /** Treasury withdraws repaid platform fees from `line`. */
+  claimFee(source: string, line: bigint, amount: bigint): Promise<string> {
+    return this.invoke(source, "claim_fee", [scAddress(source), scU64(line), scI128(amount)]);
+  }
+
+  /** Read-only: platform fees repaid on the line and not yet withdrawn by treasury. */
+  claimableFee(line: bigint): Promise<bigint> {
+    return this.read<bigint>("claimable_fee", [scU64(line)]);
   }
 
   /** Read-only: the recorded outcome of a liquidated line (throws if it was never liquidated). */
