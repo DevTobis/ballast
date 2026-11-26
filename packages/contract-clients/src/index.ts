@@ -7,5 +7,5 @@ export { RegistryClient, type RegistryParamChange, type OnChainAssetConfig } fro
 export { PriceGuardClient } from "./price-guard-client.js";
 export { PledgeVaultClient, type OnChainPledgePosition } from "./pledge-vault-client.js";
 export { CreditLineClient, type OpenCreditLineArgs, type LtvView, type OnChainLine, type OnChainLiquidationRecord } from "./credit-line-client.js";
-export { ExitDeskClient, type OnChainExitQuote } from "./exit-desk-client.js";
+export { ExitDeskClient, type OnChainExitQuote, type OnChainExitDeskAssetConfig } from "./exit-desk-client.js";
 export { RepoDvpClient, type RepoProposeTerms, type OnChainRepoMargin, type OnChainRepoTrade } from "./repo-dvp-client.js";

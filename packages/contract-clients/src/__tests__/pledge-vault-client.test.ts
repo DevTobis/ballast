@@ -33,6 +33,16 @@ describe("PledgeVaultClient", () => {
     expect(xdr.length).toBeGreaterThan(0);
   });
 
+  it("cancelPending() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.cancelPending(source, 1n, asset, 500n);
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
+  it("rejectLien() returns non-empty unsigned XDR", async () => {
+    const xdr = await client.rejectLien(source, 1n, asset, 500n, Buffer.from("declined"));
+    expect(xdr.length).toBeGreaterThan(0);
+  });
+
   it("position() simulates a read and normalizes mode and lienRef", async () => {
     stub.restore();
     process.env.STELLAR_SIMULATION_SOURCE = randomAccountId();
