@@ -70,18 +70,31 @@ pub trait PriceGuardInterface {
     fn guarded_price(env: Env, asset: Address) -> GuardedPrice;
 }
 
-/// Cross-contract call to CreditLine's `ltv` view and its `borrower_of` getter. `LtvView` is
-/// redefined locally (see the struct below) rather than imported, since PledgeVault and CreditLine
-/// are decoupled crates by design — they're built together in this pass, so the shape is
-/// hand-kept in sync between the two rather than shared from a common source. That hand-sync is
-/// the wiring compromise called out above.
+/// Cross-contract call to CreditLine's `ltv` view and its small vault-facing getters. `LtvView`
+/// and `LineStatus` are redefined locally (see below) rather than imported, since PledgeVault and
+/// CreditLine are decoupled crates by design — they're built together in this pass, so the shapes
+/// are hand-kept in sync between the two rather than shared from a common source. That hand-sync
+/// is the wiring compromise called out above.
 #[contractclient(name = "CreditLineClient")]
 pub trait CreditLineInterface {
     fn ltv(env: Env, line: u64) -> LtvView;
     fn debt_of(env: Env, line: u64) -> i128;
     fn borrower_of(env: Env, line: u64) -> Address;
+    fn lender_of(env: Env, line: u64) -> Address;
+    fn status_of(env: Env, line: u64) -> LineStatus;
     fn asset_of(env: Env, line: u64) -> Address;
     fn sync_from_vault(env: Env, vault: Address, line: u64, asset: Address, units: i128);
+}
+
+/// Mirrors `ballast_credit_line::LineStatus` variant-for-variant. A unit-only `#[contracttype]`
+/// enum is encoded on the wire as a symbol, not by Rust type name, so a cross-call into
+/// CreditLine's `status_of` decodes correctly into this independently-defined type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LineStatus {
+    Open,
+    Liquidating,
+    Closed,
 }
 
 /// Mirrors `ballast_credit_line::LtvView` field-for-field. Soroban structs are encoded on the
@@ -609,10 +622,11 @@ mod test {
         }
     }
 
-    // A minimal in-crate mock CreditLine exposing just `ltv`/`borrower_of`, returning canned
-    // values — this crate never depends on the real `ballast-credit-line` crate.
+    // A minimal in-crate mock CreditLine exposing just the vault-facing getters
+    // (`ltv`/`debt_of`/`borrower_of`/`lender_of`/`status_of`/`asset_of`), returning canned values —
+    // this crate never depends on the real `ballast-credit-line` crate.
     mod mock_credit_line {
-        use crate::LtvView;
+        use crate::{LineStatus, LtvView};
         use ballast_common::{margin::MarginState, price::PriceStatus};
         use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
@@ -623,6 +637,8 @@ mod test {
         enum DataKey {
             Debt,
             Borrower,
+            Lender,
+            Status,
             Asset,
             Synced,
         }
@@ -635,6 +651,14 @@ mod test {
 
             pub fn set_borrower(env: Env, borrower: Address) {
                 env.storage().instance().set(&DataKey::Borrower, &borrower);
+            }
+
+            pub fn set_lender(env: Env, lender: Address) {
+                env.storage().instance().set(&DataKey::Lender, &lender);
+            }
+
+            pub fn set_status(env: Env, status: LineStatus) {
+                env.storage().instance().set(&DataKey::Status, &status);
             }
 
             pub fn debt_of(env: Env, _line: u64) -> i128 {
@@ -657,6 +681,20 @@ mod test {
                     .instance()
                     .get(&DataKey::Borrower)
                     .expect("mock-credit-line: borrower not set")
+            }
+
+            pub fn lender_of(env: Env, _line: u64) -> Address {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Lender)
+                    .expect("mock-credit-line: lender not set")
+            }
+
+            pub fn status_of(env: Env, _line: u64) -> LineStatus {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Status)
+                    .expect("mock-credit-line: status not set")
             }
 
             pub fn set_asset(env: Env, asset: Address) {
@@ -901,6 +939,83 @@ mod test {
         h.vault.release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
     }
 
+    // ── #192: release validation and price status error paths ────────────────
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: units must be positive")]
+    fn release_of_zero_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.vault.release(&h.borrower, &1, &h.asset, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release exceeds pledged units")]
+    fn release_exceeding_position_units_panics() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.vault.release(&h.borrower, &1, &h.asset, &(1_001 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: price status is not Ok")]
+    fn release_with_debt_on_halted_price_panics() {
+        // Zero-debt releases skip the price check (#1110 / PRD §8 invariant 5),
+        // but any debt requires a usable price (PriceStatus::Ok).
+        let h = setup(500, 100 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Halted);
+        h.vault.release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn release_failure_modes_leave_position_and_token_balances_unchanged() {
+        // Zero-debt releases skip price checks (issue #1110), but when debt > 0,
+        // price must be Ok. For all failed release attempts, state must remain untouched.
+        let h = setup(500, 100 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault.pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 1_000 * PRICE_SCALE);
+
+        // 1. Zero units fails
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &0);
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        // 2. Units exceeding position fails
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &(1_001 * PRICE_SCALE));
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        // 3. Degraded price fails when debt > 0 (issue #1110)
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Degraded);
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+
+        // 4. Halted price fails when debt > 0 (issue #1110)
+        h.price_guard.set_price(&PRICE_SCALE, &ballast_common::price::PriceStatus::Halted);
+        let res = h.vault.try_release(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        assert!(res.is_err());
+        assert_eq!(h.vault.position_units(&1, &h.asset), 1_000 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 1_000 * PRICE_SCALE);
+    }
+
     #[test]
     fn record_lien_and_liquidate_lien_mode() {
         let h = setup(500, 0, PRICE_SCALE);
@@ -941,6 +1056,127 @@ mod test {
             &to,
         );
         assert_eq!(h.vault.position_units(&2, &h.asset), 0);
+    }
+
+    #[test]
+    fn release_in_lien_mode_moves_no_tokens_but_still_syncs() {
+        use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScSymbol, ScVal};
+
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+
+        // Re-point this asset's config at issuer-lien mode for this test.
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 2u64;
+        let pledge_amount = 100 * PRICE_SCALE;
+        h.vault
+            .pledge(&h.borrower, &line_id, &h.asset, &pledge_amount);
+
+        // In lien mode, tokens never enter vault and position_units is 0 pending confirmation
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+        assert_eq!(h.vault.position_units(&line_id, &h.asset), 0);
+
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-release-test");
+        h.vault
+            .record_lien(&gateway, &line_id, &h.asset, &pledge_amount, &lien_ref);
+        assert_eq!(h.vault.position_units(&line_id, &h.asset), 100 * PRICE_SCALE);
+        assert_eq!(h.credit_line.synced_units(), 100 * PRICE_SCALE);
+
+        // Release 40 units in lien mode
+        let release_amount = 40 * PRICE_SCALE;
+        h.vault
+            .release(&h.borrower, &line_id, &h.asset, &release_amount);
+
+        // Assert released event emitted (read immediately before subsequent calls reset event log)
+        let events = h
+            .env
+            .events()
+            .all()
+            .events()
+            .into_iter()
+            .filter(|e| e.type_ == ContractEventType::Contract)
+            .cloned()
+            .collect::<std::vec::Vec<_>>();
+        let last_event = events.last().expect("expected released event");
+        let expected_t0 = ScVal::Symbol(ScSymbol("released".try_into().unwrap()));
+        let expected_t1 = ScVal::U64(line_id);
+        let val: soroban_sdk::Val = (h.asset.clone(), release_amount).into_val(&h.env);
+        let expected_data = ScVal::try_from_val(&h.env, &val).unwrap();
+        match &last_event.body {
+            ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.get(0), Some(&expected_t0));
+                assert_eq!(v0.topics.get(1), Some(&expected_t1));
+                assert_eq!(v0.data, expected_data);
+            }
+        }
+
+        // Assert borrower token balance still 0, vault token balance 0
+        assert_eq!(h.token.balance(&h.borrower), 0);
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+        // position_units == 60
+        assert_eq!(h.vault.position_units(&line_id, &h.asset), 60 * PRICE_SCALE);
+        // synced_units() == 60
+        assert_eq!(h.credit_line.synced_units(), 60 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release exceeds pledged units")]
+    fn release_in_lien_mode_cannot_exceed_confirmed_units_when_pending() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 2u64;
+        h.vault
+            .pledge(&h.borrower, &line_id, &h.asset, &(100 * PRICE_SCALE));
+        // Confirmed units is 0, 100 pending. Release cannot exceed confirmed (0)
+        h.vault
+            .release(&h.borrower, &line_id, &h.asset, &(1 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "pledge-vault: release exceeds pledged units")]
+    fn release_in_lien_mode_cannot_exceed_confirmed_units_after_partial_record() {
+        let h = setup(500, 0, PRICE_SCALE);
+        let gateway = Address::generate(&h.env);
+        h.vault.set_gateway(&h.admin, &gateway);
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        let line_id = 2u64;
+        h.vault
+            .pledge(&h.borrower, &line_id, &h.asset, &(100 * PRICE_SCALE));
+        let lien_ref = Bytes::from_slice(&h.env, b"lien-ref-partial");
+        h.vault
+            .record_lien(&gateway, &line_id, &h.asset, &(50 * PRICE_SCALE), &lien_ref);
+        // Confirmed is 50, trying to release 51 must panic
+        h.vault
+            .release(&h.borrower, &line_id, &h.asset, &(51 * PRICE_SCALE));
     }
 
     #[test]
@@ -1747,5 +1983,243 @@ mod test {
         assert_eq!(confirmed.pending_lien_units, 150 * PRICE_SCALE);
         assert_eq!(confirmed.mode, CustodyMode::IssuerLien);
         assert_eq!(confirmed.lien_ref, Some(lien_ref));
+    }
+
+    // TODO: set these flags through a real on-chain pause entry point once pause wiring lands.
+    // `pledge-vault` has no pause writer today, so the tests set the flag directly via
+    // `as_contract`; see the dead-pause-flag entry-point bugs #30/#32 and the open pause-reach
+    // tracking issue #210.
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pledge_panics_while_pledges_scope_paused() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, true);
+        });
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: paused")]
+    fn pledge_panics_while_all_scope_paused() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::All, true);
+        });
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    fn release_and_liquidate_keep_working_while_pledges_paused() {
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, true);
+        });
+
+        // Release is risk-reducing (invariant 4): it must not be pause-gated.
+        h.vault
+            .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 950 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 50 * PRICE_SCALE);
+
+        // Liquidation is enforcement (invariant 5): it must not be pause-gated either.
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+        assert_eq!(h.token.balance(&lender), 400 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 550 * PRICE_SCALE);
+
+        // New pledges stay blocked while the flag is set.
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        }));
+        assert!(blocked.is_err(), "pledge must stay paused");
+    }
+
+    #[test]
+    fn release_and_liquidate_keep_working_while_all_paused() {
+        let h = setup(500, 500 * PRICE_SCALE, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(1_000 * PRICE_SCALE));
+
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::All, true);
+        });
+
+        h.vault
+            .release(&h.borrower, &1, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 950 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&h.borrower), 50 * PRICE_SCALE);
+
+        let lender = Address::generate(&h.env);
+        h.vault
+            .liquidate(&h.keeper, &1, &h.asset, &(400 * PRICE_SCALE), &lender);
+        assert_eq!(h.token.balance(&lender), 400 * PRICE_SCALE);
+        assert_eq!(h.vault.position_units(&1, &h.asset), 550 * PRICE_SCALE);
+
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .pledge(&h.borrower, &1, &h.asset, &(10 * PRICE_SCALE));
+        }));
+        assert!(blocked.is_err(), "pledge must stay paused under All");
+    }
+
+    #[test]
+    fn pledge_resumes_after_the_pause_flag_is_cleared() {
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(1_000 * PRICE_SCALE));
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, true);
+        });
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.vault
+                .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        }));
+        assert!(blocked.is_err(), "pledge must be refused while paused");
+
+        h.env.as_contract(&h.vault.address, || {
+            pause::set_paused(&h.env, &PauseScope::Pledges, false);
+        });
+        h.vault
+            .pledge(&h.borrower, &1, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&1, &h.asset), 100 * PRICE_SCALE);
+    }
+
+    // ── B-0184: pledge accumulation & custody-mode flip on empty position ────────────────────────
+
+    /// (1) Two escrow pledges must sum into `position_units`.
+    ///
+    /// A borrower pledges 100 units then 50 units to the same `(line, asset)` position in escrow
+    /// mode. After the second pledge `position_units` must equal 150; the vault must hold the
+    /// combined balance.
+    #[test]
+    fn escrow_pledges_accumulate() {
+        let h = setup(500, 0, PRICE_SCALE);
+        // Mint enough for both pledges.
+        h.token.mint(&h.borrower, &(150 * PRICE_SCALE));
+
+        h.vault.pledge(&h.borrower, &10, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&10, &h.asset),
+            100 * PRICE_SCALE,
+            "after first pledge: 100"
+        );
+
+        h.vault.pledge(&h.borrower, &10, &h.asset, &(50 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&10, &h.asset),
+            150 * PRICE_SCALE,
+            "after second pledge: 150"
+        );
+        // Vault balance matches.
+        assert_eq!(h.token.balance(&h.vault.address), 150 * PRICE_SCALE);
+        // Borrower's balance is fully consumed.
+        assert_eq!(h.token.balance(&h.borrower), 0);
+    }
+
+    /// (2) Two `IssuerLien` pledges must accumulate in `pending_lien_units`; `position_units`
+    /// stays zero because no gateway has confirmed either lien yet.
+    ///
+    /// Reads `position(line, asset).pending_lien_units` rather than reaching into storage with `as_contract`.
+    #[test]
+    fn lien_pledges_accumulate_in_pending() {
+        let h = setup(500, 0, PRICE_SCALE);
+
+        // Switch the asset to issuer-lien mode.
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        // No token transfer expected; no mint needed.
+        h.vault.pledge(&h.borrower, &20, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&20, &h.asset),
+            0,
+            "lien pledge should NOT yet count toward LTV"
+        );
+        assert_eq!(
+            h.vault.position(&20, &h.asset).pending_lien_units,
+            100 * PRICE_SCALE,
+            "first lien pledge lands in pending"
+        );
+
+        h.vault.pledge(&h.borrower, &20, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&20, &h.asset),
+            0,
+            "still zero — gateway has not confirmed"
+        );
+        assert_eq!(
+            h.vault.position(&20, &h.asset).pending_lien_units,
+            200 * PRICE_SCALE,
+            "two lien pledges → 200 pending"
+        );
+        // Vault must hold no tokens in lien mode.
+        assert_eq!(h.token.balance(&h.vault.address), 0);
+    }
+
+    /// (3) A position that has been fully released (units == 0, pending_lien_units == 0) must
+    /// allow the asset's custody mode to be changed, and a subsequent pledge in the new mode
+    /// must succeed.
+    ///
+    /// Flow: pledge 100 in Escrow → release 100 → reconfigure to IssuerLien → pledge 100.
+    #[test]
+    fn mode_flip_allowed_on_empty_position() {
+        // Zero debt so the full release passes the LTV health check.
+        let h = setup(500, 0, PRICE_SCALE);
+        h.token.mint(&h.borrower, &(100 * PRICE_SCALE));
+
+        // Step 1: pledge in escrow mode.
+        h.vault.pledge(&h.borrower, &30, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&30, &h.asset), 100 * PRICE_SCALE);
+
+        // Step 2: fully release — position is now empty.
+        h.vault.release(&h.borrower, &30, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(h.vault.position_units(&30, &h.asset), 0);
+        assert_eq!(
+            h.vault.position(&30, &h.asset).pending_lien_units,
+            0,
+            "pending must also be zero after full escrow release"
+        );
+
+        // Step 3: reconfigure to IssuerLien — allowed because position is empty.
+        h.vault.configure_asset(
+            &h.admin,
+            &h.asset,
+            &h.price_guard.address,
+            &h.credit_line.address,
+            &500,
+            &h.thresholds,
+            &CustodyMode::IssuerLien,
+        );
+
+        // Step 4: pledge in the new mode must succeed; units go into pending, not position.units.
+        h.vault.pledge(&h.borrower, &30, &h.asset, &(100 * PRICE_SCALE));
+        assert_eq!(
+            h.vault.position_units(&30, &h.asset),
+            0,
+            "lien pledge: position_units still zero"
+        );
+        assert_eq!(
+            h.vault.position(&30, &h.asset).pending_lien_units,
+            100 * PRICE_SCALE,
+            "lien pledge after mode flip: 100 pending"
+        );
     }
 }
