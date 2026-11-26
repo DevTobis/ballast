@@ -102,8 +102,9 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   through the timelocked `queue_param` path instead.
 - **Pause is immediate, unpause is timelocked.** `pause` (pauser-only,
   `contracts/registry/src/lib.rs:288`) sets a scope flag with no delay; lifting it goes through
-  `queue_unpause` / `execute_unpause` (48h). `All` is a virtual override read by `is_paused`, not a
-  stored per-scope flag (`contracts/common/src/pause.rs:69`).
+  `queue_unpause` / `execute_unpause` (48h). `All` is a stored flag of its own
+  (`PauseDataKey::Paused(All)`, written by `set_paused`), and `is_paused` checks it before the
+  scope's own flag (`contracts/common/src/pause.rs:62-75`).
 - **Registry's pause flags and asset parameters are not read at runtime by the other contracts.**
   Each contract keeps an admin-configured local copy of its asset config (`configure_asset`) and
   reads pause flags from its *own* instance storage; `Registry::pause` writes only Registry's
