@@ -11,8 +11,67 @@ so they match what a real liquidation would use. The result is compared with the
 
 On a change it inserts a `margin_event` (`from_state`, `to_state`, `ltv_bps`, and the newest `price_snapshot`
 for the first pledged asset of the line, if any) and logs it. Moving to `MarginCall` or `Liquidation` also
-fires a `margin_call` alert. An unchanged state writes nothing. A failure on one line is logged and the
-other lines are still checked.
+fires a `margin_call` alert. Recovering from an unhealthy state (`MarginCall` or `Liquidation`) back into
+`Healthy` or `Warning` fires a `margin_recovered` alert. An unchanged state writes nothing. A failure on one
+line is logged and the other lines are still checked.
+
+## Timing and Cure Window Latency
+
+### Detection Latency
+The margin monitor runs a continuous polling loop (`MARGIN_MONITOR_POLL_MS`, default 15,000 ms / 15 seconds).
+- **Worst-case detection latency**: `MARGIN_MONITOR_POLL_MS` + duration of the polling pass across all open credit lines.
+- During quiet conditions, a collateral shortfall or price drop is detected within seconds of the price snapshot being published.
+
+### Relationship to the Cure Window
+The keeper's `cure-expiry` liquidation job explicitly uses the monitor's `margin_event.created_at` timestamp as the start of the borrower's cure clock (`breachStart = event.createdAt` in `services/keeper/src/jobs/cureExpiry.ts:94-98`):
+- If the margin monitor is delayed, stopped, or experiencing slow poll passes, the `created_at` timestamp is recorded later than the true on-chain price breach.
+- Consequently, **any monitor delay directly extends the effective cure window** afforded to the borrower before liquidation can be triggered on-chain.
+
+### Choosing MARGIN_MONITOR_POLL_MS vs. cureWindowS
+- Keep `MARGIN_MONITOR_POLL_MS` significantly smaller (e.g. 15–30 seconds) than contractual line cure windows (`cureWindowS`, typically hours or days).
+- If poll duration grows as line volume scales, monitor metrics and tune `MARGIN_MONITOR_POLL_MS` to ensure detection lag remains a negligible fraction of `cureWindowS`.
+
+## Alerts and Webhook Delivery
+
+When a credit line transitions into `MarginCall` or `Liquidation`, the monitor fires a `margin_call` alert via `@ballast/observability`. Alerts are logged to stdout and posted as JSON to `ALERT_WEBHOOK_URL` (if configured).
+
+### Sample Payload
+
+```json
+{
+  "text": "[ballast/margin-monitor] margin_call (line-f47ac10b)",
+  "content": "[ballast/margin-monitor] margin_call (line-f47ac10b)",
+  "service": "margin-monitor",
+  "kind": "margin_call",
+  "context": {
+    "creditLineId": "line-f47ac10b",
+    "state": "MarginCall",
+    "ltvBps": 8500
+  },
+  "at": "2026-10-15T12:00:00.000Z"
+}
+```
+
+- `text`: Alert summary for Slack-compatible integrations.
+- `content`: Alert summary for Discord-compatible integrations.
+- `service`: `"margin-monitor"`.
+- `kind`: `"margin_call"`.
+- `context`:
+  - `creditLineId`: The database UUID of the credit line.
+  - `state`: The contract margin state (`"MarginCall"` or `"Liquidation"`).
+  - `ltvBps`: The loan-to-value ratio in basis points (e.g. `8500` = 85.00%).
+- `at`: ISO 8601 timestamp of alert generation.
+
+### Cooldown and Deduplication Rule
+
+- **Cooldown window**: Defined by `ALERT_COOLDOWN_S` (default `900` seconds / 15 minutes).
+- **Dedupe key**: Formatted as `${kind}:${creditLineId}:${state}` (e.g. `margin_call:line-f47ac10b:MarginCall`).
+- **Suppression**: Repeated alerts for the same line in the same state within the cooldown window are suppressed from webhook dispatch (always logged to console).
+- **Escalation**: Because the target state is included in the dedupe key, a line escalating from `MarginCall` to `Liquidation` within 15 minutes generates a distinct key (`margin_call:line-f47ac10b:Liquidation`) and is delivered immediately without being suppressed by the previous warning (see [#53](https://github.com/DevTobis/ballast/issues/53)).
+
+### Current Limitations
+
+- **Summary Text Headline**: The outer `text` and `content` fields format as `[ballast/margin-monitor] margin_call (<creditLineId>)` and do not include the specific target state in the text string itself. Downstream consumers and notification parsers must inspect `context.state` (or `context.ltvBps`) to distinguish between an initial `MarginCall` and an urgent `Liquidation` escalation. The escalation itself is no longer swallowed by the cooldown, because the state is part of the dedupe key (#53).
 
 ## How it connects to the rest
 

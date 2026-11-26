@@ -9,7 +9,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key; withdraw ExitDesk's **own** USDC float and RWA inventory (see [ExitDesk](#exitdesk)); change the parameters listed in [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value), most of them immediately | transfer a borrower's pledged collateral, a lender's committed USDC or a repo party's cash or collateral (see [RepoDvP](#repodvp)) directly: CreditLine, PledgeVault and RepoDvp have no `admin_withdraw`/sweep, and every transfer of those funds needs the owning party's auth or a keeper path; sign for a borrower or lender |
 | `pauser` | pause exits on ExitDesk and new repo activity on RepoDvp, each through that contract's own `pause`; set Registry's own flags (not read by any other contract, see #210) | pause repayment, release or withdrawal paths (invariant 5); pause draws or pledges (CreditLine and PledgeVault have no `pause`, #210) |
-| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
+| `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close`/`default_at_maturity` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
 
@@ -62,6 +62,7 @@ no timelock, and applies to positions that are already open.
 | PriceGuard | `configure_asset`, `queue_config` | bands, window, staleness | when a price is `Ok`, `Degraded` or `Halted` | tightening immediate; loosening 48h via `queue_config` |
 | PriceGuard | `remove_source` | a source name | which sources the median uses | none |
 | PriceGuard | `configure_source` | a source name and `enabled` | which names `publish_source` accepts and the median counts (the allowlist, #84); `issuer` is reserved for `publish_nav` | none |
+| PriceGuard | `configure_source_staleness`, `queue_config` | per-source staleness window | how long a source's reading keeps counting in the median (#86) | tightening immediate; widening or clearing 48h via `queue_config` |
 | PriceGuard | `configure_signature_requirement` | NAV signature on/off | whether unsigned NAV is accepted | turning it on immediate; turning it off 48h via `queue_config` |
 | Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
 
@@ -118,8 +119,10 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 | `configure_asset` | Admin | Dynamic | Intended | Initial asset onboarding and tightening safety bands (narrower price band, shorter max staleness) take effect immediately to enhance security. Loosening bands requires 48h timelock via `queue_config` to prevent stealth weakening of outlier defenses. |
 | `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. |
 | `configure_signature_requirement` | Admin | Dynamic | Intended | Requiring signatures (`required = true`) strengthens security and takes effect immediately. Turning an existing requirement off (`true` → `false`) relaxes security and must go through the 48h timelock via `queue_config`. Exception: if the flag has never been set, the first call applies immediately even with `required = false` (`contracts/price-guard/src/lib.rs`, `configure_signature_requirement`). |
-| `remove_source` | Admin | Immediate | Intended / Open Gap (#84) | Immediate removal allows admins to drop an exploited, manipulated, or failing oracle source. Open issue [#84](https://github.com/DevTobis/ballast/issues/84) tracks adding an admin allowlist of valid sources. |
-| `queue_config` | Admin | 48h timelock | Intended | Queues loosening configuration changes (`Asset`, `IssuerPubKey`, `SignatureRequirement`) with 48h delay. |
+| `configure_source` | Admin | Immediate | Intended | Source allowlist (#84): `publish_source` rejects any name not enabled for the asset, so one feed cannot be counted twice under two spellings. Enabling or disabling a name applies at once and re-evaluates the price; `issuer` is reserved for `publish_nav`. |
+| `remove_source` | Admin | Immediate | Intended | Drops a source's reading, its allowlist entry and any staleness override at once, so an exploited, manipulated or failing feed stops counting in the median immediately. |
+| `configure_source_staleness` | Admin | Dynamic | Intended | Per-source staleness window (#86). Tightening (a positive window no larger than the source's current one) applies immediately. Widening a window or clearing an override keeps old readings counting for longer, so it requires the 48h timelock via `queue_config(SourceMaxStaleness)`. |
+| `queue_config` | Admin | 48h timelock | Intended | Queues loosening configuration changes (`Asset` and its fields, `IssuerPubKey`, `RequireNavSignature`, `SourceMaxStaleness`) with 48h delay. |
 | `cancel_config` | Admin | Immediate | Intended | Safely cancels an unexecuted queued config change. |
 | `execute_config` | Anyone | 48h after queue | Intended | Applies queued loosening configurations once the 48h delay has elapsed. |
 | `confirm_halt_cleared` | Risk | Immediate | Intended / Open Gap (#807) | Circuit breaker unlatch. When a large price jump trips the circuit breaker, the price locks at `LastGood`. Once human risk operators verify off-chain conditions, unlatching must be immediate to restore trading. Open issue [#807](https://github.com/DevTobis/ballast/issues/807) tracks missing validations when asset is not halted or not configured. |
@@ -266,7 +269,9 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
   closes the line. The lender cannot choose the price, understate the collateral, or close while
   collateral remains in the vault, but **can choose when to close**; until they do the line stays
-  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close.
+  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
+  (no principal, interest, fee or funding left) can be closed by its lender or borrower with
+  `close`; `close` refuses a `Liquidating` line, so it cannot bypass `close_liquidated` (#130).
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.

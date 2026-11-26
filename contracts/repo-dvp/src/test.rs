@@ -244,6 +244,54 @@ fn propose(h: &Harness, units: i128, cash_amount: i128, rate_bps: u32, maturity_
     )
 }
 
+#[test]
+fn propose_emits_propose_event() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{IntoVal, TryFromVal};
+
+    let h = setup();
+    let units = 100 * PRICE_SCALE;
+    let cash_amount = 90 * PRICE_SCALE;
+    let maturity = h.env.ledger().timestamp() + 3_600;
+
+    let id = RepoDvpClient::new(&h.env, &h.repo).propose(
+        &h.cash_lender,
+        &h.cash_borrower,
+        &h.rwa,
+        &units,
+        &cash_amount,
+        &500u32,
+        &RepoKind::Intraday,
+        &maturity,
+        &hash(&h, 7),
+    );
+
+    let events = h.env.events().all();
+    let repo_events = events.filter_by_contract(&h.repo);
+    let last = repo_events.events().last().expect("expected event from repo-dvp");
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("propose"), id).into_val(&h.env);
+    let expected_topics_xdr: soroban_sdk::xdr::ScVec = expected_topics.into();
+    let expected_data: (Address, Address, Address, i128, i128, u64) = (
+        h.cash_lender.clone(),
+        h.cash_borrower.clone(),
+        h.rwa.clone(),
+        units,
+        cash_amount,
+        maturity,
+    );
+    let data_val: soroban_sdk::Val = expected_data.into_val(&h.env);
+    let expected_data_xdr = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data_val)
+        .expect("failed to convert expected data to ScVal");
+
+    match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(body) => {
+            assert_eq!(body.topics, expected_topics_xdr.into(), "topic mismatch");
+            assert_eq!(body.data, expected_data_xdr, "data mismatch");
+        }
+    }
+}
+
 // --- #216: a repo's term has to fit its kind, and its rate has a ceiling -------------------
 
 /// Proposes 100 units against 90 cash with the given kind and rate, maturing `term_seconds`
@@ -2619,6 +2667,139 @@ mod storage_lifetime {
         extends_the_instance(&h, |repo| repo.call_margin(&h.keeper, &id));
         let trade = RepoDvpClient::new(&h.env, &h.repo).trade(&id);
         assert!(!trade.pending_margin_call);
+    }
+
+    #[test]
+    fn admin_entry_points_emit_events() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup();
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+
+        // 1. set_usdc emits (usdc,) event
+        let alt_usdc = Address::generate(&h.env);
+        repo.set_usdc(&h.admin, &alt_usdc);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("usdc"));
+            let data: (Option<Address>, Address) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, Some(h.usdc.clone()));
+            assert_eq!(data.1, alt_usdc);
+        }
+
+        // 2. set_cure_grace emits (curegrace,) event
+        let new_grace = 3_600u64;
+        repo.set_cure_grace(&h.admin, &new_grace);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("curegrace"));
+            let data: (u64, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, MARGIN_CURE_GRACE_SECONDS);
+            assert_eq!(data.1, new_grace);
+        }
+
+        // 3. configure_asset emits (cfgasset, asset) event
+        let new_asset = Address::generate(&h.env);
+        let new_guard = Address::generate(&h.env);
+        let thresholds = MarginThresholds {
+            warning_bps: 6_000,
+            margin_call_bps: 7_500,
+            liquidation_bps: 9_000,
+        };
+        repo.configure_asset(
+            &h.admin,
+            &new_asset,
+            &new_guard,
+            &400,
+            &thresholds,
+            &(1_000 * PRICE_SCALE),
+            &(30 * 24 * 60 * 60),
+        );
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            let topic1 = Address::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("cfgasset"));
+            assert_eq!(topic1, new_asset);
+            let data: (Address, u32, MarginThresholds, i128, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, new_guard);
+            assert_eq!(data.1, 400);
+            assert_eq!(data.2.warning_bps, thresholds.warning_bps);
+            assert_eq!(data.2.margin_call_bps, thresholds.margin_call_bps);
+            assert_eq!(data.2.liquidation_bps, thresholds.liquidation_bps);
+            assert_eq!(data.3, 1_000 * PRICE_SCALE);
+            assert_eq!(data.4, 30 * 24 * 60 * 60);
+        }
+
+        // 4. set_maturity_grace emits (matgrace,) event with (old, new)
+        repo.set_maturity_grace(&h.admin, &7_200);
+        {
+            let events = h.env.events().all().filter_by_contract(&h.repo);
+            let items = events.events();
+            let last = items.last().expect("must have event");
+            let body = match &last.body {
+                soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+            };
+            let topic0 = Symbol::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(topic0, symbol_short!("matgrace"));
+            let data: (u64, u64) = TryFromVal::try_from_val(
+                &h.env,
+                &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(data.0, DEFAULT_MATURITY_GRACE_SECONDS);
+            assert_eq!(data.1, 7_200);
+        }
     }
 }
 

@@ -58,6 +58,11 @@ describe("CreditLineClient", () => {
     expect(result).toBeDefined();
   });
 
+  it("owed() simulates a read and does not throw", async () => {
+    const result = await client.owed(1n);
+    expect(result).toBeDefined();
+  });
+
   it("debtOf() simulates a read and does not throw", async () => {
     const result = await client.debtOf(1n);
     expect(result).toBeDefined();

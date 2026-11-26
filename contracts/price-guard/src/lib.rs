@@ -107,6 +107,10 @@ pub enum ConfigChange {
     Asset(Address, u32, u32, u64, u32, u64),
     IssuerPubKey(Address, BytesN<32>),
     RequireNavSignature(bool),
+    /// Per-source staleness window (issue #86): `(asset, source name, seconds)`. `0` clears the
+    /// override so the source falls back to the asset's `max_staleness_s`. Widening a window or
+    /// clearing it must go through `queue_config`; `configure_source_staleness` only tightens.
+    SourceMaxStaleness(Address, Symbol, u64),
 }
 
 #[contracttype]
@@ -157,6 +161,9 @@ enum DataKey {
     PendingConfig(u64),
     /// Admin-managed source allowlist flag per (asset, source-name) (issue #84).
     SourceAllowed(Address, Symbol),
+    /// Per-source max staleness override in seconds for (asset, source-name) (issue #86). When
+    /// absent, the asset's `max_staleness_s` applies.
+    SourceMaxStaleness(Address, Symbol),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -311,6 +318,32 @@ fn read_all_sources(env: &Env, asset: &Address) -> Vec<PriceSource> {
     out
 }
 
+fn read_source_staleness(env: &Env, asset: &Address, name: &Symbol) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SourceMaxStaleness(asset.clone(), name.clone()))
+}
+
+/// The staleness window `evaluate` applies to `name`: its override if one is set, otherwise the
+/// asset's `max_staleness_s` (issue #86).
+fn effective_source_staleness(
+    env: &Env,
+    asset: &Address,
+    name: &Symbol,
+    config: &AssetGuardConfig,
+) -> u64 {
+    read_source_staleness(env, asset, name).unwrap_or(config.max_staleness_s)
+}
+
+fn write_source_staleness(env: &Env, asset: &Address, name: &Symbol, max_staleness_s: u64) {
+    let key = DataKey::SourceMaxStaleness(asset.clone(), name.clone());
+    if max_staleness_s > 0 {
+        env.storage().instance().set(&key, &max_staleness_s);
+    } else {
+        env.storage().instance().remove(&key);
+    }
+}
+
 fn is_fresh(env: &Env, source: &PriceSource, max_staleness_s: u64) -> bool {
     let now = env.ledger().timestamp();
     // A reading dated in the future is not "zero seconds old": `saturating_sub` would otherwise
@@ -458,7 +491,8 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         if !is_source_allowed(env, &asset, &source.name) {
             continue;
         }
-        if is_fresh(env, &source, config.max_staleness_s) {
+        let max_staleness_s = effective_source_staleness(env, &asset, &source.name, &config);
+        if is_fresh(env, &source, max_staleness_s) {
             fresh_values.push_back(source.value);
             fresh_sources.push_back(source.clone());
         }
@@ -881,6 +915,48 @@ impl PriceGuard {
         is_source_allowed(&env, &asset, &name)
     }
 
+    /// Admin-only. Sets a per-source staleness window for `name` on `asset` (issue #86), e.g. a
+    /// daily issuer NAV next to a feed that updates every few minutes. Applies immediately only
+    /// when it **tightens**: `max_staleness_s` must be positive and no larger than the window the
+    /// source has now (its override, or the asset's `max_staleness_s`). A wider window keeps old
+    /// readings counting for longer, which is loosening, so it goes through
+    /// `queue_config(ConfigChange::SourceMaxStaleness(..))` and the 48h timelock, the same as
+    /// `configure_asset`; so does clearing an override (`0`).
+    pub fn configure_source_staleness(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        name: Symbol,
+        max_staleness_s: u64,
+    ) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        let config = read_config(&env, &asset);
+        assert!(
+            max_staleness_s > 0,
+            "price-guard: clearing a source staleness window requires queue_config"
+        );
+        assert!(
+            max_staleness_s <= effective_source_staleness(&env, &asset, &name, &config),
+            "price-guard: widening a source staleness window requires queue_config"
+        );
+
+        write_source_staleness(&env, &asset, &name, max_staleness_s);
+        env.events().publish(
+            (Symbol::new(&env, "source_staleness_set"), asset.clone()),
+            (name, max_staleness_s),
+        );
+
+        evaluate(&env, asset);
+    }
+
+    /// The per-source staleness override for `name` on `asset`, or `None` when the asset's
+    /// `max_staleness_s` applies (issue #86).
+    pub fn source_staleness(env: Env, asset: Address, name: Symbol) -> Option<u64> {
+        read_source_staleness(&env, &asset, &name)
+    }
+
     /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
     /// for `asset`. Unknown name removal is a safe no-op.
     pub fn remove_source(env: Env, admin: Address, asset: Address, name: Symbol) {
@@ -892,6 +968,9 @@ impl PriceGuard {
         env.storage()
             .instance()
             .remove(&DataKey::SourceAllowed(asset.clone(), name.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::SourceMaxStaleness(asset.clone(), name.clone()));
         remove_source_internal(&env, &asset, &name);
 
         env.events().publish(
@@ -1035,6 +1114,10 @@ impl PriceGuard {
                 env.storage()
                     .instance()
                     .set(&DataKey::RequireNavSignature, &val);
+            }
+            ConfigChange::SourceMaxStaleness(asset, name, val) => {
+                read_config(&env, &asset);
+                write_source_staleness(&env, &asset, &name, val);
             }
         }
         env.storage().persistent().remove(&key);
@@ -3722,6 +3805,172 @@ mod test {
         let price_after = client.guarded_price(&asset);
         assert_eq!(price_after.status, PriceStatus::Degraded);
         assert_eq!(price_after.sources.len(), 1);
+    }
+
+    // --- per-source staleness windows (issue #86) --------------------------------------------
+
+    /// Moves the ledger past the 48h config timelock.
+    fn pass_timelock(env: &Env) {
+        env.ledger().with_mut(|l| {
+            l.timestamp += ballast_common::timelock::TIMELOCK_DELAY_SECONDS + 1;
+            l.sequence_number += 35_000;
+        });
+    }
+
+    #[test]
+    fn per_source_staleness_long_window_nav_and_short_window_feed() {
+        // Asset default 3,600s. The daily NAV gets 24h (a widening, so timelocked); the fast feed
+        // gets 30m (a tightening, so immediate).
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let issuer_name = Symbol::new(&env, ISSUER_SOURCE);
+        let feed_name = feed(&env);
+
+        let id = client.queue_config(
+            &admin,
+            &ConfigChange::SourceMaxStaleness(asset.clone(), issuer_name.clone(), 86_400),
+        );
+        pass_timelock(&env);
+        client.execute_config(&id);
+        client.configure_source_staleness(&admin, &asset, &feed_name, &1_800);
+        assert_eq!(client.source_staleness(&asset, &issuer_name), Some(86_400));
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(1_800));
+
+        let base_ts = env.ledger().timestamp();
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &base_ts, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &base_ts);
+
+        // Age 1,000s: both fresh -> Ok.
+        env.ledger().set_timestamp(base_ts + 1_000);
+        let p = client.guarded_price(&asset);
+        assert_eq!(p.status, PriceStatus::Ok);
+        assert_eq!(p.sources.len(), 2);
+
+        // Age 2,500s: the feed (> 1,800s) is stale, the NAV (<= 86,400s) is not -> Degraded.
+        env.ledger().set_timestamp(base_ts + 2_500);
+        let p = client.guarded_price(&asset);
+        assert_eq!(p.status, PriceStatus::Degraded);
+        assert_eq!(p.sources.len(), 1);
+        assert_eq!(p.sources.get(0).unwrap().name, issuer_name);
+
+        // Age 90,000s: both stale.
+        env.ledger().set_timestamp(base_ts + 90_000);
+        let p = client.guarded_price(&asset);
+        assert_eq!(p.status, PriceStatus::Degraded);
+        assert_eq!(p.sources.len(), 0);
+    }
+
+    #[test]
+    fn per_source_staleness_tightening_applies_at_once_down_to_the_effective_window() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let feed_name = feed(&env);
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
+
+        // Exactly the asset default is not a widening, so it is accepted immediately.
+        client.configure_source_staleness(&admin, &asset, &feed_name, &3_600);
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(3_600));
+        client.configure_source_staleness(&admin, &asset, &feed_name, &600);
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(600));
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: widening a source staleness window requires queue_config")]
+    fn per_source_staleness_widening_past_the_asset_default_is_refused() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        client.configure_source_staleness(&admin, &asset, &feed(&env), &3_601);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: widening a source staleness window requires queue_config")]
+    fn per_source_staleness_widening_a_tightened_override_is_refused() {
+        // Once tightened to 600s, going back up to 1,800s (still under the asset default) is a
+        // widening relative to what the source has now, so it is timelocked too.
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let feed_name = feed(&env);
+        client.configure_source_staleness(&admin, &asset, &feed_name, &600);
+        client.configure_source_staleness(&admin, &asset, &feed_name, &1_800);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: clearing a source staleness window requires queue_config")]
+    fn per_source_staleness_direct_clear_is_refused() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let feed_name = feed(&env);
+        client.configure_source_staleness(&admin, &asset, &feed_name, &600);
+        client.configure_source_staleness(&admin, &asset, &feed_name, &0);
+    }
+
+    #[test]
+    fn per_source_staleness_queued_widening_and_clear_apply_after_the_timelock() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let feed_name = feed(&env);
+
+        let widen = client.queue_config(
+            &admin,
+            &ConfigChange::SourceMaxStaleness(asset.clone(), feed_name.clone(), 7_200),
+        );
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.execute_config(&widen);
+        }));
+        assert!(early.is_err(), "early execution must fail");
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
+
+        pass_timelock(&env);
+        client.execute_config(&widen);
+        assert_eq!(client.source_staleness(&asset, &feed_name), Some(7_200));
+
+        // At age 4,000s the feed is fresh under its 7,200s window but the NAV (asset default
+        // 3,600s) is stale.
+        let base_ts = env.ledger().timestamp();
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &base_ts, &sig);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &base_ts);
+        env.ledger().set_timestamp(base_ts + 4_000);
+        let p = client.guarded_price(&asset);
+        assert_eq!(p.sources.len(), 1);
+        assert_eq!(p.sources.get(0).unwrap().name, feed_name);
+
+        // Clearing the override (0) is queued too, and drops the feed back to 3,600s.
+        let clear = client.queue_config(
+            &admin,
+            &ConfigChange::SourceMaxStaleness(asset.clone(), feed_name.clone(), 0),
+        );
+        pass_timelock(&env);
+        client.execute_config(&clear);
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_source_staleness() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let feed_name = feed(&env);
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "configure_source_staleness",
+                    args: (&stranger, &asset, &feed_name, 600u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_configure_source_staleness(&stranger, &asset, &feed_name, &600);
+        assert!(res.is_err(), "non-admin must not configure source staleness");
+    }
+
+    #[test]
+    fn remove_source_clears_its_staleness_override() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let feed_name = feed(&env);
+        client.configure_source_staleness(&admin, &asset, &feed_name, &600);
+        client.remove_source(&admin, &asset, &feed_name);
+        assert_eq!(client.source_staleness(&asset, &feed_name), None);
     }
 
     mod invariants;
