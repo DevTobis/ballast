@@ -6,15 +6,6 @@ import type { ChainGateway } from "../chain.js";
 import type { ContractClients } from "../contract-clients.js";
 import { recordIntent, withTransaction } from "../intents.js";
 import {
-  closeLiquidationRouteSchema,
-  createDrawRouteSchema,
-  createPledgeRouteSchema,
-  createRepaymentRouteSchema,
-  fundCreditLineRouteSchema,
-  openCreditLineRouteSchema,
-  withdrawRouteSchema,
-} from "../openapi.js";
-import {
   createDrawSchema,
   createPledgeSchema,
   createRepaymentSchema,
@@ -32,7 +23,7 @@ export function registerCreditLineRoutes(
   contracts: ContractClients,
   chain: ChainGateway,
 ): void {
-  app.post("/v1/credit-lines", { schema: openCreditLineRouteSchema as any }, async (request, reply) => {
+  app.post("/v1/credit-lines", async (request, reply) => {
     const body = openCreditLineSchema.parse(request.body);
     if (body.lenderId !== request.partyId) {
       return reply.code(403).send({ error: "a credit line can only be opened by its own lender" });
@@ -48,6 +39,7 @@ export function registerCreditLineRoutes(
       asset: body.asset,
       limit: body.limit,
       rateBps: body.rateBps,
+      feeBps: body.feeBps,
       cureS: body.cureWindowS,
       agreementHash: body.agreementHash,
     });
@@ -171,10 +163,7 @@ export function registerCreditLineRoutes(
   // Not in the PRD §9 route list (which covers borrower-facing actions), but `CreditLine.fund`
   // is a real, lender-authed on-chain function with no other way to reach it from this API - a
   // credit line a lender never funds can never be drawn against.
-  app.post<{ Params: { id: string } }>(
-    "/v1/credit-lines/:id/fund",
-    { schema: fundCreditLineRouteSchema as any },
-    async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/fund", async (request, reply) => {
     const body = fundCreditLineSchema.parse(request.body);
     let line;
     try {
@@ -203,10 +192,7 @@ export function registerCreditLineRoutes(
 
   // The lender's way out: without these, repaid principal and interest would sit in the contract
   // for good, since `fund` is the only other thing that touches the lender's USDC.
-  app.post<{ Params: { id: string } }>(
-    "/v1/credit-lines/:id/withdrawals",
-    { schema: withdrawRouteSchema as any },
-    async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/withdrawals", async (request, reply) => {
     const body = withdrawSchema.parse(request.body);
     let line;
     try {
@@ -240,10 +226,7 @@ export function registerCreditLineRoutes(
   // After the keeper has liquidated a line and sent the collateral to the lender in kind, the
   // lender closes it: the contract books the outcome and, if the collateral was worth more than the
   // debt, pays the borrower the difference out of the lender's USDC in the same transaction.
-  app.post<{ Params: { id: string } }>(
-    "/v1/credit-lines/:id/close-liquidation",
-    { schema: closeLiquidationRouteSchema as any },
-    async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/close-liquidation", async (request, reply) => {
     let line;
     try {
       line = await requireCreditLine(db, request.params.id);
@@ -271,10 +254,7 @@ export function registerCreditLineRoutes(
     return reply.code(201).send({ xdr, txHash });
   });
 
-  app.post<{ Params: { id: string } }>(
-    "/v1/credit-lines/:id/pledges",
-    { schema: createPledgeRouteSchema as any },
-    async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/pledges", async (request, reply) => {
     const body = createPledgeSchema.parse(request.body);
     let line;
     try {
@@ -404,10 +384,7 @@ export function registerCreditLineRoutes(
     },
   );
 
-  app.post<{ Params: { id: string } }>(
-    "/v1/credit-lines/:id/draws",
-    { schema: createDrawRouteSchema as any },
-    async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/draws", async (request, reply) => {
     const body = createDrawSchema.parse(request.body);
     let line;
     try {
@@ -442,10 +419,17 @@ export function registerCreditLineRoutes(
     return reply.code(201).send({ xdr, txHash });
   });
 
-  app.post<{ Params: { id: string } }>(
-    "/v1/credit-lines/:id/repayments",
-    { schema: createRepaymentRouteSchema as any },
-    async (request, reply) => {
+  /**
+   * POST /v1/credit-lines/:id/repayments
+   *
+   * Note on semantics:
+   * On-chain `CreditLine::repay` treats `amount` as a cap rather than an exact
+   * amount, applying `min(amount, owed)` (interest first, then principal) and
+   * transferring only what was applied. This allows borrowers to specify a higher
+   * cap to fully clear the line without stranding dust or panicking when interest
+   * accrues between transaction creation and inclusion.
+   */
+  app.post<{ Params: { id: string } }>("/v1/credit-lines/:id/repayments", async (request, reply) => {
     const body = createRepaymentSchema.parse(request.body);
     let line;
     try {

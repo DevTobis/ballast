@@ -49,6 +49,56 @@ export class PriceGuardClient extends BaseContractClient {
     return this.invoke(source, "configure_signature_requirement", [scAddress(source), scBool(required)]);
   }
 
+  /** Admin-only. Allows or disallows a price source name for an asset (PRD §6.4, issue #84). */
+  configureSource(
+    source: string,
+    assetAddress: string,
+    sourceName: string,
+    enabled: boolean,
+  ): Promise<string> {
+    return this.invoke(source, "configure_source", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+      scBool(enabled),
+    ]);
+  }
+
+  /** Read-only; returns whether `sourceName` is currently allowlisted for `assetAddress`. */
+  isSourceAllowed(assetAddress: string, sourceName: string): Promise<boolean> {
+    return this.read<boolean>("is_source_allowed", [
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+    ]);
+  }
+
+  /**
+   * Admin-only. Tightens the staleness window for one source of an asset (issue #86). The contract
+   * refuses a wider window or a clear (`0`); those go through `queue_config` with the 48h timelock.
+   */
+  configureSourceStaleness(
+    source: string,
+    assetAddress: string,
+    sourceName: string,
+    maxStalenessS: bigint | number,
+  ): Promise<string> {
+    return this.invoke(source, "configure_source_staleness", [
+      scAddress(source),
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+      scU64(maxStalenessS),
+    ]);
+  }
+
+  /** Read-only; the per-source staleness override in seconds, or `undefined` when the asset's
+   * `max_staleness_s` applies. A `u64` decodes to a `bigint`. */
+  sourceStaleness(assetAddress: string, sourceName: string): Promise<bigint | undefined> {
+    return this.read<bigint | undefined>("source_staleness", [
+      scAddress(assetAddress),
+      scSymbol(sourceName),
+    ]);
+  }
+
   /**
    * Pushes an independent-feed or last-redemption-price reading. The on-chain function is named
    * `publish_source` (contracts/price-guard/src/lib.rs) — kept as `publishFeed` here for the

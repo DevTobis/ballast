@@ -49,7 +49,7 @@ ZERO_HASH="0000000000000000000000000000000000000000000000000000000000000000"
 log "Opening a credit line: lender=$LENDER borrower=$BORROWER limit=10,000 TUSD @ 7% APR"
 LINE_ID=$(inv --id "$CREDIT_LINE_CID" --source lender -- open \
   --lender "$LENDER" --borrower "$BORROWER" --asset "$RWA_SAC" \
-  --limit 100000000000 --rate_bps 700 --cure_s 86400 --agreement "$ZERO_HASH")
+  --limit 100000000000 --rate_bps 700 --fee_bps 0 --cure_s 86400 --agreement "$ZERO_HASH")
 log "  line id = $LINE_ID"
 
 log "Lender funds the line with 10,000 TUSD"
@@ -80,8 +80,11 @@ NAV_SIG=$(node scripts/sign-nav.mjs "$(stellar keys secret price_publisher)" RWA
 inv --id "$PRICE_GUARD_CID" --source price_publisher -- publish_nav \
   --publisher "$PRICE_PUBLISHER" --asset "$RWA_SAC" --asset_code "$RWA1_ASSET_CODE_HEX" \
   --value "$NAV_VALUE" --ts "$NAV_TS" --sig "$NAV_SIG" >/dev/null
+# Allowlist and publish price sources
+inv --id "$PRICE_GUARD_CID" --source admin -- configure_source \
+  --admin "$ADMIN" --asset "$RWA_SAC" --name redstone --enabled true >/dev/null
 inv --id "$PRICE_GUARD_CID" --source price_publisher -- publish_source \
-  --publisher "$PRICE_PUBLISHER" --asset "$RWA_SAC" --source redston --value "$FEED_VALUE" --ts "$FEED_TS" >/dev/null
+  --publisher "$PRICE_PUBLISHER" --asset "$RWA_SAC" --source redstone --value "$FEED_VALUE" --ts "$FEED_TS" >/dev/null
 
 log "guarded_price:"
 inv --id "$PRICE_GUARD_CID" --source admin -- guarded_price --asset "$RWA_SAC"

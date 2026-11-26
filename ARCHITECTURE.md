@@ -44,7 +44,7 @@ every amount in a settlement comes from contract state or the PriceGuard (see `A
 | `registry` | Asset configs, haircut parameters, timelocked parameter and role changes, admin transfer, pause | – |
 | `price-guard` | Median / band / staleness / halt over several price sources; verifies the Ed25519 NAV signature | – |
 | `pledge-vault` | One collateral position per `(line, asset)`. Escrow mode holds the token; lien modes only record a reference | `CreditLine` (`sync_from_vault`, `ltv`, `borrower_of`), `PriceGuard` |
-| `credit-line` | Lender commitments, draws, repayments, interest, LTV, the margin state machine, liquidation entry | `PriceGuard` |
+| `credit-line` | Lender commitments, draws, repayments, interest, LTV, the margin state machine, liquidation entry | `PriceGuard` ([Credit-line lifecycle](contracts/README.md#credit-line-lifecycle)) |
 | `exit-desk` | Atomic RWA → USDC swap at guarded price minus a spread | `PriceGuard` |
 | `repo-dvp` | Bilateral repo: DvP on leg 1, scheduled unwind on leg 2, margin calls and default | `PriceGuard` |
 

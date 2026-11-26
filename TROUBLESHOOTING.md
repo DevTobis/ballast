@@ -64,7 +64,8 @@ Change `API_PORT`, `ISSUER_GATEWAY_PORT` or `PAYOUT_HOP_PORT` in the repo-root `
 3. That the issuer NAV key is registered: `scripts/configure-nav-key.sh testnet`.
 
 A move beyond `daily_move_band_bps` against the last good value puts the guard into a sticky `Halted`
-state that only the `risk` role clears (`confirm_halt_cleared`).
+state that only the `risk` role clears (`confirm_halt_cleared`). Follow
+[`docs/runbooks/price-halt.md`](docs/runbooks/price-halt.md) before clearing it.
 
 ## Requests are refused with a compliance error
 
@@ -82,6 +83,75 @@ Signing goes through the Freighter extension, which the scripts cannot drive. To
 the deployment's key into Freighter (`stellar keys secret lender`), switch Freighter to the same network,
 and open http://localhost:5173.
 
+## Liquidation runs get stuck or stop half-finished
+
+See [`services/keeper/src/jobs/cureExpiry.ts`](services/keeper/src/jobs/cureExpiry.ts) for the automated transfer-route flow and [`contracts/AUDIT_NOTES.md`](contracts/AUDIT_NOTES.md) for contract guarantees. Every keeper step (`poke`, `CreditLine::liquidate`, `PledgeVault::liquidate`, and DB booking) is idempotent and safe to repeat; final settlement (`CreditLine::close_liquidated`) always requires the lender's signature.
+
+Common inspection commands (read-only simulations against Soroban RPC):
+
+```bash
+stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- line --line <LINE_ID>
+stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- ltv --line <LINE_ID>
+stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- liquidation_record --line <LINE_ID>
+stellar contract invoke --id "$PLEDGE_VAULT_CID" --source "$SIGNER" --network "$NETWORK" -- position_units --line <LINE_ID> --asset <ASSET_CID>
+```
+
+### 1. Keeper died between `CreditLine::liquidate` and `PledgeVault::liquidate`
+
+- **Symptom:** The credit line is `Liquidating` on-chain (`CreditLine` froze the debt and price), while collateral still sits in `PledgeVault` (`position_units > 0`) and Postgres `credit_line.status` is still `open`.
+- **Confirm on-chain:**
+  ```bash
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- line --line <LINE_ID>
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- liquidation_record --line <LINE_ID>
+  stellar contract invoke --id "$PLEDGE_VAULT_CID" --source "$SIGNER" --network "$NETWORK" -- position_units --line <LINE_ID> --asset <ASSET_CID>
+  ```
+  Expect `line.status == "Liquidating"`, `liquidation_record.closed == false`, and `position_units > 0` (or `0` if `PledgeVault::liquidate` already ran and the keeper died right before Postgres booking).
+- **Safe next step:** **Safe for keeper / operator to repeat.** Restart or wait for the next `cure-expiry` keeper tick. Because `runCureExpiryJob` checks `onChain.status === "Liquidating"`, it skips `CreditLine::liquidate`, submits `PledgeVault::liquidate` if `position_units > 0`, recovers `totalUnits` from active DB pledges if `position_units == 0`, and finishes Postgres booking.
+
+### 2. Keeper skips an overdue line due to collateral sync lag (`held != onChain.pledgedUnits`)
+
+- **Symptom:** A line is past its cure window and at liquidation LTV, yet `cure-expiry` keeps skipping it because `PledgeVault`'s held balance differs from `CreditLine.pledged_units`.
+- **Confirm on-chain:**
+  ```bash
+  stellar contract invoke --id "$PLEDGE_VAULT_CID" --source "$SIGNER" --network "$NETWORK" -- position_units --line <LINE_ID> --asset <ASSET_CID>
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- line --line <LINE_ID>
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- ltv --line <LINE_ID>
+  ```
+  Compare `position_units` against `line.pledged_units` and check `ltv.state` / `ltv.price_status`.
+- **Safe next step:** **Safe to repeat reconciliation; do not bypass the mismatch check.** Let the `sync-collateral` keeper job (runs every minute) call `CreditLine::sync_collateral` with the vault's `position_units`, or invoke it manually as `keeper`/`admin` using the vault's on-chain figure (never Postgres):
+  ```bash
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source keeper --network "$NETWORK" -- sync_collateral --caller <KEEPER_ADDR> --line <LINE_ID> --units <POSITION_UNITS>
+  ```
+  Once synchronized, `cure-expiry` is safe to repeat (it arms `breach_ledger` via `poke` if cleared and proceeds after one ledger when `price_status == "Ok"` and `ltv.state == "Liquidation"`).
+
+### 3. Lender has not called `close_liquidated` (`Liquidating` indefinitely)
+
+- **Symptom:** Collateral was transferred to the lender in kind (`position_units == 0` in `PledgeVault`), `line.status` stays `Liquidating`, and any borrower surplus has not been paid out.
+- **Confirm on-chain:**
+  ```bash
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- line --line <LINE_ID>
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- liquidation_record --line <LINE_ID>
+  stellar contract invoke --id "$PLEDGE_VAULT_CID" --source "$SIGNER" --network "$NETWORK" -- position_units --line <LINE_ID> --asset <ASSET_CID>
+  ```
+  Expect `line.status == "Liquidating"`, `liquidation_record.closed == false` (with `price`, `debt`, and `seized_units` already frozen), and `position_units == 0`.
+- **Safe next step:** **Requires the lender (not keeper, admin, or borrower).** Re-running keeper jobs has no effect here, and `price`/`debt` remain frozen in `LiquidationRecord` regardless of delay. Coordinate with the lender to sign `CreditLine::close_liquidated` (either in the Lender Console or via CLI):
+  ```bash
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source <LENDER_IDENTITY> --network "$NETWORK" -- close_liquidated --lender <LENDER_ADDR> --line <LINE_ID>
+  ```
+
+### 4. `close_liquidated` reverts when transferring surplus (lender lacks USDC)
+
+- **Symptom:** The lender calls `CreditLine::close_liquidated`, but the transaction traps/reverts inside the USDC token transfer (`surplus > 0` because `recovered = seized_units * price` exceeds `debt`).
+- **Confirm on-chain:**
+  ```bash
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- liquidation_record --line <LINE_ID>
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- line --line <LINE_ID>
+  stellar contract invoke --id "$CREDIT_LINE_CID" --source "$SIGNER" --network "$NETWORK" -- ltv --line <LINE_ID>
+  stellar contract invoke --id "$USDC_CID" --source "$SIGNER" --network "$NETWORK" -- balance --id <LENDER_ADDR>
+  ```
+  Check `liquidation_record` (`seized_units * price / 10_000_000 - debt`) against the lender's USDC `balance` (both 7-decimal stroops).
+- **Safe next step:** **Requires the lender.** Have the lender fund their wallet with at least the `surplus` USDC shortfall (and verify the borrower's USDC trustline if classic), then **safely repeat** `CreditLine::close_liquidated` — because earlier attempts reverted atomically, no state was mutated.
+
 ## PriceGuard calls fail due to archived state
 
 Symptoms: Transactions trap or RPC simulation fails reporting that a contract data entry or contract instance is archived or missing from the active footprint.
@@ -94,6 +164,12 @@ Fix:
    stellar contract restore --id <PRICE_GUARD_CONTRACT_ID> --source <OPERATOR_IDENTITY> --network <NETWORK>
    ```
 2. For specific persistent source keys, include the key in a restore footprint transaction or trigger a re-publish once the instance is restored. Regular publishing automatically keeps active keys extended via `extend_ttl`.
+
+## Keeper job errors and transaction failures
+
+Keeper jobs (such as `cure-expiry`, `repo-unwind`, `sync-collateral`) and transaction submissions via `submitSignedTx` report structured errors for conditions like missing lender accounts, on-chain execution traps, submission timeouts, and collateral discrepancies.
+
+For the full error reference table—including causes, whether runs retry, which errors are safe to ignore, and recommended operator actions—see [services/keeper Troubleshooting](services/keeper/README.md#troubleshooting-job-errors).
 
 ## Still stuck
 

@@ -80,11 +80,6 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     }
   });
 
-  // Preserve route schemas on route options for OpenAPI documentation without overriding
-  // the Zod validation and error formatting handled in the route handlers and error handler.
-  app.setValidatorCompiler(() => () => true);
-  app.setSerializerCompiler(() => (data) => JSON.stringify(data));
-
   void app.register(helmet);
   void app.register(cors, { origin: config.consoleOrigin });
   // Per-address ceiling: callers presenting an `x-api-key` get a higher one. A bogus key buys no
@@ -146,6 +141,9 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   // GET /v1/assets and /v1/assets/:id/price are public per PRD §9 (no auth required to browse
   // supported assets/prices); everything else needs a resolved partyId.
   app.get("/healthz", { config: { public: true, rateLimit: false } }, async () => ({ ok: true }));
+  // The document is built from the route descriptions in openapi.ts, which a test keeps in step with
+  // the zod schemas the handlers parse with. Route options carry no JSON schema, so Fastify does no
+  // validation of its own and the zod error responses stay as they are.
   app.get("/v1/openapi.json", { config: { public: true, rateLimit: false } }, async () => getOpenApiDocument());
 
   registerAuthRoutes(app, db, config);
