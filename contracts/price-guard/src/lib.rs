@@ -61,9 +61,19 @@ use ballast_common::{
     price::{GuardedPrice, PriceSource, PriceStatus},
     timelock, ttl, upgrade,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol, TryFromVal, Val,
+    Vec,
+};
 
 const ISSUER_SOURCE: &str = "issuer";
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastGood {
+    pub value: i128,
+    pub ts: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +83,17 @@ pub struct AssetGuardConfig {
     pub max_staleness_s: u64,
     pub window_seconds: u64,
     pub window_move_band_bps: u32,
+}
+
+/// What a risk operator needs to see before calling `confirm_halt_cleared`, returned by
+/// `halt_info` while an asset is halted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HaltInfo {
+    /// The baseline `guarded_price` keeps returning while halted. `None` if none was ever recorded.
+    pub last_good: Option<i128>,
+    /// The median that tripped the halt; confirming promotes it to the new `last_good`.
+    pub pending: Option<i128>,
 }
 
 #[contracttype]
@@ -134,6 +155,8 @@ enum DataKey {
     /// Last evaluated PriceStatus for `asset`, tracked to emit `status_changed` events on transitions.
     LastStatus(Address),
     PendingConfig(u64),
+    /// Admin-managed source allowlist flag per (asset, source-name) (issue #84).
+    SourceAllowed(Address, Symbol),
 }
 
 /// Fixed-capacity (no `alloc`) unsigned/signed-decimal-ASCII encoders for building the canonical
@@ -206,6 +229,16 @@ fn read_config(env: &Env, asset: &Address) -> AssetGuardConfig {
         .instance()
         .get(&DataKey::Config(asset.clone()))
         .expect("price-guard: asset not configured")
+}
+
+fn is_source_allowed(env: &Env, asset: &Address, name: &Symbol) -> bool {
+    if name == &Symbol::new(env, ISSUER_SOURCE) {
+        return true;
+    }
+    env.storage()
+        .instance()
+        .get(&DataKey::SourceAllowed(asset.clone(), name.clone()))
+        .unwrap_or(false)
 }
 
 fn write_source(env: &Env, asset: &Address, name: &Symbol, value: i128, observed_at: u64) {
@@ -385,6 +418,25 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
     }
 }
 
+/// Reads the `LastGood` baseline. A value stored by an earlier version as a bare `i128` decodes
+/// with `ts = 0` until the next `Ok` evaluation rewrites it.
+fn read_last_good(env: &Env, asset: &Address) -> Option<LastGood> {
+    let raw: Val = env
+        .storage()
+        .instance()
+        .get(&DataKey::LastGood(asset.clone()))?;
+    if let Ok(value) = i128::try_from_val(env, &raw) {
+        return Some(LastGood { value, ts: 0 });
+    }
+    LastGood::try_from_val(env, &raw).ok()
+}
+
+fn write_last_good(env: &Env, asset: &Address, value: i128, ts: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LastGood(asset.clone()), &LastGood { value, ts });
+}
+
 /// The PRD §6.4 rules, evaluated against the sources as they stand, writing back what the result
 /// implies: a `Halted` latch (with the value that caused it) or the new `LastGood` baseline.
 ///
@@ -397,22 +449,24 @@ fn check_and_emit_status_change(env: &Env, asset: &Address, to: PriceStatus, val
 /// the daily-move check would then compare against a baseline days old and halt on ordinary yield
 /// drift. Evaluating at publish time keeps the baseline current and makes a jump latch at once.
 fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
-    let config = read_config(&env, &asset);
-    let all_sources = read_all_sources(&env, &asset);
+    let config = read_config(env, &asset);
+    let all_sources = read_all_sources(env, &asset);
 
-    let mut fresh_values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
-    let mut fresh_sources: soroban_sdk::Vec<PriceSource> = soroban_sdk::Vec::new(&env);
+    let mut fresh_values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
+    let mut fresh_sources: soroban_sdk::Vec<PriceSource> = soroban_sdk::Vec::new(env);
     for source in all_sources.iter() {
-        if is_fresh(&env, &source, config.max_staleness_s) {
+        if !is_source_allowed(env, &asset, &source.name) {
+            continue;
+        }
+        if is_fresh(env, &source, config.max_staleness_s) {
             fresh_values.push_back(source.value);
             fresh_sources.push_back(source.clone());
         }
     }
 
-    let last_good: Option<i128> = env
-        .storage()
-        .instance()
-        .get(&DataKey::LastGood(asset.clone()));
+    let last_good = read_last_good(env, &asset);
+    let last_good_val = last_good.as_ref().map(|lg| lg.value);
+    let last_good_ts = last_good.as_ref().map_or(0, |lg| lg.ts);
     let already_halted: bool = env
         .storage()
         .instance()
@@ -422,25 +476,25 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
     let now = env.ledger().timestamp();
 
     if already_halted {
-        let val = last_good.unwrap_or(0);
+        let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Halted, val);
         return GuardedPrice {
             asset,
             value: val,
             status: PriceStatus::Halted,
-            ts: now,
+            ts: last_good_ts,
             sources: fresh_sources,
         };
     }
 
     if fresh_values.len() < 2 {
-        let val = last_good.unwrap_or(0);
+        let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Degraded, val);
         return GuardedPrice {
             asset,
             value: val,
             status: PriceStatus::Degraded,
-            ts: now,
+            ts: last_good_ts,
             sources: fresh_sources,
         };
     }
@@ -460,18 +514,18 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         *slot = plain_values.get(i);
     }
     if !within_band(&as_array[..len], config.band_bps) {
-        let val = last_good.unwrap_or(0);
+        let val = last_good_val.unwrap_or(0);
         check_and_emit_status_change(env, &asset, PriceStatus::Degraded, val);
         return GuardedPrice {
             asset,
             value: val,
             status: PriceStatus::Degraded,
-            ts: now,
+            ts: last_good_ts,
             sources: fresh_sources,
         };
     }
 
-    if let Some(last) = last_good {
+    if let Some(last) = last_good_val {
         if last > 0 {
             let move_bps = (((median_value - last).abs()) * 10_000) / last;
             if move_bps > config.daily_move_band_bps as i128 {
@@ -490,7 +544,7 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                     asset,
                     value: last,
                     status: PriceStatus::Halted,
-                    ts: now,
+                    ts: last_good_ts,
                     sources: fresh_sources,
                 };
             }
@@ -521,7 +575,12 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                     .instance()
                     .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
                 // Report the last good value, like every other Halted path, not the older reference.
-                let held = last_good.unwrap_or(reference);
+                let held = last_good_val.unwrap_or(reference);
+                let held_ts = if last_good_val.is_some() {
+                    last_good_ts
+                } else {
+                    rolling_ref_ts.unwrap_or(0)
+                };
                 env.events().publish(
                     (Symbol::new(env, "halt_latched"), asset.clone()),
                     (held, median_value),
@@ -531,7 +590,7 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
                     asset,
                     value: held,
                     status: PriceStatus::Halted,
-                    ts: now,
+                    ts: held_ts,
                     sources: fresh_sources,
                 };
             }
@@ -549,9 +608,7 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
             .set(&DataKey::RollingReferenceUpdated(asset.clone()), &now);
     }
 
-    env.storage()
-        .instance()
-        .set(&DataKey::LastGood(asset.clone()), &median_value);
+    write_last_good(env, &asset, median_value, now);
 
     check_and_emit_status_change(env, &asset, PriceStatus::Ok, median_value);
 
@@ -789,6 +846,41 @@ impl PriceGuard {
         );
     }
 
+    /// Admin-only. Allows or disallows an independent price source for an asset.
+    /// Reserving `issuer` for `publish_nav`.
+    pub fn configure_source(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        name: Symbol,
+        enabled: bool,
+    ) {
+        admin.require_auth();
+        access::require_admin(&env);
+        ttl::extend_instance(&env);
+        read_config(&env, &asset);
+        assert!(
+            name != Symbol::new(&env, ISSUER_SOURCE),
+            "price-guard: source name 'issuer' is reserved for publish_nav"
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SourceAllowed(asset.clone(), name.clone()), &enabled);
+
+        env.events().publish(
+            (Symbol::new(&env, "configure_source"), asset.clone()),
+            (name, enabled),
+        );
+
+        evaluate(&env, asset);
+    }
+
+    /// Returns whether a price source name is currently allowlisted for `asset`.
+    pub fn is_source_allowed(env: Env, asset: Address, name: Symbol) -> bool {
+        is_source_allowed(&env, &asset, &name)
+    }
+
     /// Admin-only. Removes a price source entry and deletes its name from the tracked source names
     /// for `asset`. Unknown name removal is a safe no-op.
     pub fn remove_source(env: Env, admin: Address, asset: Address, name: Symbol) {
@@ -797,6 +889,9 @@ impl PriceGuard {
         ttl::extend_instance(&env);
         read_config(&env, &asset);
 
+        env.storage()
+            .instance()
+            .remove(&DataKey::SourceAllowed(asset.clone(), name.clone()));
         remove_source_internal(&env, &asset, &name);
 
         env.events().publish(
@@ -979,6 +1074,32 @@ impl PriceGuard {
         env.storage().instance().get(&DataKey::IssuerPubKey(asset))
     }
 
+    /// Read-only: the halt latch for `asset`. `None` while the asset is not halted. While halted,
+    /// shows the baseline `guarded_price` is holding and the value `confirm_halt_cleared` would
+    /// promote, so a risk operator can check both before confirming.
+    pub fn halt_info(env: Env, asset: Address) -> Option<HaltInfo> {
+        ttl::extend_instance(&env);
+        let halted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Halted(asset.clone()))
+            .unwrap_or(false);
+        if !halted {
+            return None;
+        }
+        Some(HaltInfo {
+            last_good: read_last_good(&env, &asset).map(|lg| lg.value),
+            pending: env.storage().instance().get(&DataKey::PendingHaltValue(asset)),
+        })
+    }
+
+    /// Read-only: the last guarded value that reached `Ok`, which `guarded_price` falls back to
+    /// while `Degraded` or `Halted`. `None` if the asset has never reached `Ok`.
+    pub fn last_good(env: Env, asset: Address) -> Option<i128> {
+        ttl::extend_instance(&env);
+        read_last_good(&env, &asset).map(|lg| lg.value)
+    }
+
     /// PRD §8: issuer-signed NAV. See the module doc comment on `sig` — verified against the
     /// asset's registered issuer key (`configure_issuer_key`) whenever `require_nav_signature` is
     /// `true` (the default), over the canonical message built from `asset_code`/`ts`/`value`.
@@ -1041,6 +1162,14 @@ impl PriceGuard {
         access::require_price_publisher(&env);
         ttl::extend_instance(&env);
         read_config(&env, &asset);
+        assert!(
+            source != Symbol::new(&env, ISSUER_SOURCE),
+            "price-guard: source name 'issuer' is reserved for publish_nav"
+        );
+        assert!(
+            is_source_allowed(&env, &asset, &source),
+            "price-guard: source not allowlisted"
+        );
         require_sane_reading(&env, value, ts);
 
         track_source_name(&env, &asset, &source);
@@ -1086,15 +1215,14 @@ impl PriceGuard {
         access::require_risk(&env);
         ttl::extend_instance(&env);
 
+        let now = env.ledger().timestamp();
         let mut new_last_good = 0i128;
         if let Some(pending) = env
             .storage()
             .instance()
             .get::<_, i128>(&DataKey::PendingHaltValue(asset.clone()))
         {
-            env.storage()
-                .instance()
-                .set(&DataKey::LastGood(asset.clone()), &pending);
+            write_last_good(&env, &asset, pending, now);
             new_last_good = pending;
             env.storage()
                 .instance()
@@ -1103,17 +1231,13 @@ impl PriceGuard {
                 .instance()
                 .set(
                     &DataKey::RollingReferenceUpdated(asset.clone()),
-                    &env.ledger().timestamp(),
+                    &now,
                 );
             env.storage()
                 .instance()
                 .remove(&DataKey::PendingHaltValue(asset.clone()));
-        } else if let Some(last) = env
-            .storage()
-            .instance()
-            .get::<_, i128>(&DataKey::LastGood(asset.clone()))
-        {
-            new_last_good = last;
+        } else if let Some(last) = read_last_good(&env, &asset) {
+            new_last_good = last.value;
         }
         env.storage().instance().remove(&DataKey::Halted(asset.clone()));
 
@@ -1134,6 +1258,10 @@ mod test {
     /// per day) stays well inside it.
     const DEFAULT_WINDOW_SECONDS: u64 = 86_400;
     const DEFAULT_WINDOW_MOVE_BAND_BPS: u32 = 100;
+
+    fn feed(env: &Env) -> Symbol {
+        Symbol::new(env, "redston")
+    }
 
     fn setup_with_admin(
         band_bps: u32,
@@ -1185,7 +1313,33 @@ mod test {
         // doesn't panic every call here.
         client.configure_signature_requirement(&admin, &false);
 
+        allowlist_test_sources(&env, &client, &admin, &asset);
+
         (env, client, admin, price_publisher, risk, asset)
+    }
+
+    /// Allowlists (#84) every source name the tests publish under, so tests that are not about
+    /// the allowlist itself can call `publish_source` freely.
+    fn allowlist_test_sources(
+        env: &Env,
+        client: &PriceGuardClient<'static>,
+        admin: &Address,
+        asset: &Address,
+    ) {
+        let mut names = std::vec![
+            std::string::String::from("redston"),
+            "redstone".into(),
+            "redemp".into(),
+            "band3".into(),
+            "band4".into(),
+        ];
+        for i in 1..=8 {
+            names.push(std::format!("feed_{}", i));
+            names.push(std::format!("src{}", i));
+        }
+        for name in names {
+            client.configure_source(admin, asset, &Symbol::new(env, &name), &true);
+        }
     }
 
     fn setup(
@@ -1196,6 +1350,90 @@ mod test {
         let (env, client, _admin, price_publisher, risk, asset) =
             setup_with_admin(band_bps, daily_move_band_bps, max_staleness_s);
         (env, client, price_publisher, risk, asset)
+    }
+
+    /// Setup helper for a fresh deployment that does NOT disable the signature requirement,
+    /// leaving `require_nav_signature` in its default state (`true`).
+    fn setup_fresh_deployment(
+        band_bps: u32,
+        daily_move_band_bps: u32,
+        max_staleness_s: u64,
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let id = env.register(PriceGuard, ());
+        let client = PriceGuardClient::new(&env, &id);
+
+        let admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let price_publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &price_publisher, &risk);
+
+        let asset = Address::generate(&env);
+        client.configure_asset(
+            &admin,
+            &asset,
+            &band_bps,
+            &daily_move_band_bps,
+            &DEFAULT_WINDOW_SECONDS,
+            &DEFAULT_WINDOW_MOVE_BAND_BPS,
+            &max_staleness_s,
+        );
+        allowlist_test_sources(&env, &client, &admin, &asset);
+
+        (env, client, admin, price_publisher, risk, asset)
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: already initialized")]
+    fn second_initialize_panics_already_initialized() {
+        let (env, client, admin, _publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3600);
+        let pauser = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let risk = Address::generate(&env);
+        client.initialize(&admin, &pauser, &keeper, &publisher, &risk);
+    }
+
+    #[test]
+    fn signature_requirement_defaults_to_true_and_disabling_allows_zero_signature() {
+        let (env, client, admin, publisher, _risk, asset) =
+            setup_fresh_deployment(50, 100, 3600);
+        let code = asset_code(&env);
+        let zero_sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        // On a fresh deploy, signature requirement must default to true
+        assert_eq!(client.require_nav_signature(), true);
+
+        // Register issuer key so the signature check itself triggers rather than missing key panic
+        let (pubkey, _) = test_issuer_keypair(&env);
+        client.configure_issuer_key(&admin, &asset, &pubkey);
+
+        // Under default require_nav_signature = true, publish_nav with a zero/invalid signature must fail
+        let failed_publish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &zero_sig);
+        }));
+        assert!(
+            failed_publish.is_err(),
+            "publish_nav with zero signature must fail under default signature requirement"
+        );
+
+        // Once configure_signature_requirement(false) is called, publish_nav with a zero signature succeeds
+        client.configure_signature_requirement(&admin, &false);
+        assert_eq!(client.require_nav_signature(), false);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &zero_sig);
+        let feed_name = feed(&env);
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &now);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, SCALE);
     }
 
     const SCALE: i128 = ballast_common::price::PRICE_SCALE;
@@ -1635,10 +1873,6 @@ mod test {
 
     // --- adversarial cases -------------------------------------------------------------------
 
-    fn feed(env: &Env) -> Symbol {
-        Symbol::new(env, "redston")
-    }
-
     /// The 2026-02-22 shape: one venue's price is pushed far from reality while the issuer's NAV is
     /// unchanged. The guard must refuse to call that a price, however big the push.
     #[test]
@@ -1897,6 +2131,75 @@ mod test {
     }
 
     #[test]
+    fn is_fresh_staleness_and_future_skew_boundaries() {
+        let env = Env::default();
+        let now = 10_000u64;
+        env.ledger().set_timestamp(now);
+        let max_staleness_s = 3600u64;
+
+        let make_source = |observed_at: u64| PriceSource {
+            name: Symbol::new(&env, "testsrc"),
+            value: SCALE,
+            observed_at,
+            stale: false,
+        };
+
+        // 1. Age exactly max_staleness_s is fresh
+        let at_max_staleness = make_source(now - max_staleness_s);
+        assert!(
+            is_fresh(&env, &at_max_staleness, max_staleness_s),
+            "reading at exactly max_staleness_s must be fresh"
+        );
+
+        // 2. Age max_staleness_s + 1 is stale
+        let past_max_staleness = make_source(now - max_staleness_s - 1);
+        assert!(
+            !is_fresh(&env, &past_max_staleness, max_staleness_s),
+            "reading at max_staleness_s + 1 must be stale"
+        );
+
+        // 3. observed_at = now + MAX_FUTURE_SKEW_S (60s) is fresh
+        let at_max_future_skew = make_source(now + MAX_FUTURE_SKEW_S);
+        assert!(
+            is_fresh(&env, &at_max_future_skew, max_staleness_s),
+            "reading at now + MAX_FUTURE_SKEW_S must be fresh"
+        );
+
+        // 4. observed_at = now + MAX_FUTURE_SKEW_S + 1 (61s) is not fresh
+        let beyond_future_skew = make_source(now + MAX_FUTURE_SKEW_S + 1);
+        assert!(
+            !is_fresh(&env, &beyond_future_skew, max_staleness_s),
+            "reading at now + MAX_FUTURE_SKEW_S + 1 must not be fresh"
+        );
+    }
+
+    #[test]
+    fn publish_source_boundary_at_max_future_skew_and_plus_one() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let now = 10_000u64;
+        env.ledger().set_timestamp(now);
+        let feed_name = feed(&env);
+
+        // 1. now + MAX_FUTURE_SKEW_S is accepted by publish_source
+        client.publish_source(&publisher, &asset, &feed_name, &SCALE, &(now + MAX_FUTURE_SKEW_S));
+
+        // 2. now + MAX_FUTURE_SKEW_S + 1 (61s ahead) is refused with panic
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.publish_source(
+                &publisher,
+                &asset,
+                &feed_name,
+                &SCALE,
+                &(now + MAX_FUTURE_SKEW_S + 1),
+            );
+        }));
+        assert!(
+            res.is_err(),
+            "publish_source at now + MAX_FUTURE_SKEW_S + 1 must be refused"
+        );
+    }
+
+    #[test]
     fn a_reading_that_ages_into_staleness_stops_counting() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
         let code = asset_code(&env);
@@ -2086,6 +2389,12 @@ mod test {
         let events = env.events().all();
         assert!(has_event(&events, "configure_signature_requirement"), "configure_signature_requirement event must be emitted");
 
+        // 3b. configure_source event
+        let feed_name = feed(&env);
+        client.configure_source(&admin, &asset, &feed_name, &true);
+        let events = env.events().all();
+        assert!(has_event(&events, "configure_source"), "configure_source event must be emitted");
+
         // 4. nav_published event
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
@@ -2260,6 +2569,36 @@ mod test {
                 b"CETES28:4102444800:170141183460469231731687303715884105727"
             )
         );
+
+        let (pubkey, _) = test_issuer_keypair(&env);
+        let sig1 = BytesN::from_array(
+            &env,
+            &[
+                0x23, 0x4b, 0xd2, 0x54, 0x08, 0x8c, 0x73, 0x65, 0x41, 0xfe, 0x36, 0x3a, 0xa4,
+                0xd7, 0x16, 0x30, 0x04, 0xec, 0xe7, 0x97, 0xb6, 0xdf, 0xc6, 0xd5, 0x8d, 0x3e,
+                0x79, 0x69, 0x87, 0xcf, 0xc2, 0x05, 0x01, 0xae, 0x42, 0xa4, 0x2e, 0x9d, 0xb5,
+                0xd1, 0xa0, 0x26, 0x29, 0x4b, 0x75, 0x5e, 0x3c, 0x98, 0x94, 0x3f, 0xdc, 0xe0,
+                0x37, 0xcf, 0xf1, 0xba, 0xcf, 0xd5, 0x78, 0xe7, 0x49, 0xa7, 0xba, 0x0e,
+            ],
+        );
+        let msg1 = Bytes::from_slice(&env, b"SPIKO:1700000000:10234567");
+        env.crypto().ed25519_verify(&pubkey, &msg1, &sig1);
+
+        let sig2 = BytesN::from_array(
+            &env,
+            &[
+                0x8d, 0x3d, 0x74, 0x08, 0x0e, 0xed, 0xf8, 0x29, 0xec, 0x37, 0x88, 0x31, 0x08,
+                0xd1, 0x14, 0xc7, 0x43, 0x07, 0x29, 0xa9, 0x8d, 0x90, 0x45, 0x61, 0xc0, 0x5f,
+                0x1c, 0x09, 0x28, 0x0c, 0x5a, 0xce, 0x06, 0x32, 0x37, 0x7a, 0xfa, 0xfe, 0x85,
+                0x06, 0x14, 0x21, 0xbe, 0xe9, 0x2c, 0xc6, 0xde, 0x6b, 0xf6, 0xe4, 0xca, 0xcf,
+                0x2b, 0x82, 0xae, 0xf3, 0x9d, 0x4a, 0x23, 0x33, 0xd8, 0x29, 0x4c, 0x0c,
+            ],
+        );
+        let msg2 = Bytes::from_slice(
+            &env,
+            b"CETES28:4102444800:170141183460469231731687303715884105727",
+        );
+        env.crypto().ed25519_verify(&pubkey, &msg2, &sig2);
     }
 
     #[test]
@@ -2614,8 +2953,8 @@ mod test {
 
         // State persists: the last good price and config established before upgrade are still in storage
         env.as_contract(&client.address, || {
-            let last_good: Option<i128> = env.storage().instance().get(&DataKey::LastGood(asset.clone()));
-            assert_eq!(last_good, Some(SCALE));
+            let last_good = read_last_good(&env, &asset);
+            assert_eq!(last_good.map(|lg| lg.value), Some(SCALE));
             let config = read_config(&env, &asset);
             assert_eq!(config.band_bps, 50);
             assert_eq!(config.daily_move_band_bps, 10_000);
@@ -2700,6 +3039,167 @@ mod test {
         assert_eq!(price.value, v2);
     }
 
+    /// Publishes `values` as sources named `src1`, `src2`, ... all stamped with the current ledger
+    /// time, so up to the 8-source limit stay fresh for the whole test.
+    fn publish_numbered_sources(
+        env: &Env,
+        client: &PriceGuardClient<'static>,
+        publisher: &Address,
+        asset: &Address,
+        values: &[i128],
+    ) {
+        const NAMES: [&str; 5] = ["src1", "src2", "src3", "src4", "src5"];
+        let now = env.ledger().timestamp();
+        for (name, value) in NAMES.iter().zip(values.iter()) {
+            client.publish_source(publisher, asset, &Symbol::new(env, name), value, &now);
+        }
+    }
+
+    #[test]
+    fn three_fresh_sources_within_band_return_the_median_not_the_mean_or_extremes() {
+        // 50 bps band. 1.000, 1.002 and 1.004 spread by 40 bps, so all three are in band.
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let low = SCALE;
+        let mid = SCALE + 20_000; // 1.002
+        let high = SCALE + 40_000; // 1.004
+
+        // Published out of order so the result cannot come from insertion order.
+        publish_numbered_sources(&env, &client, &publisher, &asset, &[high, low, mid]);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, mid);
+        assert_eq!(price.sources.len(), 3);
+    }
+
+    #[test]
+    fn three_sources_with_an_outlier_beyond_the_band_degrade_and_keep_the_last_good_value() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let last_good = SCALE + 10_000; // 1.010
+        let new_median = SCALE + 20_000; // 1.002
+
+        // Establish a last good value that differs from the next round's median, so the value
+        // assertion proves the guard kept the old price rather than returning the new median.
+        publish_numbered_sources(
+            &env,
+            &client,
+            &publisher,
+            &asset,
+            &[last_good, last_good, last_good],
+        );
+        let good = client.guarded_price(&asset);
+        assert_eq!(good.status, PriceStatus::Ok);
+        assert_eq!(good.value, last_good);
+
+        // The outlier round's median is 1.002, but the extremes (1.000 and 1.060) are 600 bps
+        // apart, well past the 50 bps band. A degraded result must keep 1.010, not 1.002.
+        publish_numbered_sources(
+            &env,
+            &client,
+            &publisher,
+            &asset,
+            &[SCALE, new_median, SCALE + 600_000],
+        );
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Degraded);
+        assert_eq!(price.value, last_good);
+        assert_ne!(price.value, new_median);
+    }
+
+    #[test]
+    fn five_fresh_sources_within_band_return_the_middle_value() {
+        // 100 bps band. The five values span 80 bps. The mean is 1.0038 and the mid-range is
+        // 1.0040, so neither would be mistaken for the median, 1.0030.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let values = [
+            SCALE,          // 1.0000
+            SCALE + 10_000, // 1.0010
+            SCALE + 30_000, // 1.0030 (median)
+            SCALE + 70_000, // 1.0070
+            SCALE + 80_000, // 1.0080
+        ];
+        let mean = values.iter().sum::<i128>() / 5;
+        assert_ne!(mean, values[2]);
+
+        publish_numbered_sources(&env, &client, &publisher, &asset, &[
+            values[3], values[0], values[4], values[2], values[1],
+        ]);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, values[2]);
+        assert_eq!(price.sources.len(), 5);
+    }
+
+    #[test]
+    fn last_good_is_none_until_the_asset_reaches_ok_then_tracks_the_median() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        assert_eq!(client.last_good(&asset), None);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        // One source is Degraded, which never records a last good value.
+        assert_eq!(client.last_good(&asset), None);
+
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+    }
+
+    #[test]
+    fn getters_need_no_auth_and_do_not_change_state() {
+        use soroban_sdk::testutils::MockAuth;
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+
+        // Drop every mocked authorisation: a getter that required auth would now panic.
+        env.mock_auths(&[] as &[MockAuth]);
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.halt_info(&asset), None);
+    }
+
+    #[test]
+    fn halt_info_shows_baseline_and_tripping_value_then_clears_on_confirm() {
+        let (env, client, publisher, risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let t0 = env.ledger().timestamp();
+        let feed = feed(&env);
+        assert_eq!(client.halt_info(&asset), None);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &SCALE, &t0);
+        assert_eq!(client.halt_info(&asset), None);
+
+        // Both sources agree on a jump beyond the daily band, which latches the halt.
+        let jumped = SCALE * 13 / 10;
+        client.publish_nav(&publisher, &asset, &code, &jumped, &t0, &sig);
+        client.publish_source(&publisher, &asset, &feed, &jumped, &t0);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Halted);
+        assert_eq!(
+            client.halt_info(&asset),
+            Some(HaltInfo {
+                last_good: Some(SCALE),
+                pending: Some(jumped),
+            })
+        );
+        assert_eq!(client.last_good(&asset), Some(SCALE));
+
+        // Confirming promotes the tripping value and lifts the latch.
+        client.confirm_halt_cleared(&risk, &asset);
+        assert_eq!(client.halt_info(&asset), None);
+        assert_eq!(client.last_good(&asset), Some(jumped));
+    }
+
     // `within_band` boundaries. The band is inclusive: a spread of exactly `band_bps` is still
     // within band, one bp more is not.
 
@@ -2737,6 +3237,109 @@ mod test {
         assert!(!within_band(&[10_051, 10_025, 10_000], 50));
     }
 
+    // -------------------------------------------------------------------------
+    // SortBuf tests: sorting, duplicates, signed numbers, and capacity limits (#113)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn sortbuf_unsorted_three_elements() {
+        let env = Env::default();
+        let mut v = soroban_sdk::Vec::new(&env);
+        v.push_back(3);
+        v.push_back(1);
+        v.push_back(2);
+
+        let mut buf = alloc_free_sort::SortBuf::from(&v);
+        assert_eq!(buf.len(), 3);
+        buf.sort();
+        assert_eq!(buf.get(0), 1);
+        assert_eq!(buf.get(1), 2);
+        assert_eq!(buf.get(2), 3);
+    }
+
+    #[test]
+    fn sortbuf_already_sorted() {
+        let env = Env::default();
+        let mut v = soroban_sdk::Vec::new(&env);
+        v.push_back(1);
+        v.push_back(2);
+        v.push_back(3);
+        v.push_back(4);
+        v.push_back(5);
+
+        let mut buf = alloc_free_sort::SortBuf::from(&v);
+        buf.sort();
+        assert_eq!(buf.len(), 5);
+        for i in 0..5 {
+            assert_eq!(buf.get(i), (i as i128) + 1);
+        }
+    }
+
+    #[test]
+    fn sortbuf_all_equal_duplicates() {
+        let env = Env::default();
+        let mut v = soroban_sdk::Vec::new(&env);
+        v.push_back(7);
+        v.push_back(7);
+        v.push_back(7);
+        v.push_back(7);
+
+        let mut buf = alloc_free_sort::SortBuf::from(&v);
+        buf.sort();
+        assert_eq!(buf.len(), 4);
+        for i in 0..4 {
+            assert_eq!(buf.get(i), 7);
+        }
+    }
+
+    #[test]
+    fn sortbuf_negative_numbers() {
+        let env = Env::default();
+        let mut v = soroban_sdk::Vec::new(&env);
+        v.push_back(-5);
+        v.push_back(10);
+        v.push_back(-20);
+        v.push_back(0);
+        v.push_back(3);
+
+        let mut buf = alloc_free_sort::SortBuf::from(&v);
+        buf.sort();
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.get(0), -20);
+        assert_eq!(buf.get(1), -5);
+        assert_eq!(buf.get(2), 0);
+        assert_eq!(buf.get(3), 3);
+        assert_eq!(buf.get(4), 10);
+    }
+
+    #[test]
+    fn sortbuf_exactly_eight_values_capacity_limit() {
+        let env = Env::default();
+        let mut v = soroban_sdk::Vec::new(&env);
+        for val in [8, 7, 6, 5, 4, 3, 2, 1] {
+            v.push_back(val);
+        }
+
+        let mut buf = alloc_free_sort::SortBuf::from(&v);
+        assert_eq!(buf.len(), 8);
+        buf.sort();
+        for i in 0..8 {
+            assert_eq!(buf.get(i), (i as i128) + 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "more than 8 fresh sources")]
+    fn sortbuf_nine_values_panics_capacity_exceeded() {
+        let env = Env::default();
+        let mut v = soroban_sdk::Vec::new(&env);
+        for val in 1..=9 {
+            v.push_back(val);
+        }
+
+        let _buf = alloc_free_sort::SortBuf::from(&v);
+    }
+
     #[test]
     fn admin_can_remove_source_and_free_slot() {
         let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 10_000, 3600);
@@ -2757,6 +3360,7 @@ mod test {
 
         // Attempting a 9th publish before removal panics because SortBuf capacity is 8.
         let name_9 = Symbol::new(&env, "feed_9");
+        client.configure_source(&admin, &asset, &name_9, &true);
         let res_9 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.publish_source(&publisher, &asset, &name_9, &SCALE, &now);
         }));
@@ -2810,6 +3414,314 @@ mod test {
         // Real admin succeeds.
         env.mock_all_auths();
         client.remove_source(&admin, &asset, &feed_name);
+    }
+
+    // --- publish_nav / publish_source / guarded_price failure modes (issue #116) -------------
+    //
+    // These use `setup_fresh_deployment`, not `setup`: `setup` turns the signature requirement
+    // off, which would hide the missing-issuer-key panic.
+
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn publish_nav_for_an_unconfigured_asset_panics() {
+        let (env, client, _admin, publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        let never_configured = Address::generate(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &never_configured, &asset_code(&env), &SCALE, &now, &sig);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "price-guard: no issuer public key configured for asset (call configure_issuer_key)"
+    )]
+    fn publish_nav_with_signature_required_and_no_issuer_key_panics() {
+        let (env, client, _admin, publisher, _risk, asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        // Fresh deployment: the requirement defaults to on and `configure_issuer_key` was never
+        // called for `asset`.
+        assert!(client.require_nav_signature());
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &asset_code(&env), &SCALE, &now, &sig);
+    }
+
+    #[test]
+    fn publish_nav_with_signature_requirement_off_succeeds_without_an_issuer_key() {
+        let (env, client, admin, publisher, _risk, asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        client.configure_signature_requirement(&admin, &false);
+
+        // Same call as the test above (no issuer key, zero signature), now accepted.
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+        client.publish_nav(&publisher, &asset, &asset_code(&env), &SCALE, &now, &sig);
+
+        // The NAV was stored as a fresh source: with one more source the price is Ok at SCALE,
+        // which it could not be if the NAV had been dropped (one source alone is Degraded).
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Degraded);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &now);
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn guarded_price_for_an_unconfigured_asset_panics() {
+        let (env, client, _admin, _publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        client.guarded_price(&Address::generate(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: asset not configured")]
+    fn publish_source_for_an_unconfigured_asset_panics() {
+        let (env, client, _admin, publisher, _risk, _asset) =
+            setup_fresh_deployment(50, 100, 3_600);
+        let now = env.ledger().timestamp();
+        client.publish_source(&publisher, &Address::generate(&env), &feed(&env), &SCALE, &now);
+    }
+
+    // --- decimal_ascii encoders vs std formatting (issue #121) ---------------------------------
+    //
+    // These bytes go into the signed NAV message, so one wrong digit makes every valid signature
+    // fail to verify. `format!` is the oracle.
+
+    #[test]
+    fn decimal_ascii_u64_to_bytes_matches_std_formatting() {
+        let env = Env::default();
+        for n in [0u64, 9, 10, 1_700_000_000, u64::MAX] {
+            let expected = format!("{}", n);
+            assert_eq!(
+                decimal_ascii::u64_to_bytes(&env, n),
+                Bytes::from_slice(&env, expected.as_bytes()),
+                "u64_to_bytes({n})"
+            );
+        }
+        // u64::MAX is 20 digits: it fills the 20-byte buffer exactly, no truncation.
+        assert_eq!(decimal_ascii::u64_to_bytes(&env, u64::MAX).len(), 20);
+    }
+
+    #[test]
+    fn decimal_ascii_i128_to_bytes_matches_std_formatting() {
+        let env = Env::default();
+        for n in [0i128, 1, -1, 10_000_000, i128::MAX, i128::MIN] {
+            let expected = format!("{}", n);
+            assert_eq!(
+                decimal_ascii::i128_to_bytes(&env, n),
+                Bytes::from_slice(&env, expected.as_bytes()),
+                "i128_to_bytes({n})"
+            );
+        }
+        // i128::MAX is 39 digits; i128::MIN is 39 digits plus `-`, exactly the 40-byte buffer.
+        assert_eq!(decimal_ascii::i128_to_bytes(&env, i128::MAX).len(), 39);
+        assert_eq!(decimal_ascii::i128_to_bytes(&env, i128::MIN).len(), 40);
+    }
+
+    #[test]
+    fn degraded_and_halted_return_last_good_timestamp_instead_of_now() {
+        let (env, client, publisher, risk, asset) = setup(50, 100, 3_600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        // No prior good price yet -> Degraded with ts == 0.
+        env.ledger().with_mut(|l| l.timestamp = 500);
+        let initial = client.guarded_price(&asset);
+        assert_eq!(initial.status, PriceStatus::Degraded);
+        assert_eq!(initial.value, 0);
+        assert_eq!(initial.ts, 0);
+
+        // Publish an Ok price at t = 1000.
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &1_000, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &1_000);
+        let ok_price = client.guarded_price(&asset);
+        assert_eq!(ok_price.status, PriceStatus::Ok);
+        assert_eq!(ok_price.value, SCALE);
+        assert_eq!(ok_price.ts, 1_000);
+
+        // Advance ledger to t = 5000 so readings go stale (max_staleness_s = 3600).
+        env.ledger().with_mut(|l| l.timestamp = 5_000);
+        let degraded = client.guarded_price(&asset);
+        assert_eq!(degraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded.value, SCALE);
+        assert_eq!(degraded.ts, 1_000);
+
+        // Publish a fresh jump at t = 5500 that exceeds daily_move_band_bps (100 bps) -> Halted
+        // still reports ts == 1000 (when the held last_good was recorded).
+        env.ledger().with_mut(|l| l.timestamp = 5_500);
+        let jumped = SCALE + 500_000; // +5%
+        client.publish_nav(&publisher, &asset, &code, &jumped, &5_500, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &jumped, &5_500);
+        let halted = client.guarded_price(&asset);
+        assert_eq!(halted.status, PriceStatus::Halted);
+        assert_eq!(halted.value, SCALE);
+        assert_eq!(halted.ts, 1_000);
+
+        // Clearing the halt at t = 6000 accepts `jumped` as LastGood at t = 6000; once readings
+        // age out at t = 10_000, Degraded reports the t = 6000 timestamp.
+        env.ledger().with_mut(|l| l.timestamp = 6_000);
+        client.confirm_halt_cleared(&risk, &asset);
+        env.ledger().with_mut(|l| l.timestamp = 10_000);
+        let degraded_after_clear = client.guarded_price(&asset);
+        assert_eq!(degraded_after_clear.status, PriceStatus::Degraded);
+        assert_eq!(degraded_after_clear.value, jumped);
+        assert_eq!(degraded_after_clear.ts, 6_000);
+    }
+
+    #[test]
+    fn legacy_bare_i128_last_good_migrates_with_zero_timestamp() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3_600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        // Simulate a pre-migration contract instance that stored a bare i128 under DataKey::LastGood.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::LastGood(asset.clone()), &SCALE);
+        });
+
+        env.ledger().with_mut(|l| l.timestamp = 2_500);
+        let degraded = client.guarded_price(&asset);
+        assert_eq!(degraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded.value, SCALE);
+        assert_eq!(degraded.ts, 0);
+
+        // Next Ok publish at t = 3000 upgrades storage to LastGood { value, ts: 3000 }.
+        env.ledger().with_mut(|l| l.timestamp = 3_000);
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &3_000, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &SCALE, &3_000);
+        let ok_price = client.guarded_price(&asset);
+        assert_eq!(ok_price.status, PriceStatus::Ok);
+        assert_eq!(ok_price.ts, 3_000);
+
+        env.ledger().with_mut(|l| l.timestamp = 7_000);
+        let degraded_upgraded = client.guarded_price(&asset);
+        assert_eq!(degraded_upgraded.status, PriceStatus::Degraded);
+        assert_eq!(degraded_upgraded.value, SCALE);
+        assert_eq!(degraded_upgraded.ts, 3_000);
+    }
+
+    // --- source allowlist tests (issue #84) ----------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "price-guard: source not allowlisted")]
+    fn publish_source_rejects_unlisted_source() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let unlisted = Symbol::new(&env, "unlisted_feed");
+        let now = env.ledger().timestamp();
+        client.publish_source(&publisher, &asset, &unlisted, &SCALE, &now);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: source name 'issuer' is reserved for publish_nav")]
+    fn publish_source_rejects_reserved_issuer_name() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let issuer_name = Symbol::new(&env, ISSUER_SOURCE);
+        let now = env.ledger().timestamp();
+        client.publish_source(&publisher, &asset, &issuer_name, &SCALE, &now);
+    }
+
+    #[test]
+    #[should_panic(expected = "price-guard: source name 'issuer' is reserved for publish_nav")]
+    fn configure_source_rejects_reserved_issuer_name() {
+        let (env, client, admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let issuer_name = Symbol::new(&env, ISSUER_SOURCE);
+        client.configure_source(&admin, &asset, &issuer_name, &true);
+    }
+
+    #[test]
+    fn a_stranger_cannot_configure_source() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _admin, _publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let stranger = Address::generate(&env);
+        let custom_feed = Symbol::new(&env, "custom_feed");
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "configure_source",
+                    args: (&stranger, &asset, &custom_feed, true).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_configure_source(&stranger, &asset, &custom_feed, &true);
+
+        assert!(res.is_err(), "non-admin must not be allowed to configure sources");
+    }
+
+    #[test]
+    fn disabling_source_stops_it_counting_immediately() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        let feed_a = Symbol::new(&env, "feed_a");
+        let feed_b = Symbol::new(&env, "feed_b");
+        client.configure_source(&admin, &asset, &feed_a, &true);
+        client.configure_source(&admin, &asset, &feed_b, &true);
+
+        assert!(client.is_source_allowed(&asset, &feed_a));
+        assert!(client.is_source_allowed(&asset, &feed_b));
+
+        // Publish NAV + feed_a + feed_b -> 3 fresh sources -> Ok
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_a, &SCALE, &now);
+        client.publish_source(&publisher, &asset, &feed_b, &SCALE, &now);
+
+        let price_3 = client.guarded_price(&asset);
+        assert_eq!(price_3.status, PriceStatus::Ok);
+        assert_eq!(price_3.sources.len(), 3);
+
+        // Disable feed_a -> stops counting immediately -> 2 sources remaining -> still Ok
+        client.configure_source(&admin, &asset, &feed_a, &false);
+        assert!(!client.is_source_allowed(&asset, &feed_a));
+
+        let price_2 = client.guarded_price(&asset);
+        assert_eq!(price_2.status, PriceStatus::Ok);
+        assert_eq!(price_2.sources.len(), 2);
+
+        // Disable feed_b -> only 1 source remaining (NAV) -> Degraded immediately
+        client.configure_source(&admin, &asset, &feed_b, &false);
+        assert!(!client.is_source_allowed(&asset, &feed_b));
+
+        let price_1 = client.guarded_price(&asset);
+        assert_eq!(price_1.status, PriceStatus::Degraded);
+        assert_eq!(price_1.sources.len(), 1);
+    }
+
+    #[test]
+    fn removing_source_stops_it_counting_immediately() {
+        let (env, client, admin, publisher, _risk, asset) = setup_with_admin(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let now = env.ledger().timestamp();
+
+        let feed_a = Symbol::new(&env, "feed_a");
+        client.configure_source(&admin, &asset, &feed_a, &true);
+
+        client.publish_nav(&publisher, &asset, &code, &SCALE, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed_a, &SCALE, &now);
+
+        let price_before = client.guarded_price(&asset);
+        assert_eq!(price_before.status, PriceStatus::Ok);
+        assert_eq!(price_before.sources.len(), 2);
+
+        // Remove feed_a -> stops counting immediately and drops below quorum (<2) -> Degraded
+        client.remove_source(&admin, &asset, &feed_a);
+        assert!(!client.is_source_allowed(&asset, &feed_a));
+
+        let price_after = client.guarded_price(&asset);
+        assert_eq!(price_after.status, PriceStatus::Degraded);
+        assert_eq!(price_after.sources.len(), 1);
     }
 
     mod invariants;
