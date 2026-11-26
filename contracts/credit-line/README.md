@@ -69,10 +69,13 @@ decoded incorrectly or fail to decode after an incompatible upgrade. This applie
 ## Contract Events
 
 Events follow the same convention as `PledgeVault`: one event per state change, with the shape
-`((Symbol, line), payload)`.
+`((Symbol, line), payload)`. See [`../EVENTS.md`](../EVENTS.md) for the cross-contract reference, consumers
+and the payload-order compatibility rule.
 
 | Event | Topics | Data | Emitted by |
 |---|---|---|---|
+| `drawn` | `(Symbol("drawn"), line: u64)` | `(amount: i128, to: Address, drawn_total: i128, ltv_bps: u32)` | `draw` |
+| `repaid` | `(Symbol("repaid"), line: u64)` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` |
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
 | `liquidation_started` | `(Symbol("liquidation_started"), line: u64)` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` |
@@ -85,6 +88,17 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 `undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
 figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
 publishes nothing.
+
+`repaid` is published after the repayment is applied: `interest_paid` and `principal_paid` sum to
+the amount actually applied (`min(amount, owed)`), and `drawn_after` is the line's remaining
+principal. Together they are the repayment `(principal, interest)` split the ledger needs, without
+recomputing it from a pre-state. A reverted repayment publishes nothing.
+
+`close_liquidated` verifies cross-contract that the collateral position in `PledgeVault` has been
+fully cleared (`position_units(line, asset) == 0`) before permitting the line to close and settling
+surplus or shortfall. If no vault is configured, closing is allowed only if zero collateral units
+were pledged or seized (`record.seized_units == 0 && state.pledged_units == 0`); if any collateral
+was pledged/seized, closing without a configured vault panics with `"credit-line: vault not configured"`.
 
 ## Building and testing
 
